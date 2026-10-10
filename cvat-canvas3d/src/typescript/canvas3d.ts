@@ -27,6 +27,7 @@ interface Canvas3d {
     isAbleToChangeFrame(): boolean;
     mode(): Mode;
     render(): void;
+    requestRender(frameCount?: number): void;
     keyControls(keys: KeyboardEvent): void;
     draw(drawData: DrawData): void;
     cancel(): void;
@@ -36,6 +37,9 @@ interface Canvas3d {
     fitCanvas(): void;
     fit(): void;
     focus(clientID: number): void;
+    snapToRoad(clientID?: number | null): void;
+    revertSnap(clientID?: number | null): boolean;
+    getPreviousCuboid(clientID?: number | null): number[] | null;
     group(groupData: GroupData): void;
     merge(mergeData: MergeData): void;
     split(splitData: SplitData): void;
@@ -63,6 +67,10 @@ class Canvas3dImpl implements Canvas3d {
 
     public render(): void {
         this.view.render();
+    }
+
+    public requestRender(frameCount?: number): void {
+        this.view.requestRender(frameCount);
     }
 
     public draw(drawData: DrawData): void {
@@ -111,6 +119,18 @@ class Canvas3dImpl implements Canvas3d {
 
     public focus(clientID: number): void {
         this.view.focusObjectByClientId(clientID, true);
+    }
+
+    public snapToRoad(clientID?: number | null): void {
+        this.view.snapToRoad(clientID);
+    }
+
+    public revertSnap(clientID?: number | null): boolean {
+        return this.view.revertSnap(clientID);
+    }
+
+    public getPreviousCuboid(clientID?: number | null): number[] | null {
+        return this.view.getPreviousCuboid(clientID);
     }
 
     public fit(): void {

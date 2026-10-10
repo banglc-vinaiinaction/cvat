@@ -1,0 +1,29 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Data files & archives
+data/
+*.zip
+*.tar
+*.tar.gz
+*.pcd
+*.pkl
+
+# Frontend dependencies & build output
+dist/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+
+# Logs
+*.log
+
+# OS & IDE
+.DS_Store
+.vscode/
+.idea/

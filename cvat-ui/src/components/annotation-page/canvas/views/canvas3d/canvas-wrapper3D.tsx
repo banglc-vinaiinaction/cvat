@@ -11,6 +11,7 @@ import {
 } from '@ant-design/icons';
 import Button from 'antd/lib/button';
 import Spin from 'antd/lib/spin';
+import notification from 'antd/lib/notification';
 
 import {
     activateObject,
@@ -740,6 +741,53 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
         onUpdateAnnotations([state]);
     };
 
+    const onCanvasSnapped = (event: any): void => {
+        const { metrics, state } = event.detail || {};
+        if (!metrics) return;
+        const {
+            deltaZ, deltaYawDeg, groundZ, pointsCount,
+        } = metrics;
+        const zSign = deltaZ >= 0 ? '+' : '';
+        const yawSign = deltaYawDeg >= 0 ? '+' : '';
+        const key = `snap_notification_${Date.now()}`;
+        notification.info({
+            key,
+            message: '3D Road Snapped & Oriented',
+            description: (
+                <div>
+                    <div><strong>Ground plane:</strong> {groundZ.toFixed(2)} m (Δz: {zSign}{deltaZ.toFixed(2)} m)</div>
+                    <div><strong>Yaw aligned:</strong> {yawSign}{deltaYawDeg.toFixed(1)}°</div>
+                    <div><strong>LiDAR points:</strong> {pointsCount}</div>
+                </div>
+            ),
+            btn: (
+                <Button
+                    type='primary'
+                    size='small'
+                    onClick={(): void => {
+                        notification.destroy(key);
+                        if (state?.clientID !== undefined) {
+                            canvasInstance.revertSnap(state.clientID);
+                        } else {
+                            canvasInstance.revertSnap();
+                        }
+                    }}
+                >
+                    Revert
+                </Button>
+            ),
+            duration: 5,
+        });
+    };
+
+    const onCanvasReverted = (): void => {
+        notification.success({
+            message: 'Cuboid Reverted',
+            description: 'Restored cuboid position and orientation prior to snapping.',
+            duration: 3,
+        });
+    };
+
     useEffect(() => {
         const canvasInstanceDOM = canvasInstance.html();
 
@@ -853,6 +901,8 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
         canvasInstanceDOM.perspective.addEventListener('canvas.selected', onCanvasShapeSelected);
         canvasInstanceDOM.perspective.addEventListener('canvas.clicked', onCanvasShapeClicked as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.edited', onCanvasEditDone);
+        canvasInstanceDOM.perspective.addEventListener('canvas.snapped', onCanvasSnapped as EventListener);
+        canvasInstanceDOM.perspective.addEventListener('canvas.reverted', onCanvasReverted as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.contextmenu', onContextMenu);
         canvasInstanceDOM.perspective.addEventListener('click', onCanvasClick);
         canvasInstanceDOM.perspective.addEventListener('canvas.grouped', onCanvasObjectsGrouped as EventListener);
@@ -865,6 +915,8 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
             canvasInstanceDOM.perspective.removeEventListener('canvas.selected', onCanvasShapeSelected);
             canvasInstanceDOM.perspective.removeEventListener('canvas.clicked', onCanvasShapeClicked as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.edited', onCanvasEditDone);
+            canvasInstanceDOM.perspective.removeEventListener('canvas.snapped', onCanvasSnapped as EventListener);
+            canvasInstanceDOM.perspective.removeEventListener('canvas.reverted', onCanvasReverted as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.contextmenu', onContextMenu);
             canvasInstanceDOM.perspective.removeEventListener('click', onCanvasClick);
             canvasInstanceDOM.perspective.removeEventListener('canvas.grouped', onCanvasObjectsGrouped as EventListener);

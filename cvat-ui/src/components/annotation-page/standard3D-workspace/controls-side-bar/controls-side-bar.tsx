@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: MIT
 
 import React from 'react';
+import { useSelector } from 'react-redux';
 import Layout from 'antd/lib/layout';
-import { ActiveControl } from 'reducers';
+import { ActiveControl, CombinedState } from 'reducers';
 import { Label, LabelType } from 'cvat-core-wrapper';
 import { Canvas3d as Canvas } from 'cvat-canvas3d-wrapper';
 import MoveControl, {
@@ -26,6 +27,9 @@ import MergeControl, {
 import SplitControl, {
     Props as SplitControlProps,
 } from 'components/annotation-page/standard-workspace/controls-side-bar/split-control';
+import SnapToRoadControl, {
+    Props as SnapToRoadControlProps,
+} from './snap-to-road-control';
 import GlobalHotKeys, { KeyMap, KeyMapItem } from 'utils/mousetrap-react';
 import ControlVisibilityObserver from 'components/annotation-page/standard-workspace/controls-side-bar/control-visibility-observer';
 import { filterApplicableForType } from 'utils/filter-applicable-labels';
@@ -91,6 +95,18 @@ const componentShortcuts: Record<string, KeyMapItem> = {
         sequences: ['alt+m'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
+    SNAP_TO_ROAD_3D_CONTROLS: {
+        name: 'Snap to Road & Orient',
+        description: 'Snap selected 3D cuboid flush to the road plane and align its yaw with vehicle points',
+        sequences: ['f'],
+        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
+    },
+    REVERT_SNAP_3D_CONTROLS: {
+        name: 'Revert Snap to Road',
+        description: 'Revert previously snapped 3D cuboid to its original position and orientation',
+        sequences: ['shift+f'],
+        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
+    },
 };
 
 registerComponentShortcuts(componentShortcuts);
@@ -115,6 +131,10 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         updateActiveControl,
         resetGroup,
     } = props;
+
+    const selectedStatesID = useSelector(
+        (state: CombinedState) => state.annotation.annotations.selectedStatesID,
+    );
 
     const applicableLabels = filterApplicableForType(LabelType.CUBOID, labels);
     const preventDefault = (event: KeyboardEvent | undefined): void => {
@@ -213,6 +233,20 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             if (event) event.preventDefault();
             dynamicTrackIconProps.onClick();
         },
+        SNAP_TO_ROAD_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
+            if (event) event.preventDefault();
+            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            if (event && (event.shiftKey || event.key === 'F')) {
+                canvasInstance.revertSnap(targetID);
+            } else {
+                canvasInstance.snapToRoad(targetID);
+            }
+        },
+        REVERT_SNAP_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
+            if (event) event.preventDefault();
+            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            canvasInstance.revertSnap(targetID);
+        },
     };
 
     handlers = applicableLabels.length ? {
@@ -246,6 +280,10 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             <ObservedDrawCuboidControl
                 canvasInstance={canvasInstance}
                 isDrawing={activeControl === ActiveControl.DRAW_CUBOID}
+                disabled={controlsDisabled}
+            />
+            <SnapToRoadControl
+                canvasInstance={canvasInstance}
                 disabled={controlsDisabled}
             />
 

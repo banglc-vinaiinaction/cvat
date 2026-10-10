@@ -19,12 +19,17 @@ import {
 } from './cuboid';
 import { ObjectState, ObjectType } from '.';
 import { disposeScene } from './utils';
+import { snapCuboidToRoadAndOrient } from './snapping';
 
 export interface Canvas3dView {
     html(): ViewsDOM;
     render(): void;
+    requestRender(frameCount?: number): void;
     keyControls(keys: KeyboardEvent): void;
     focusObjectByClientId(clientID: number, animate?: boolean): void;
+    snapToRoad(clientID?: number | null): void;
+    revertSnap(clientID?: number | null): boolean;
+    getPreviousCuboid(clientID?: number | null): number[] | null;
 }
 
 export enum CameraAction {
@@ -112,6 +117,7 @@ function drawnDataFromState(state: ObjectState): DrawnObjectData {
 
 export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private controller: Canvas3dController;
+    private masterRenderer: THREE.WebGLRenderer;
     private views: Views;
     private clock: THREE.Clock;
     private speed: number;
@@ -130,12 +136,203 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         cuboid: CuboidModel;
     }>;
     private hoverNeedsUpdate: boolean;
+    private needsRenderCount: number = 2;
+    private pointCloudPoints: any = null;
+    private previousCuboids: Map<number, number[]> = new Map();
+
+    public requestRender(frameCount: number = 2): void {
+        this.needsRenderCount = Math.max(this.needsRenderCount, frameCount);
+    }
 
     public focusObjectByClientId(clientID: number, animate: boolean = true): void {
         const cuboidModel = this.drawnObjects[clientID];
         if (cuboidModel) {
             this.fitObject(cuboidModel.cuboid, animate);
+            this.requestRender();
         }
+    }
+
+    public snapToRoad(clientID?: number | null): void {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            if (this.activatedElementID !== null) {
+                targetClientID = this.activatedElementID;
+            } else if (this.model.data.activeElement.clientID !== null) {
+                targetClientID = +this.model.data.activeElement.clientID;
+            }
+        }
+
+        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+            return;
+        }
+
+        if (!this.pointCloudPoints?.geometry?.attributes?.position?.array) {
+            return;
+        }
+
+        const positions = this.pointCloudPoints.geometry.attributes.position.array;
+        const { cuboid, data } = this.drawnObjects[targetClientID];
+        if (data.lock) return;
+
+        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
+        if (!state) return;
+
+        const currentPoints = [
+            cuboid.perspective.position.x,
+            cuboid.perspective.position.y,
+            cuboid.perspective.position.z,
+            cuboid.perspective.rotation.x,
+            cuboid.perspective.rotation.y,
+            cuboid.perspective.rotation.z,
+            cuboid.perspective.scale.x,
+            cuboid.perspective.scale.y,
+            cuboid.perspective.scale.z,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        const previousPoints = [...currentPoints];
+        this.previousCuboids.set(targetClientID, previousPoints);
+
+        const snapResult = snapCuboidToRoadAndOrient(currentPoints, positions);
+        const [x, y, z, rx, ry, rz, dx, dy, dz] = snapResult.points;
+
+        cuboid.setPosition(x, y, z);
+        cuboid.setRotation(rx, ry, rz);
+        cuboid.setScale(dx, dy, dz);
+        data.points = [...snapResult.points];
+
+        this.translateReferencePlane(new THREE.Vector3(x, y, z));
+        try {
+            this.rotatePlane(null as any, null as any);
+        } catch (_) {
+            // ignore if not all views are initialized
+        }
+
+        BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
+        this.updateCameraFrustumPlane();
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.edited', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points: [...snapResult.points],
+                    previousPoints: [...previousPoints],
+                },
+            }),
+        );
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.snapped', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points: [...snapResult.points],
+                    previousPoints: [...previousPoints],
+                    metrics: snapResult.metrics,
+                },
+            }),
+        );
+
+        this.requestRender();
+        this.render();
+    }
+
+    public revertSnap(clientID?: number | null): boolean {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            if (this.activatedElementID !== null) {
+                targetClientID = this.activatedElementID;
+            } else if (this.model.data.activeElement.clientID !== null) {
+                targetClientID = +this.model.data.activeElement.clientID;
+            }
+        }
+
+        if (targetClientID === null || !this.previousCuboids.has(targetClientID)) {
+            return false;
+        }
+
+        const prevPoints = this.previousCuboids.get(targetClientID)!;
+        const { cuboid, data } = this.drawnObjects[targetClientID] || {};
+        if (!cuboid || data?.lock) return false;
+
+        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
+        if (!state) return false;
+
+        const snappedPoints = [
+            cuboid.perspective.position.x,
+            cuboid.perspective.position.y,
+            cuboid.perspective.position.z,
+            cuboid.perspective.rotation.x,
+            cuboid.perspective.rotation.y,
+            cuboid.perspective.rotation.z,
+            cuboid.perspective.scale.x,
+            cuboid.perspective.scale.y,
+            cuboid.perspective.scale.z,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        cuboid.setPosition(prevPoints[0], prevPoints[1], prevPoints[2]);
+        cuboid.setRotation(prevPoints[3], prevPoints[4], prevPoints[5]);
+        cuboid.setScale(prevPoints[6], prevPoints[7], prevPoints[8]);
+        data.points = [...prevPoints];
+
+        this.translateReferencePlane(new THREE.Vector3(prevPoints[0], prevPoints[1], prevPoints[2]));
+        try {
+            this.rotatePlane(null as any, null as any);
+        } catch (_) {
+            // ignore if not all views initialized
+        }
+
+        BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
+        this.updateCameraFrustumPlane();
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.edited', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points: [...prevPoints],
+                    previousPoints: [...snappedPoints],
+                },
+            }),
+        );
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.reverted', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points: [...prevPoints],
+                    previousPoints: [...snappedPoints],
+                },
+            }),
+        );
+
+        this.previousCuboids.delete(targetClientID);
+        this.requestRender();
+        this.render();
+        return true;
+    }
+
+    public getPreviousCuboid(clientID?: number | null): number[] | null {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            if (this.activatedElementID !== null) {
+                targetClientID = this.activatedElementID;
+            } else if (this.model.data.activeElement.clientID !== null) {
+                targetClientID = +this.model.data.activeElement.clientID;
+            }
+        }
+
+        if (targetClientID !== null && this.previousCuboids.has(targetClientID)) {
+            return [...this.previousCuboids.get(targetClientID)!];
+        }
+        return null;
     }
 
     private action: {
@@ -246,9 +443,52 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             },
         };
 
+        this.masterRenderer = new THREE.WebGLRenderer({
+            antialias: true,
+            powerPreference: 'high-performance',
+            preserveDrawingBuffer: true,
+        });
+
+        const createViewRenderer = (): THREE.WebGLRenderer => {
+            const canvas = window.document.createElement('canvas');
+            canvas.style.width = '100%';
+            canvas.style.height = '100%';
+            const ctx = canvas.getContext('2d');
+
+            return {
+                domElement: canvas,
+                setSize: (w: number, h: number, updateStyle?: boolean) => {
+                    canvas.width = w;
+                    canvas.height = h;
+                    if (updateStyle !== false) {
+                        canvas.style.width = `${w}px`;
+                        canvas.style.height = `${h}px`;
+                    }
+                },
+                render: (scene: THREE.Scene, camera: THREE.Camera) => {
+                    if (!ctx) return;
+                    const w = canvas.width || 300;
+                    const h = canvas.height || 150;
+                    if (w <= 0 || h <= 0) return;
+
+                    if (this.masterRenderer.domElement.width !== w || this.masterRenderer.domElement.height !== h) {
+                        this.masterRenderer.setSize(w, h, false);
+                    }
+                    this.masterRenderer.render(scene, camera);
+                    ctx.clearRect(0, 0, w, h);
+                    ctx.drawImage(this.masterRenderer.domElement, 0, 0);
+                },
+                dispose: () => {
+                    if (ctx) {
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    }
+                },
+            } as unknown as THREE.WebGLRenderer;
+        };
+
         this.views = {
             perspective: {
-                renderer: new THREE.WebGLRenderer({ antialias: true }),
+                renderer: createViewRenderer(),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -256,7 +496,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 },
             },
             top: {
-                renderer: new THREE.WebGLRenderer({ antialias: true }),
+                renderer: createViewRenderer(),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -264,7 +504,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 },
             },
             side: {
-                renderer: new THREE.WebGLRenderer({ antialias: true }),
+                renderer: createViewRenderer(),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -272,7 +512,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 },
             },
             front: {
-                renderer: new THREE.WebGLRenderer({ antialias: true }),
+                renderer: createViewRenderer(),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -984,6 +1224,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         mouseVector.x = (diffX / canvas.clientWidth) * 2 - 1;
         mouseVector.y = -(diffY / canvas.clientHeight) * 2 + 1;
         this.action.rotation.screenMove = { x: diffX, y: diffY };
+        this.requestRender();
     }
 
     private translateReferencePlane(coordinates: any): void {
@@ -1413,74 +1654,121 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                 console.error = defaultImpl;
                             }
 
-                            let {
-                                position, color, normal, intensity, label,
-                            } = cloud.geometry.attributes;
+                            const posAttr = cloud.geometry.attributes.position;
+                            const colorAttr = cloud.geometry.attributes.color;
+                            const normalAttr = cloud.geometry.attributes.normal;
+                            const intensityAttr = cloud.geometry.attributes.intensity;
+                            const labelAttr = cloud.geometry.attributes.label;
                             cloud.material.vertexColors = true;
 
-                            ({
-                                color, position, normal, intensity, label,
-                            } = position.array.reduce((acc, _, i, array) => {
-                                if (
-                                    i % 3 === 0 &&
-                                    Number.isFinite(array[i]) &&
-                                    Number.isFinite(array[i + 1]) &&
-                                    Number.isFinite(array[i + 2])
-                                ) {
-                                    acc.position.push(array[i], array[i + 1], array[i + 2]);
+                            if (posAttr && posAttr.array) {
+                                const posArray = posAttr.array;
+                                const len = posArray.length;
+                                const totalPoints = Math.floor(len / 3);
 
+                                // 1. Fast Scan for NaNs or non-finite values
+                                let hasInvalid = false;
+                                for (let i = 0; i < len; i += 3) {
                                     if (
-                                        color &&
-                                        Number.isFinite(color.array[i]) &&
-                                        Number.isFinite(color.array[i + 1]) &&
-                                        Number.isFinite(color.array[i + 2])
+                                        !Number.isFinite(posArray[i]) ||
+                                        !Number.isFinite(posArray[i + 1]) ||
+                                        !Number.isFinite(posArray[i + 2])
                                     ) {
-                                        acc.color.push(color.array[i], color.array[i + 1], color.array[i + 2]);
-                                    } else {
-                                        acc.color.push(255, 255, 255);
-                                    }
-
-                                    if (
-                                        normal &&
-                                        Number.isFinite(normal.array[i]) &&
-                                        Number.isFinite(normal.array[i + 1]) &&
-                                        Number.isFinite(normal.array[i + 2])
-                                    ) {
-                                        acc.normal.push(normal.array[i], normal.array[i + 1], normal.array[i + 2]);
-                                    }
-
-                                    if (intensity) {
-                                        acc.intensity.push(intensity.array[i / 3]);
-                                    }
-
-                                    if (label) {
-                                        acc.label.push(label.array[i / 3]);
+                                        hasInvalid = true;
+                                        break;
                                     }
                                 }
 
-                                return acc;
-                            }, {
-                                position: [], color: [], normal: [], intensity: [], label: [],
-                            }));
+                                const hasColor = Boolean(colorAttr && colorAttr.array);
 
-                            if (position.length) {
-                                cloud.geometry.setAttribute('position', new THREE.Float32BufferAttribute(position, 3));
-                            }
+                                if (!hasInvalid && hasColor) {
+                                    // Fast path: Point coordinates are completely clean and colors exist.
+                                    // 0ms, zero allocations or dynamic array overhead.
+                                } else if (!hasInvalid && !hasColor) {
+                                    // Fast path: Point coordinates are clean, synthesize default white colors directly
+                                    const defaultColors = new Float32Array(len);
+                                    defaultColors.fill(255);
+                                    cloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(defaultColors, 3));
+                                } else {
+                                    // Filter in single pass using pre-allocated TypedArrays (zero heap garbage)
+                                    const validPositions = new Float32Array(len);
+                                    const validColors = new Float32Array(len);
+                                    const validNormals = normalAttr ? new Float32Array(len) : null;
+                                    const validIntensities = intensityAttr ? new Float32Array(totalPoints) : null;
+                                    const validLabels = labelAttr ? new Float32Array(totalPoints) : null;
 
-                            if (color.length) {
-                                cloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(color, 3));
-                            }
+                                    const colArray = colorAttr?.array;
+                                    const normArray = normalAttr?.array;
+                                    const intArr = intensityAttr?.array;
+                                    const lblArr = labelAttr?.array;
 
-                            if (normal.length) {
-                                cloud.geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normal, 3));
-                            }
+                                    let validCount = 0;
 
-                            if (intensity.length) {
-                                cloud.geometry.setAttribute('intensity', new THREE.Float32BufferAttribute(intensity, 1));
-                            }
+                                    for (let i = 0, pt = 0; i < len; i += 3, pt++) {
+                                        const x = posArray[i];
+                                        const y = posArray[i + 1];
+                                        const z = posArray[i + 2];
 
-                            if (label.length) {
-                                cloud.geometry.setAttribute('label', new THREE.Float32BufferAttribute(label, 1));
+                                        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+                                            const outIdx = validCount * 3;
+                                            validPositions[outIdx] = x;
+                                            validPositions[outIdx + 1] = y;
+                                            validPositions[outIdx + 2] = z;
+
+                                            if (
+                                                colArray &&
+                                                Number.isFinite(colArray[i]) &&
+                                                Number.isFinite(colArray[i + 1]) &&
+                                                Number.isFinite(colArray[i + 2])
+                                            ) {
+                                                validColors[outIdx] = colArray[i];
+                                                validColors[outIdx + 1] = colArray[i + 1];
+                                                validColors[outIdx + 2] = colArray[i + 2];
+                                            } else {
+                                                validColors[outIdx] = 255;
+                                                validColors[outIdx + 1] = 255;
+                                                validColors[outIdx + 2] = 255;
+                                            }
+
+                                            if (
+                                                validNormals && normArray &&
+                                                Number.isFinite(normArray[i]) &&
+                                                Number.isFinite(normArray[i + 1]) &&
+                                                Number.isFinite(normArray[i + 2])
+                                            ) {
+                                                validNormals[outIdx] = normArray[i];
+                                                validNormals[outIdx + 1] = normArray[i + 1];
+                                                validNormals[outIdx + 2] = normArray[i + 2];
+                                            }
+
+                                            if (validIntensities && intArr) {
+                                                validIntensities[validCount] = intArr[pt];
+                                            }
+
+                                            if (validLabels && lblArr) {
+                                                validLabels[validCount] = lblArr[pt];
+                                            }
+
+                                            validCount++;
+                                        }
+                                    }
+
+                                    const finalPos = validPositions.subarray(0, validCount * 3);
+                                    const finalCol = validColors.subarray(0, validCount * 3);
+
+                                    cloud.geometry.setAttribute('position', new THREE.Float32BufferAttribute(finalPos, 3));
+                                    cloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(finalCol, 3));
+
+                                    if (validNormals) {
+                                        cloud.geometry.setAttribute('normal', new THREE.Float32BufferAttribute(validNormals.subarray(0, validCount * 3), 3));
+                                    }
+                                    if (validIntensities) {
+                                        cloud.geometry.setAttribute('intensity', new THREE.Float32BufferAttribute(validIntensities.subarray(0, validCount), 1));
+                                    }
+                                    if (validLabels) {
+                                        cloud.geometry.setAttribute('label', new THREE.Float32BufferAttribute(validLabels.subarray(0, validCount), 1));
+                                    }
+                                }
                             }
 
                             cloud.geometry.computeBoundingSphere();
@@ -1640,9 +1928,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         } else if (reason === UpdateReasons.DATA_FAILED) {
             this.onError(model.exception, 'data fetching');
         }
+        this.requestRender();
     }
 
     private clearScene(): void {
+        this.pointCloudPoints = null;
+        this.previousCuboids.clear();
         Object.entries(this.drawnObjects).forEach(([clientID, { cuboid }]) => {
             this.removeSceneChildren(cuboid, +clientID);
         });
@@ -1752,6 +2043,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     private onSceneImageLoaded(points: any): void {
+        this.pointCloudPoints = points;
         const getCameraSettingsToFitScene = (
             camera: THREE.PerspectiveCamera,
             boundingBox: THREE.Box3,
@@ -1808,8 +2100,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         this.cameraSettings.perspective.position = position;
         this.sceneBBox = new THREE.Box3().setFromObject(points);
-        const perspectiveCloud = points.clone();
-        this.views.perspective.scene.add(perspectiveCloud);
+        this.views.perspective.scene.add(points);
 
         const origin = new THREE.Vector3(0, 0, 0);
         const isOriginInScene = this.sceneBBox.containsPoint(origin);
@@ -1841,10 +2132,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         topScenePlane.name = Planes.TOP;
         (topScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
         (topScenePlane as any).verticesNeedUpdate = true;
-        // eslint-disable-next-line no-param-reassign
-        points.material = material;
         material.size = 0.5;
-        const topCloud = points.clone();
+        const topCloud = new THREE.Points(points.geometry, material);
         this.views.top.scene.add(topCloud);
         this.views.top.scene.add(topScenePlane);
         // Setup Side View
@@ -1867,7 +2156,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         sideScenePlane.name = Planes.SIDE;
         (sideScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
         (sideScenePlane as any).verticesNeedUpdate = true;
-        const sideCloud = points.clone();
+        const sideCloud = new THREE.Points(points.geometry, material);
         this.views.side.scene.add(sideCloud);
         this.views.side.scene.add(sideScenePlane);
         // Setup front View
@@ -1889,13 +2178,14 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         frontScenePlane.name = Planes.FRONT;
         (frontScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
         (frontScenePlane as any).verticesNeedUpdate = true;
-        const frontCloud = points.clone();
+        const frontCloud = new THREE.Points(points.geometry, material);
         this.views.front.scene.add(frontCloud);
         this.views.front.scene.add(frontScenePlane);
 
         if (this.mode === Mode.DRAW) {
             this.views[ViewType.PERSPECTIVE].scene.children[0].add(this.cube.perspective);
         }
+        this.requestRender();
     }
 
     private positionAllViews(x: number, y: number, z: number, animation: boolean): void {
@@ -1925,11 +2215,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
     }
 
-    private resizeRendererToDisplaySize(viewType: ViewType, view: RenderView): void {
+    private resizeRendererToDisplaySize(viewType: ViewType, view: RenderView): boolean {
         const { camera, renderer } = view;
         const canvas = renderer.domElement;
         if (!canvas.parentElement) {
-            return;
+            return false;
         }
         const width = canvas.parentElement.clientWidth;
         const height = canvas.parentElement.clientHeight;
@@ -1949,7 +2239,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
             view.renderer.setSize(width, height);
             view.camera.updateProjectionMatrix();
+            return true;
         }
+        return false;
     }
 
     private renderRayCaster = (viewType: RenderView): void => {
@@ -2002,31 +2294,69 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                         );
                     }
                 }
-            } else if (this.mode === Mode.SPLIT && this.stateToBeSplitted) {
-                const state = this.stateToBeSplitted;
-                this.stateToBeSplitted = null;
-                this.drawnObjects[state.clientID].cuboid.setColor(this.receiveShapeColor(state));
+            } else {
+                this.hoverNeedsUpdate = false;
+                if (this.mode === Mode.SPLIT && this.stateToBeSplitted) {
+                    const state = this.stateToBeSplitted;
+                    this.stateToBeSplitted = null;
+                    this.drawnObjects[state.clientID].cuboid.setColor(this.receiveShapeColor(state));
+                }
             }
         }
     };
 
     public render(): void {
+        const delta = this.clock.getDelta();
+        const isActionActive = Boolean(
+            this.action.detected ||
+            this.action.translation.status ||
+            this.action.resize.status ||
+            this.action.rotation.status,
+        );
+
+        if (isActionActive) {
+            this.needsRenderCount = 2;
+        }
+
+        const forceRenderAll = this.needsRenderCount > 0;
+        if (this.needsRenderCount > 0) {
+            this.needsRenderCount--;
+        }
+
         Object.keys(this.views).forEach((view: string): void => {
             const viewType = this.views[view as keyof Views];
             if (!(viewType.controls && viewType.camera && viewType.rayCaster)) return;
 
             const { clientID } = this.model.data.activeElement;
-            this.resizeRendererToDisplaySize(view as ViewType, viewType);
+            const resized = this.resizeRendererToDisplaySize(view as ViewType, viewType);
+            let controlsUpdated = false;
             if (viewType.controls.enabled) {
-                viewType.controls.update(this.clock.getDelta());
+                controlsUpdated = viewType.controls.update(delta);
             } else {
                 viewType.camera.updateProjectionMatrix();
             }
-            viewType.renderer.render(viewType.scene, viewType.camera);
-            if (view === ViewType.PERSPECTIVE && viewType.scene.children.length !== 0) {
-                this.renderRayCaster(viewType);
+
+            const isPerspective = view === ViewType.PERSPECTIVE;
+            const isScanningView = this.action.scan === view;
+            const needsPerspectiveInteraction = isPerspective && (
+                this.mode === Mode.DRAW ||
+                this.hoverNeedsUpdate ||
+                this.isPerspectiveBeingDragged
+            );
+
+            const shouldRender = forceRenderAll || resized || controlsUpdated || isScanningView || needsPerspectiveInteraction;
+
+            if (shouldRender) {
+                viewType.renderer.render(viewType.scene, viewType.camera);
             }
-            if (clientID !== null && view !== ViewType.PERSPECTIVE) {
+
+            if (isPerspective && viewType.scene.children.length !== 0) {
+                if (shouldRender || this.hoverNeedsUpdate) {
+                    this.renderRayCaster(viewType);
+                }
+            }
+
+            if (clientID !== null && !isPerspective) {
                 viewType.rayCaster.renderer.setFromCamera(viewType.rayCaster.mouseVector, viewType.camera);
                 // First Scan
                 if (this.action.scan === view) {
@@ -2544,6 +2874,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 default:
                     break;
             }
+            this.requestRender();
         }
     }
 

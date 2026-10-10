@@ -81,3 +81,10 @@ cvat-ui/dist
 **/!.yarn/releases
 **/!.yarn/sdks
 **/!.yarn/versions
+
+# Annotator dashboard 3d ignores
+/cvat-annotator-dashboard-3d/venv/
+/cvat-annotator-dashboard-3d/data/
+/cvat-annotator-dashboard-3d/frontend/node_modules/
+/cvat-annotator-dashboard-3d/frontend/dist/
+

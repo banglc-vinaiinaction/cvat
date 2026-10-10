@@ -4,7 +4,15 @@
 
 import * as THREE from 'three';
 
+const disposedGeometries = new WeakSet<THREE.BufferGeometry>();
+const disposedMaterials = new WeakSet<THREE.Material>();
+
 function disposeMaterial(material: THREE.Material): void {
+    if (disposedMaterials.has(material)) {
+        return;
+    }
+    disposedMaterials.add(material);
+
     Object.keys(material).forEach((prop) => {
         const value = material[prop];
         if (value instanceof THREE.Texture) {
@@ -16,7 +24,10 @@ function disposeMaterial(material: THREE.Material): void {
 
 export function disposeObjectResources(object: THREE.Object3D): void {
     if ('geometry' in object && object.geometry instanceof THREE.BufferGeometry) {
-        object.geometry.dispose();
+        if (!disposedGeometries.has(object.geometry)) {
+            disposedGeometries.add(object.geometry);
+            object.geometry.dispose();
+        }
     }
 
     if ('material' in object) {
