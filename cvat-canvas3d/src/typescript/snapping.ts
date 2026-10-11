@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 import * as THREE from 'three';
-import { getClassDimensionPrior } from './consts';
+import { getClassDimensionPrior, isPedestrianClass, CLASS_DIMENSION_PRIORS } from './consts';
 
 export interface SnapMetrics {
     deltaZ: number;
@@ -663,9 +663,9 @@ export function snapCuboidToRoadAndOrient(
     }
 
     // 4. Class-Specific Dimension Constraints & Upright Posture
-    const lowerLabel = (options.labelName || '').toLowerCase();
-    const isPedestrian = lowerLabel.includes('pedestrian') || lowerLabel.includes('person');
-    const isTwoWheeler = lowerLabel.includes('motorcycle') || lowerLabel.includes('bicycle') || lowerLabel.includes('cyclist');
+    const isPedestrian = isPedestrianClass(options.labelName);
+    const lowerLabel = (options.labelName || '').toLowerCase().trim();
+    const isTwoWheeler = lowerLabel.includes('motorcycle') || lowerLabel.includes('bicycle') || lowerLabel.includes('cyclist') || lowerLabel.includes('bike');
     const isHeavyVehicle = lowerLabel.includes('truck') || lowerLabel.includes('bus') || lowerLabel.includes('trailer');
 
     if (isPedestrian) {
@@ -907,6 +907,294 @@ export function estimateLocalRoadPlane(
     return null;
 }
 
+export interface ClusterPoint {
+    px: number;
+    py: number;
+    pz: number;
+}
+
+/**
+ * Extracts candidate object cluster points within a cylindrical ROI around `center`,
+ * filtering out ground/pavement points below `localRoadZ + minHeightAboveGround`.
+ */
+export function extractClusterPoints(
+    center: [number, number, number],
+    positions: ArrayLike<number>,
+    options: {
+        radius?: number;
+        zGround?: number;
+        detectedPlane?: [number, number, number, number] | null;
+        minHeightAboveGround?: number;
+        maxHeightAboveGround?: number;
+    } = {},
+): ClusterPoint[] {
+    const [cx, cy, cz] = center;
+    const {
+        radius = 2.5,
+        zGround = cz,
+        detectedPlane = null,
+        minHeightAboveGround = 0.15,
+        maxHeightAboveGround = 2.6,
+    } = options;
+
+    if (!positions || positions.length < 9) return [];
+
+    const r2 = radius * radius;
+    const totalPoints = Math.floor(positions.length / 3);
+    const zMin = cz - 4.0;
+    const zMax = cz + 4.0;
+    const clusterPoints: ClusterPoint[] = [];
+
+    for (let i = 0; i < totalPoints; i++) {
+        const px = positions[i * 3];
+        if (Math.abs(px - cx) > radius) continue;
+        const py = positions[i * 3 + 1];
+        if (Math.abs(py - cy) > radius) continue;
+        const pz = positions[i * 3 + 2];
+        if (pz < zMin || pz > zMax) continue;
+
+        if ((px - cx) ** 2 + (py - cy) ** 2 <= r2) {
+            const localRoadZ = detectedPlane ? getRoadHeightAt(detectedPlane, px, py) : zGround;
+            if (pz >= localRoadZ + minHeightAboveGround && pz <= localRoadZ + maxHeightAboveGround) {
+                clusterPoints.push({ px, py, pz });
+            }
+        }
+    }
+
+    return clusterPoints;
+}
+
+export interface ClusterYawResult {
+    yaw: number;
+    centroidX: number;
+    centroidY: number;
+}
+
+/**
+ * Computes 2D centroid and PCA orientation for a set of cluster points.
+ * Returns null if points count is below minPoints (default 8).
+ */
+export function solveClusterYaw(
+    points: { px: number; py: number }[],
+    isXLongitudinal: boolean = true,
+    minPoints: number = 8,
+): ClusterYawResult | null {
+    if (!points || points.length < minPoints) {
+        return null;
+    }
+
+    let sumX = 0;
+    let sumY = 0;
+    for (let i = 0; i < points.length; i++) {
+        sumX += points[i].px;
+        sumY += points[i].py;
+    }
+    const centroidX = sumX / points.length;
+    const centroidY = sumY / points.length;
+
+    let cxx = 0;
+    let cxy = 0;
+    let cyy = 0;
+    for (let i = 0; i < points.length; i++) {
+        const x = points[i].px - centroidX;
+        const y = points[i].py - centroidY;
+        cxx += x * x;
+        cxy += x * y;
+        cyy += y * y;
+    }
+
+    const pcaAngle = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+    let yaw = isXLongitudinal ? pcaAngle : pcaAngle - Math.PI / 2;
+    yaw = Math.atan2(Math.sin(yaw), Math.cos(yaw));
+
+    return {
+        yaw,
+        centroidX,
+        centroidY,
+    };
+}
+
+/**
+ * Coarse 2D ground elevation spatial grid / heightmap cache.
+ * Populated once when a point cloud frame loads, enabling O(1) road elevation
+ * and road plane normal lookups during mousemove/rendering without linearly
+ * scanning the point cloud array every frame.
+ */
+export class GroundElevationGrid {
+    public readonly cellSize: number;
+    public readonly minX: number;
+    public readonly minY: number;
+    public readonly maxX: number;
+    public readonly maxY: number;
+    public readonly cols: number;
+    public readonly rows: number;
+    private readonly grid: Float32Array;
+
+    constructor(positions: ArrayLike<number>, cellSize: number = 0.5) {
+        this.cellSize = cellSize > 0 ? cellSize : 0.5;
+
+        if (!positions || positions.length < 9) {
+            this.minX = 0;
+            this.minY = 0;
+            this.maxX = 0;
+            this.maxY = 0;
+            this.cols = 0;
+            this.rows = 0;
+            this.grid = new Float32Array(0);
+            return;
+        }
+
+        const totalPoints = Math.floor(positions.length / 3);
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
+
+        for (let i = 0; i < totalPoints; i++) {
+            const px = positions[i * 3];
+            const py = positions[i * 3 + 1];
+            const pz = positions[i * 3 + 2];
+            if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) continue;
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+        }
+
+        if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+            this.minX = 0;
+            this.minY = 0;
+            this.maxX = 0;
+            this.maxY = 0;
+            this.cols = 0;
+            this.rows = 0;
+            this.grid = new Float32Array(0);
+            return;
+        }
+
+        let effectiveCellSize = this.cellSize;
+        const width = maxX - minX;
+        const height = maxY - minY;
+        let c = Math.ceil(width / effectiveCellSize) + 1;
+        let r = Math.ceil(height / effectiveCellSize) + 1;
+
+        if (c * r > 1_000_000) {
+            effectiveCellSize = Math.max(width, height) / 1000;
+            c = Math.ceil(width / effectiveCellSize) + 1;
+            r = Math.ceil(height / effectiveCellSize) + 1;
+        }
+
+        this.cellSize = effectiveCellSize;
+        this.minX = minX;
+        this.minY = minY;
+        this.maxX = maxX;
+        this.maxY = maxY;
+        this.cols = c;
+        this.rows = r;
+
+        const grid = new Float32Array(c * r);
+        grid.fill(Infinity);
+
+        for (let i = 0; i < totalPoints; i++) {
+            const px = positions[i * 3];
+            const py = positions[i * 3 + 1];
+            const pz = positions[i * 3 + 2];
+            if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) continue;
+
+            const col = Math.floor((px - minX) / effectiveCellSize);
+            const row = Math.floor((py - minY) / effectiveCellSize);
+            if (col >= 0 && col < c && row >= 0 && row < r) {
+                const idx = row * c + col;
+                if (pz < grid[idx]) {
+                    grid[idx] = pz;
+                }
+            }
+        }
+
+        this.grid = grid;
+    }
+
+    /**
+     * Looks up road/ground elevation at (x, y) in O(1) time.
+     * If the cell is empty (e.g. gap between LiDAR rings), searches expanding neighbor cells.
+     */
+    public getElevation(x: number, y: number, maxSearchRadiusCells: number = 2): number | null {
+        if (this.cols === 0 || this.rows === 0) return null;
+
+        const col = Math.floor((x - this.minX) / this.cellSize);
+        const row = Math.floor((y - this.minY) / this.cellSize);
+
+        if (col >= 0 && col < this.cols && row >= 0 && row < this.rows) {
+            const val = this.grid[row * this.cols + col];
+            if (val !== Infinity) return val;
+        }
+
+        for (let rad = 1; rad <= maxSearchRadiusCells; rad++) {
+            for (let dr = -rad; dr <= rad; dr++) {
+                for (let dc = -rad; dc <= rad; dc++) {
+                    const r = row + dr;
+                    const c = col + dc;
+                    if (r >= 0 && r < this.rows && c >= 0 && c < this.cols) {
+                        const val = this.grid[r * this.cols + c];
+                        if (val !== Infinity) return val;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Estimates local road plane [nA, nB, nC, nD] at (x, y) using heightmap finite differences in O(1).
+     * Returns plane equation coefficients [nA, nB, nC, nD] where nA*x + nB*y + nC*z + nD = 0,
+     * or null if normal is not sufficiently upward-pointing (nC >= 0.80).
+     */
+    public getRoadPlane(x: number, y: number): [number, number, number, number] | null {
+        const z0 = this.getElevation(x, y);
+        if (z0 === null) return null;
+
+        const step = Math.max(this.cellSize, 1.0);
+        const zRight = this.getElevation(x + step, y);
+        const zLeft = this.getElevation(x - step, y);
+        const zTop = this.getElevation(x, y + step);
+        const zBottom = this.getElevation(x, y - step);
+
+        let dzDx = 0;
+        if (zRight !== null && zLeft !== null) {
+            dzDx = (zRight - zLeft) / (2 * step);
+        } else if (zRight !== null) {
+            dzDx = (zRight - z0) / step;
+        } else if (zLeft !== null) {
+            dzDx = (z0 - zLeft) / step;
+        }
+
+        let dzDy = 0;
+        if (zTop !== null && zBottom !== null) {
+            dzDy = (zTop - zBottom) / (2 * step);
+        } else if (zTop !== null) {
+            dzDy = (zTop - z0) / step;
+        } else if (zBottom !== null) {
+            dzDy = (z0 - zBottom) / step;
+        }
+
+        const nx = -dzDx;
+        const ny = -dzDy;
+        const nz = 1.0;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+        if (len < 1e-6) return null;
+
+        const normX = nx / len;
+        const normY = ny / len;
+        const normZ = nz / len;
+
+        if (normZ < 0.80) return null;
+
+        const d = -(normX * x + normY * y + normZ * z0);
+        return [normX, normY, normZ, d];
+    }
+}
+
 /**
  * Fits a 3D bounding box cluster around a clicked point.
  * Estimates local ground surface, filters out pavement, and if >= 8 vehicle points exist,
@@ -917,6 +1205,8 @@ export function fitClusterAtPoint(
     positions: ArrayLike<number>,
     options: {
         labelName?: string;
+        label?: any;
+        attributes?: any;
         defaultDims?: [number, number, number];
         snapGround?: boolean;
         autoOrient?: boolean;
@@ -925,13 +1215,18 @@ export function fitClusterAtPoint(
     const [cx, cy, cz] = clickedPoint;
     const {
         labelName,
+        label,
+        attributes,
         defaultDims,
         snapGround = true,
         autoOrient = true,
     } = options;
-    const [dx, dy, dz] = defaultDims || getClassDimensionPrior(labelName);
-    const lowerLabel = (labelName || '').toLowerCase().trim();
-    const isPedestrian = lowerLabel.includes('pedestrian') || lowerLabel.includes('person');
+    const [dx, dy, dz] = defaultDims || getClassDimensionPrior(label || labelName, {
+        attributes,
+        label,
+        defaultDims,
+    });
+    const isPedestrian = isPedestrianClass(label || labelName);
 
     if (!positions || positions.length < 9) {
         return {
@@ -945,143 +1240,78 @@ export function fitClusterAtPoint(
     }
 
     const radius = 2.5;
-    const r2 = radius * radius;
-    const totalPoints = Math.floor(positions.length / 3);
-    const localIndices: number[] = [];
-    const zMin = cz - 4.0;
-    const zMax = cz + 4.0;
+    const detectedPlane = snapGround ? estimateLocalRoadPlane(cx, cy, cz, positions, radius) : null;
+    const zGround = detectedPlane ? getRoadHeightAt(detectedPlane, cx, cy) : cz;
 
-    for (let i = 0; i < totalPoints; i++) {
-        const px = positions[i * 3];
-        if (Math.abs(px - cx) > radius) continue;
-        const py = positions[i * 3 + 1];
-        if (Math.abs(py - cy) > radius) continue;
-        const pz = positions[i * 3 + 2];
-        if (pz < zMin || pz > zMax) continue;
+    const clusterPoints = extractClusterPoints([cx, cy, cz], positions, {
+        radius,
+        zGround,
+        detectedPlane,
+        minHeightAboveGround: 0.15,
+        maxHeightAboveGround: Math.max(dz, 1.8) + 0.8,
+    });
 
-        if ((px - cx) ** 2 + (py - cy) ** 2 <= r2) {
-            localIndices.push(i);
-        }
-    }
+    const isXLongitudinal = dx >= dy;
+    const yawResult = autoOrient ? solveClusterYaw(clusterPoints, isXLongitudinal) : null;
 
-    let detectedPlane: [number, number, number, number] | null = null;
-    let zGround = cz;
+    let finalDx = dx;
+    let finalDy = dy;
+    let finalDz = dz;
 
-    if (snapGround && localIndices.length >= 4) {
-        const sortedIndices = [...localIndices].sort(
-            (a, b) => positions[a * 3 + 2] - positions[b * 3 + 2],
+    if (!defaultDims && clusterPoints.length >= 8 && yawResult) {
+        const lower = (labelName || '').toLowerCase().trim();
+        const hasCustomPrior = lower && (
+            CLASS_DIMENSION_PRIORS[lower] ||
+            (attributes && Object.keys(attributes).length > 0)
         );
-        const lprCount = Math.max(3, Math.floor(sortedIndices.length * 0.25));
-        let lprSum = 0;
-        for (let k = 0; k < lprCount; k++) {
-            lprSum += positions[sortedIndices[k] * 3 + 2];
-        }
-        const lprZ = lprSum / lprCount;
-
-        const groundSeeds = sortedIndices.filter((idx) => {
-            const pz = positions[idx * 3 + 2];
-            return pz >= lprZ - 0.15 && pz <= lprZ + 0.25;
-        });
-
-        const ptsForFit = groundSeeds.length >= 4 ?
-            groundSeeds :
-            sortedIndices.slice(0, Math.min(sortedIndices.length, 20));
-
-        const plane = fitGroundPlaneGPF(positions, ptsForFit, {
-            lprRatio: 0.25,
-            seedThreshold: 0.15,
-            distanceThreshold: 0.08,
-        });
-
-        if (plane[2] >= 0.80) {
-            detectedPlane = plane;
-            zGround = getRoadHeightAt(plane, cx, cy);
-        } else {
-            zGround = lprZ;
+        if (!hasCustomPrior) {
+            const cosYaw = Math.cos(yawResult.yaw);
+            const sinYaw = Math.sin(yawResult.yaw);
+            const uVals: number[] = [];
+            const vVals: number[] = [];
+            const zVals: number[] = [];
+            for (const pt of clusterPoints) {
+                const du = (pt.px - yawResult.centroidX) * cosYaw + (pt.py - yawResult.centroidY) * sinYaw;
+                const dv = -(pt.px - yawResult.centroidX) * sinYaw + (pt.py - yawResult.centroidY) * cosYaw;
+                uVals.push(du);
+                vVals.push(dv);
+                zVals.push(pt.pz);
+            }
+            uVals.sort((a, b) => a - b);
+            vVals.sort((a, b) => a - b);
+            zVals.sort((a, b) => a - b);
+            const n = clusterPoints.length;
+            const uSpan = uVals[Math.min(n - 1, Math.floor(n * 0.95))] - uVals[Math.floor(n * 0.05)] + 0.15;
+            const vSpan = vVals[Math.min(n - 1, Math.floor(n * 0.95))] - vVals[Math.floor(n * 0.05)] + 0.10;
+            const zSpan = zVals[Math.min(n - 1, Math.floor(n * 0.98))] - zGround;
+            if (uSpan >= 0.5 && uSpan <= 15.0) finalDx = parseFloat(uSpan.toFixed(3));
+            if (vSpan >= 0.4 && vSpan <= 4.0) finalDy = parseFloat(vSpan.toFixed(3));
+            if (zSpan >= 0.4 && zSpan <= 5.0) finalDz = parseFloat(zSpan.toFixed(3));
         }
     }
 
-    // Filter out pavement points (z < zGround + 0.15m)
-    const vehiclePoints: { px: number; py: number; pz: number }[] = [];
-    for (const idx of localIndices) {
-        const px = positions[idx * 3];
-        const py = positions[idx * 3 + 1];
-        const pz = positions[idx * 3 + 2];
+    const finalX = yawResult ? yawResult.centroidX : cx;
+    const finalY = yawResult ? yawResult.centroidY : cy;
+    const yaw = (yawResult && !isPedestrian) ? yawResult.yaw : 0;
 
-        const localRoadZ = (snapGround && detectedPlane) ? getRoadHeightAt(detectedPlane, px, py) : zGround;
-        if (pz >= localRoadZ + 0.15 && pz <= localRoadZ + Math.max(dz, 1.8) + 0.8) {
-            vehiclePoints.push({ px, py, pz });
-        }
-    }
-
-    let finalX = cx;
-    let finalY = cy;
-    let finalZ = (snapGround ? zGround : cz) + dz / 2;
     let rx = 0;
     let ry = 0;
     let rz = 0;
 
-    if (autoOrient && vehiclePoints.length >= 8) {
-        let sumX = 0;
-        let sumY = 0;
-        for (const pt of vehiclePoints) {
-            sumX += pt.px;
-            sumY += pt.py;
-        }
-        finalX = sumX / vehiclePoints.length;
-        finalY = sumY / vehiclePoints.length;
-
-        let cxx = 0;
-        let cxy = 0;
-        let cyy = 0;
-        for (const pt of vehiclePoints) {
-            const x = pt.px - finalX;
-            const y = pt.py - finalY;
-            cxx += x * x;
-            cxy += x * y;
-            cyy += y * y;
-        }
-        const pcaAngle = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
-
-        const isXLongitudinal = dx >= dy;
-        let yaw = isXLongitudinal ? pcaAngle : pcaAngle - Math.PI / 2;
-        yaw = Math.atan2(Math.sin(yaw), Math.cos(yaw));
-
-        if (isPedestrian) {
-            yaw = 0;
-            rx = 0;
-            ry = 0;
-            rz = 0;
-        } else if (snapGround && detectedPlane) {
-            const aligned = alignEulerToRoadPlane(yaw, detectedPlane);
-            rx = aligned.rx;
-            ry = aligned.ry;
-            rz = aligned.rz;
-        } else {
-            rx = 0;
-            ry = 0;
-            rz = yaw;
-        }
-
-        const roadZAtCentroid = (snapGround && detectedPlane) ?
-            getRoadHeightAt(detectedPlane, finalX, finalY) : zGround;
-        finalZ = (snapGround ? roadZAtCentroid : cz) + dz / 2;
+    if (isPedestrian || !snapGround || !detectedPlane) {
+        rx = 0;
+        ry = 0;
+        rz = yaw;
     } else {
-        finalX = cx;
-        finalY = cy;
-        finalZ = (snapGround ? zGround : cz) + dz / 2;
-
-        if (isPedestrian || !snapGround || !detectedPlane) {
-            rx = 0;
-            ry = 0;
-            rz = 0;
-        } else {
-            const aligned = alignEulerToRoadPlane(0, detectedPlane);
-            rx = aligned.rx;
-            ry = aligned.ry;
-            rz = aligned.rz;
-        }
+        const aligned = alignEulerToRoadPlane(yaw, detectedPlane);
+        rx = aligned.rx;
+        ry = aligned.ry;
+        rz = aligned.rz;
     }
+
+    const roadZAtCentroid = (snapGround && detectedPlane) ?
+        getRoadHeightAt(detectedPlane, finalX, finalY) : zGround;
+    const finalZ = (snapGround ? roadZAtCentroid : cz) + finalDz / 2;
 
     return {
         points: [
@@ -1091,9 +1321,9 @@ export function fitClusterAtPoint(
             rx,
             ry,
             parseFloat(rz.toFixed(4)),
-            dx,
-            dy,
-            dz,
+            finalDx,
+            finalDy,
+            finalDz,
             0, 0, 0, 0, 0, 0, 0,
         ],
     };

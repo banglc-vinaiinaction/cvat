@@ -8,7 +8,7 @@ import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader';
 import CameraControls from 'camera-controls';
 import { Canvas3dController } from './canvas3dController';
 import { Listener, Master } from './master';
-import consts, { getClassDimensionPrior } from './consts';
+import consts, { getClassDimensionPrior, isPedestrianClass } from './consts';
 import {
     Canvas3dModel, DrawData, Mode, Planes, UpdateReasons, ViewType,
 } from './canvas3dModel';
@@ -20,8 +20,8 @@ import {
 import { ObjectState, ObjectType } from '.';
 import { disposeScene } from './utils';
 import {
-    snapCuboidToRoadAndOrient, fitClusterAtPoint, estimateLocalRoadPlane,
-    alignEulerToRoadPlane, getRoadHeightAt,
+    snapCuboidToRoadAndOrient, fitClusterAtPoint,
+    alignEulerToRoadPlane, GroundElevationGrid,
 } from './snapping';
 
 export interface Canvas3dView {
@@ -149,6 +149,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private hoverNeedsUpdate: boolean;
     private needsRenderCount: number = 2;
     private pointCloudPoints: any = null;
+    private groundGrid: GroundElevationGrid | null = null;
     private previousCuboids: Map<number, number[][]> = new Map();
 
     public requestRender(frameCount: number = 2): void {
@@ -999,12 +1000,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 let points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
                 const initState = this.model.data.drawData.initialState;
                 if (this.pointCloudPoints?.geometry?.attributes?.position?.array) {
-                    const labelName = initState?.label?.name;
+                    const label = initState?.label;
+                    const labelName = label?.name;
                     points = fitClusterAtPoint(
                         [x, y, z],
                         this.pointCloudPoints.geometry.attributes.position.array,
                         {
                             labelName,
+                            label,
+                            attributes: initState?.attributes,
                             defaultDims: this.controller.drawData.initialDimensions,
                             snapGround: this.controller.drawData.snapGround ?? true,
                             autoOrient: this.controller.drawData.autoOrient ?? true,
@@ -1313,12 +1317,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             );
         } else {
             if (this.pointCloudPoints?.geometry?.attributes?.position?.array) {
-                const labelName = initState?.label?.name;
+                const label = initState?.label;
+                const labelName = label?.name;
                 const fitted = fitClusterAtPoint(
                     [x, y, z],
                     this.pointCloudPoints.geometry.attributes.position.array,
                     {
                         labelName,
+                        label,
+                        attributes: initState?.attributes,
                         defaultDims: this.controller.drawData.initialDimensions,
                         snapGround: this.controller.drawData.snapGround ?? true,
                         autoOrient: this.controller.drawData.autoOrient ?? true,
@@ -2308,8 +2315,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 this.cube.setOrientationVisibility(this.model.data.configuration.orientationVisibility);
             }
 
-            const labelName = data.initialState?.label?.name;
-            const [dx, dy, dz] = data.initialDimensions || getClassDimensionPrior(labelName);
+            const label = data.initialState?.label;
+            const labelName = label?.name;
+            const [dx, dy, dz] = data.initialDimensions || getClassDimensionPrior(label || labelName, {
+                attributes: data.initialState?.attributes,
+                label,
+            });
             if (!Number.isInteger(data.redraw) && (!data.initialState || !Array.isArray(data.initialState.points))) {
                 this.cube.perspective.scale.set(dx, dy, dz);
             }
@@ -2412,6 +2423,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     private clearScene(): void {
         this.pointCloudPoints = null;
+        this.groundGrid = null;
         this.previousCuboids.clear();
         Object.entries(this.drawnObjects).forEach(([clientID, { cuboid }]) => {
             this.removeSceneChildren(cuboid, +clientID);
@@ -2521,8 +2533,22 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return helperWorldSize;
     }
 
+    private getGroundGrid(): GroundElevationGrid | null {
+        if (!this.pointCloudPoints?.geometry?.attributes?.position?.array) {
+            this.groundGrid = null;
+            return null;
+        }
+        if (!this.groundGrid) {
+            const positions = this.pointCloudPoints.geometry.attributes.position.array;
+            this.groundGrid = new GroundElevationGrid(positions, 0.5);
+        }
+        return this.groundGrid;
+    }
+
     private onSceneImageLoaded(points: any): void {
         this.pointCloudPoints = points;
+        const positions = points?.geometry?.attributes?.position?.array;
+        this.groundGrid = positions ? new GroundElevationGrid(positions, 0.5) : null;
         const getCameraSettingsToFitScene = (
             camera: THREE.PerspectiveCamera,
             boundingBox: THREE.Box3,
@@ -2733,23 +2759,22 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 if (object) {
                     const { x, y, z } = intersection.point;
                     const h = this.cube.perspective.scale.z;
-                    const positions = this.pointCloudPoints?.geometry?.attributes?.position?.array;
                     let zGround = z;
                     let rx = 0;
                     let ry = 0;
                     const rz = object.rotation.z;
 
-                    if (positions) {
-                        const plane = estimateLocalRoadPlane(x, y, z, positions);
-                        if (plane) {
-                            const roadZ = getRoadHeightAt(plane, x, y);
-                            if (Math.abs(roadZ - z) <= 2.5) {
-                                zGround = roadZ;
-                            }
-                            const labelName = this.controller.drawData.initialState?.label?.name;
-                            const lowerLabel = (labelName || '').toLowerCase().trim();
-                            const isPedestrian = lowerLabel.includes('pedestrian') || lowerLabel.includes('person');
-                            if (!isPedestrian) {
+                    const groundGrid = this.getGroundGrid();
+                    if (groundGrid) {
+                        const roadZ = groundGrid.getElevation(x, y);
+                        if (roadZ !== null && Math.abs(roadZ - z) <= 2.5) {
+                            zGround = roadZ;
+                        }
+                        const label = this.controller.drawData.initialState?.label;
+                        const isPedestrian = isPedestrianClass(label || label?.name);
+                        if (!isPedestrian) {
+                            const plane = groundGrid.getRoadPlane(x, y);
+                            if (plane) {
                                 const aligned = alignEulerToRoadPlane(rz, plane);
                                 rx = aligned.rx;
                                 ry = aligned.ry;
