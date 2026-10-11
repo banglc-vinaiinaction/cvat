@@ -151,7 +151,10 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             activatedStateID: state.annotation.annotations.activatedStateID,
         }),
     );
-    const activeTargetID = activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null);
+    const canvasActiveID = canvasInstance && typeof (canvasInstance as any).getActiveElement === 'function' ?
+        (canvasInstance as any).getActiveElement() : null;
+    const activeTargetID = canvasActiveID !== null ? canvasActiveID :
+        (activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null));
 
     const applicableLabels = filterApplicableForType(LabelType.CUBOID, labels);
     const preventDefault = (event: KeyboardEvent | undefined): void => {

@@ -28,7 +28,10 @@ function SnapToRoadControl(props: Props): JSX.Element {
         }),
     );
 
-    const targetID = activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null);
+    const canvasActiveID = canvasInstance && typeof (canvasInstance as any).getActiveElement === 'function' ?
+        (canvasInstance as any).getActiveElement() : null;
+    const targetID = canvasActiveID !== null ? canvasActiveID :
+        (activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null));
 
     const onClick = (): void => {
         if (!disabled) {

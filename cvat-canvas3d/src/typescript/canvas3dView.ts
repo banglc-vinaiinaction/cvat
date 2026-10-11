@@ -158,19 +158,24 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
     }
 
+    public getActiveElement(): number | null {
+        if (this.activatedElementID !== null) return this.activatedElementID;
+        if (this.model.data.activeElement.clientID !== null) return +this.model.data.activeElement.clientID;
+        return null;
+    }
+
     public snapToRoad(clientID?: number | null): void {
         let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
         if (targetClientID === null) {
-            if (this.activatedElementID !== null) {
-                targetClientID = this.activatedElementID;
-            } else if (this.model.data.activeElement.clientID !== null) {
-                targetClientID = +this.model.data.activeElement.clientID;
-            }
+            targetClientID = this.getActiveElement();
         }
 
         if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
             return;
         }
+
+        this.model.data.activeElement.clientID = `${targetClientID}`;
+        this.activatedElementID = targetClientID;
 
         if (!this.pointCloudPoints?.geometry?.attributes?.position?.array) {
             return;
@@ -257,16 +262,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     public revertSnap(clientID?: number | null): boolean {
         let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
         if (targetClientID === null) {
-            if (this.activatedElementID !== null) {
-                targetClientID = this.activatedElementID;
-            } else if (this.model.data.activeElement.clientID !== null) {
-                targetClientID = +this.model.data.activeElement.clientID;
-            }
+            targetClientID = this.getActiveElement();
         }
 
         if (targetClientID === null || !this.previousCuboids.has(targetClientID)) {
             return false;
         }
+
+        this.model.data.activeElement.clientID = `${targetClientID}`;
+        this.activatedElementID = targetClientID;
 
         const stack = this.previousCuboids.get(targetClientID)!;
         if (stack.length === 0) {
@@ -367,16 +371,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     public invertHeading(clientID?: number | null): void {
         let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
         if (targetClientID === null) {
-            if (this.activatedElementID !== null) {
-                targetClientID = this.activatedElementID;
-            } else if (this.model.data.activeElement.clientID !== null) {
-                targetClientID = +this.model.data.activeElement.clientID;
-            }
+            targetClientID = this.getActiveElement();
         }
 
         if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
             return;
         }
+
+        this.model.data.activeElement.clientID = `${targetClientID}`;
+        this.activatedElementID = targetClientID;
 
         const { cuboid, data } = this.drawnObjects[targetClientID];
         if (data.lock) return;
@@ -1047,17 +1050,16 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 this.onSplitDone(objectState);
             } else if (this.mode === Mode.IDLE) {
                 const intersectedClientID = intersects[0]?.object?.name || null;
-                if (this.model.data.activeElement.clientID !== intersectedClientID) {
-                    this.dispatchEvent(
-                        new CustomEvent('canvas.selected', {
-                            bubbles: false,
-                            cancelable: true,
-                            detail: {
-                                clientID: typeof intersectedClientID === 'string' ? +intersectedClientID : null,
-                            },
-                        }),
-                    );
-                }
+                const nextID = typeof intersectedClientID === 'string' && intersectedClientID !== '' ? +intersectedClientID : null;
+                this.dispatchEvent(
+                    new CustomEvent('canvas.selected', {
+                        bubbles: false,
+                        cancelable: true,
+                        detail: {
+                            clientID: nextID,
+                        },
+                    }),
+                );
             }
         });
 
@@ -2930,19 +2932,24 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     private detachCamera(view?: ViewType): void {
-        const coordTop = this.selectedCuboid.getReferenceCoordinates(ViewType.TOP);
+        const cuboid = this.selectedCuboid;
+        if (!cuboid) {
+            return;
+        }
+
+        const coordTop = cuboid.getReferenceCoordinates(ViewType.TOP);
         const sphericaltop = new THREE.Spherical();
         sphericaltop.setFromVector3(coordTop);
 
-        const coordSide = this.selectedCuboid.getReferenceCoordinates(ViewType.SIDE);
+        const coordSide = cuboid.getReferenceCoordinates(ViewType.SIDE);
         const sphericalside = new THREE.Spherical();
         sphericalside.setFromVector3(coordSide);
 
-        const coordFront = this.selectedCuboid.getReferenceCoordinates(ViewType.FRONT);
+        const coordFront = cuboid.getReferenceCoordinates(ViewType.FRONT);
         const sphericalfront = new THREE.Spherical();
         sphericalfront.setFromVector3(coordFront);
 
-        const { side: objectSideView, front: objectFrontView, top: objectTopView } = this.selectedCuboid;
+        const { side: objectSideView, front: objectFrontView, top: objectTopView } = cuboid;
         const sideWorld = objectSideView.getWorldPosition(new THREE.Vector3());
         const frontWorld = objectFrontView.getWorldPosition(new THREE.Vector3());
         const topWorld = objectTopView.getWorldPosition(new THREE.Vector3());
@@ -3031,7 +3038,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 sceneFrontPlane.rotateZ(direction);
                 break;
             default: {
-                const { top: objectTopView, side: objectSideView, front: objectFrontView } = this.selectedCuboid;
+                const cuboid = this.selectedCuboid;
+                if (!cuboid) {
+                    return;
+                }
+
+                const { top: objectTopView, side: objectSideView, front: objectFrontView } = cuboid;
 
                 const quaternionSide = objectSideView.getObjectByName(consts.PLANE_ROTATION_HELPER)
                     .getWorldQuaternion(new THREE.Quaternion());

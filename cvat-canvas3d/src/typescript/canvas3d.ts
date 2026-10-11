@@ -41,6 +41,7 @@ interface Canvas3d {
     revertSnap(clientID?: number | null): boolean;
     getPreviousCuboid(clientID?: number | null): number[] | null;
     invertHeading(clientID?: number | null): void;
+    getActiveElement(): number | null;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -141,6 +142,10 @@ class Canvas3dImpl implements Canvas3d {
 
     public invertHeading(clientID?: number | null): void {
         this.view.invertHeading(clientID);
+    }
+
+    public getActiveElement(): number | null {
+        return this.view.getActiveElement();
     }
 
     public async snapTrackToRoad(

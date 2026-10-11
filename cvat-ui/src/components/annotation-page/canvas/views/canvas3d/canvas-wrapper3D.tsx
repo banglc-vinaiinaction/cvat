@@ -725,6 +725,9 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
             return;
         }
 
+        onActivateObject(clientID);
+        canvasInstance.activate(clientID);
+
         const objectState = annotations.find((state) => state.clientID === clientID);
 
         if (!objectState) {
