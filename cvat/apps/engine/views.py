@@ -22,6 +22,7 @@ from attr.converters import to_bool
 from django.conf import settings
 from django.core.files.storage import storages
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 from django.db.models.query import Prefetch, prefetch_related_objects
 from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseNotFound
 from drf_spectacular.types import OpenApiTypes
@@ -147,6 +148,7 @@ from cvat.apps.engine.serializers import (
     TaskValidationLayoutWriteSerializer,
     TaskWriteSerializer,
     UserSerializer,
+    StandardizeCuboidsSerializer,
 )
 from cvat.apps.engine.task import ensure_task_is_initialized
 from cvat.apps.engine.tus import TusFile
@@ -1010,6 +1012,104 @@ class _JobDataGetter(_DataGetter):
         )
 
 
+def _standardize_cuboids_impl(
+    *,
+    task_id: int | None,
+    job_id: int | None,
+    label_id: int,
+    dx: float,
+    dy: float,
+    dz: float,
+    reground: bool = True,
+    frame_from: int | None = None,
+    frame_to: int | None = None,
+) -> tuple[int, int]:
+    updated_shapes = 0
+    updated_tracks = 0
+
+    with transaction.atomic():
+        if job_id is not None:
+            labeled_shapes_qs = models.LabeledShape.objects.filter(
+                job_id=job_id,
+                type=models.ShapeType.CUBOID,
+                label_id=label_id,
+            )
+            tracked_shapes_qs = models.TrackedShape.objects.filter(
+                track__job_id=job_id,
+                type=models.ShapeType.CUBOID,
+                track__label_id=label_id,
+            )
+        else:
+            labeled_shapes_qs = models.LabeledShape.objects.filter(
+                job__segment__task_id=task_id,
+                type=models.ShapeType.CUBOID,
+                label_id=label_id,
+            )
+            tracked_shapes_qs = models.TrackedShape.objects.filter(
+                track__job__segment__task_id=task_id,
+                type=models.ShapeType.CUBOID,
+                track__label_id=label_id,
+            )
+
+        if frame_from is not None:
+            labeled_shapes_qs = labeled_shapes_qs.filter(frame__gte=frame_from)
+            tracked_shapes_qs = tracked_shapes_qs.filter(frame__gte=frame_from)
+        if frame_to is not None:
+            labeled_shapes_qs = labeled_shapes_qs.filter(frame__lte=frame_to)
+            tracked_shapes_qs = tracked_shapes_qs.filter(frame__lte=frame_to)
+
+        shapes_to_update = []
+        for shape in labeled_shapes_qs.iterator(chunk_size=1000):
+            pts = list(shape.points)
+            if len(pts) >= 9:
+                if reground:
+                    old_z = pts[2]
+                    old_dz = pts[8]
+                    z_bottom = old_z - old_dz / 2.0
+                    pts[2] = round(z_bottom + dz / 2.0, 4)
+                pts[6] = round(dx, 4)
+                pts[7] = round(dy, 4)
+                pts[8] = round(dz, 4)
+                shape.points = pts
+                shapes_to_update.append(shape)
+                if len(shapes_to_update) >= 1000:
+                    models.LabeledShape.objects.bulk_update(shapes_to_update, ["points"])
+                    updated_shapes += len(shapes_to_update)
+                    shapes_to_update = []
+        if shapes_to_update:
+            models.LabeledShape.objects.bulk_update(shapes_to_update, ["points"])
+            updated_shapes += len(shapes_to_update)
+
+        tracks_to_update = []
+        for shape in tracked_shapes_qs.iterator(chunk_size=1000):
+            pts = list(shape.points)
+            if len(pts) >= 9:
+                if reground:
+                    old_z = pts[2]
+                    old_dz = pts[8]
+                    z_bottom = old_z - old_dz / 2.0
+                    pts[2] = round(z_bottom + dz / 2.0, 4)
+                pts[6] = round(dx, 4)
+                pts[7] = round(dy, 4)
+                pts[8] = round(dz, 4)
+                shape.points = pts
+                tracks_to_update.append(shape)
+                if len(tracks_to_update) >= 1000:
+                    models.TrackedShape.objects.bulk_update(tracks_to_update, ["points"])
+                    updated_tracks += len(tracks_to_update)
+                    tracks_to_update = []
+        if tracks_to_update:
+            models.TrackedShape.objects.bulk_update(tracks_to_update, ["points"])
+            updated_tracks += len(tracks_to_update)
+
+        if job_id is not None:
+            models.Job.objects.filter(pk=job_id).update(updated_date=timezone.now())
+        elif task_id is not None:
+            models.Task.objects.filter(pk=task_id).update(updated_date=timezone.now())
+
+    return updated_shapes, updated_tracks
+
+
 @extend_schema(tags=["tasks"])
 @extend_schema_view(
     list=extend_schema(
@@ -1854,6 +1954,50 @@ class TaskViewSet(
         self._object = self.get_object()
         return self.append_tus_chunk(request, file_id)
 
+    @extend_schema(
+        methods=["POST"],
+        summary="Standardize cuboid dimensions en-masse across task",
+        request=StandardizeCuboidsSerializer,
+        responses={
+            "200": OpenApiResponse(description="Cuboid dimensions standardized"),
+        },
+    )
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path=r"annotations/standardize/?$",
+        serializer_class=StandardizeCuboidsSerializer,
+    )
+    def standardize_annotations(self, request: ExtendedRequest, pk: int):
+        self._object = self.get_object()
+        serializer = StandardizeCuboidsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        label_id = data["label_id"]
+        dx, dy, dz = data["dimensions"]
+        reground = data.get("reground", True)
+        frame_from = data.get("frame_from")
+        frame_to = data.get("frame_to")
+
+        updated_shapes, updated_tracks = _standardize_cuboids_impl(
+            task_id=pk,
+            job_id=None,
+            label_id=label_id,
+            dx=dx,
+            dy=dy,
+            dz=dz,
+            reground=reground,
+            frame_from=frame_from,
+            frame_to=frame_to,
+        )
+
+        return Response({
+            "updated_shapes": updated_shapes,
+            "updated_tracks": updated_tracks,
+            "total": updated_shapes + updated_tracks,
+        })
+
     ### --- DEPRECATED METHOD --- ###
     @extend_schema(
         summary="Get the creation status of a task",
@@ -2565,6 +2709,50 @@ class JobViewSet(
     def append_annotations_chunk(self, request: ExtendedRequest, pk: int, file_id: str):
         self._object = self.get_object()
         return self.append_tus_chunk(request, file_id)
+
+    @extend_schema(
+        methods=["POST"],
+        summary="Standardize cuboid dimensions en-masse across job",
+        request=StandardizeCuboidsSerializer,
+        responses={
+            "200": OpenApiResponse(description="Cuboid dimensions standardized"),
+        },
+    )
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path=r"annotations/standardize/?$",
+        serializer_class=StandardizeCuboidsSerializer,
+    )
+    def standardize_annotations(self, request: ExtendedRequest, pk: int):
+        self._object = self.get_object()
+        serializer = StandardizeCuboidsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        label_id = data["label_id"]
+        dx, dy, dz = data["dimensions"]
+        reground = data.get("reground", True)
+        frame_from = data.get("frame_from")
+        frame_to = data.get("frame_to")
+
+        updated_shapes, updated_tracks = _standardize_cuboids_impl(
+            task_id=None,
+            job_id=pk,
+            label_id=label_id,
+            dx=dx,
+            dy=dy,
+            dz=dz,
+            reground=reground,
+            frame_from=frame_from,
+            frame_to=frame_to,
+        )
+
+        return Response({
+            "updated_shapes": updated_shapes,
+            "updated_tracks": updated_tracks,
+            "total": updated_shapes + updated_tracks,
+        })
 
     @extend_schema(exclude=True)
     @action(detail=True, methods=["GET"], serializer_class=None, url_path="dataset")

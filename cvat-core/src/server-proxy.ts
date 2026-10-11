@@ -1887,6 +1887,27 @@ async function updateAnnotations(
     return response.data;
 }
 
+async function standardizeCuboids(
+    session: 'task' | 'job',
+    id: number,
+    data: {
+        label_id: number;
+        dimensions: [number, number, number];
+        reground?: boolean;
+        frame_from?: number | null;
+        frame_to?: number | null;
+    },
+): Promise<{ updated_shapes: number; updated_tracks: number; total: number }> {
+    const { backendAPI } = config;
+    const url = `${backendAPI}/${session}s/${id}/annotations/standardize/`;
+    try {
+        const response = await Axios.post(url, data);
+        return response.data;
+    } catch (errorData) {
+        throw generateError(errorData);
+    }
+}
+
 // Session is 'task' or 'job'
 async function uploadAnnotations(
     session,
@@ -2826,6 +2847,7 @@ export default Object.freeze({
         updateAnnotations,
         getAnnotations,
         uploadAnnotations,
+        standardizeCuboids,
     }),
 
     events: Object.freeze({

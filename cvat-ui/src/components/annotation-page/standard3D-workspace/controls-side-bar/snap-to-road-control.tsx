@@ -17,10 +17,13 @@ export interface Props {
     canvasInstance: Canvas3d;
     disabled?: boolean;
     jobInstance?: any;
+    onOpenStandardizeModal?: () => void;
 }
 
 function SnapToRoadControl(props: Props): JSX.Element {
-    const { canvasInstance, disabled, jobInstance } = props;
+    const {
+        canvasInstance, disabled, jobInstance, onOpenStandardizeModal,
+    } = props;
     const { selectedStatesID, activatedStateID } = useSelector(
         (state: CombinedState) => ({
             selectedStatesID: state.annotation.annotations.selectedStatesID,
@@ -137,6 +140,18 @@ function SnapToRoadControl(props: Props): JSX.Element {
             onClick: () => {
                 if (targetID !== null) {
                     canvasInstance.revertSnap(targetID);
+                }
+            },
+        },
+        {
+            type: 'divider' as const,
+        },
+        {
+            key: 'standardize',
+            label: 'Standardize Dimensions (En-Masse)...',
+            onClick: () => {
+                if (onOpenStandardizeModal) {
+                    onOpenStandardizeModal();
                 }
             },
         },

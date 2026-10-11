@@ -48,6 +48,7 @@ interface Props {
     pasteShape(): void;
     resetGroup(): void;
     updateActiveControl(activeControl: ActiveControl): void;
+    onOpenStandardizeModal?(): void;
 }
 
 const componentShortcuts: Record<string, KeyMapItem> = {
@@ -362,6 +363,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
                 canvasInstance={canvasInstance}
                 disabled={controlsDisabled}
                 jobInstance={props.jobInstance}
+                onOpenStandardizeModal={props.onOpenStandardizeModal}
             />
 
             <hr />

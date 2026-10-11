@@ -727,6 +727,7 @@ class TaskPermission(
             ("annotations", "DELETE"): Scopes.DELETE_ANNOTATIONS,
             ("annotations", "PUT"): Scopes.UPDATE_ANNOTATIONS,
             ("annotations", "POST"): Scopes.IMPORT_ANNOTATIONS,
+            ("standardize_annotations", "POST"): Scopes.UPDATE_ANNOTATIONS,
             ("append_annotations_chunk", "PATCH"): Scopes.UPDATE_ANNOTATIONS,
             ("append_annotations_chunk", "HEAD"): Scopes.UPDATE_ANNOTATIONS,
             ("initiate_dataset_export", "POST"): (
@@ -1012,6 +1013,7 @@ class JobPermission(OpenPolicyAgentPermission, DownloadExportedExtension):
             ("annotations", "DELETE"): Scopes.DELETE_ANNOTATIONS,
             ("annotations", "PUT"): Scopes.UPDATE_ANNOTATIONS,
             ("annotations", "POST"): Scopes.IMPORT_ANNOTATIONS,
+            ("standardize_annotations", "POST"): Scopes.UPDATE_ANNOTATIONS,
             ("append_annotations_chunk", "PATCH"): Scopes.UPDATE_ANNOTATIONS,
             ("append_annotations_chunk", "HEAD"): Scopes.UPDATE_ANNOTATIONS,
             ("data", "GET"): Scopes.VIEW_DATA,

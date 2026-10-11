@@ -5,6 +5,7 @@
 
 import CVATCore from 'cvat-core/src';
 import _cvat from 'cvat-core/src/api';
+import serverProxy from 'cvat-core/src/server-proxy';
 import config from 'config';
 
 import ObjectState, { SerializedData } from 'cvat-core/src/object-state';
@@ -145,6 +146,7 @@ export {
     AboutData,
     BaseImageFilter,
     fetchAndAssembleAudio,
+    serverProxy,
 };
 
 export type {
