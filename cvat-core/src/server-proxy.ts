@@ -1896,6 +1896,7 @@ async function standardizeCuboids(
         reground?: boolean;
         frame_from?: number | null;
         frame_to?: number | null;
+        track_id?: number | null;
     },
 ): Promise<{ updated_shapes: number; updated_tracks: number; total: number }> {
     const { backendAPI } = config;

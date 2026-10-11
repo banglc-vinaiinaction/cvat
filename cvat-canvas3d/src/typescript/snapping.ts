@@ -1328,3 +1328,55 @@ export function fitClusterAtPoint(
         ],
     };
 }
+
+export interface AnchorFaceConfig {
+    anchorX?: 'front' | 'rear' | 'center'; // Longitudinal axis (X): +X = front bumper, -X = rear bumper
+    anchorY?: 'left' | 'right' | 'center'; // Lateral axis (Y): +Y = left side, -Y = right side
+    anchorZ?: 'bottom' | 'top' | 'center'; // Vertical axis (Z): +Z = roof, -Z = ground bottom
+}
+
+/**
+ * Resizes a 3D cuboid while pinning a specified face (e.g. rear bumper, ground bottom) in place.
+ * Shifts centroid in world space by rotating local anchor delta via object orientation Euler.
+ *
+ * In CVAT 3D coordinate convention:
+ * - Longitudinal axis (X, dx): +X is Front, -X is Rear.
+ * - Lateral axis (Y, dy): +Y is Left, -Y is Right.
+ * - Vertical axis (Z, dz): +Z is Top, -Z is Bottom.
+ */
+export function resizeCuboidWithAnchor(
+    points: number[],
+    newDx: number,
+    newDy: number,
+    newDz: number,
+    anchor: AnchorFaceConfig = { anchorX: 'rear', anchorZ: 'bottom' },
+): number[] {
+    if (!points || points.length < 9) return points;
+    const [x, y, z, rx, ry, rz, oldDx, oldDy, oldDz] = points;
+    const deltaLocal = new THREE.Vector3(0, 0, 0);
+
+    // Longitudinal axis (X, dx)
+    if (anchor.anchorX === 'rear') deltaLocal.x = (newDx - oldDx) / 2;
+    else if (anchor.anchorX === 'front') deltaLocal.x = -(newDx - oldDx) / 2;
+
+    // Lateral axis (Y, dy)
+    if (anchor.anchorY === 'right') deltaLocal.y = (newDy - oldDy) / 2;
+    else if (anchor.anchorY === 'left') deltaLocal.y = -(newDy - oldDy) / 2;
+
+    // Vertical axis (Z, dz)
+    if (anchor.anchorZ === 'bottom') deltaLocal.z = (newDz - oldDz) / 2;
+    else if (anchor.anchorZ === 'top') deltaLocal.z = -(newDz - oldDz) / 2;
+
+    const euler = new THREE.Euler(rx, ry, rz, 'XYZ');
+    deltaLocal.applyEuler(euler);
+
+    const result = [...points];
+    result[0] = parseFloat((x + deltaLocal.x).toFixed(4));
+    result[1] = parseFloat((y + deltaLocal.y).toFixed(4));
+    result[2] = parseFloat((z + deltaLocal.z).toFixed(4));
+    result[6] = parseFloat(newDx.toFixed(4));
+    result[7] = parseFloat(newDy.toFixed(4));
+    result[8] = parseFloat(newDz.toFixed(4));
+
+    return result;
+}

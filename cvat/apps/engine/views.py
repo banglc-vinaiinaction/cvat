@@ -1023,12 +1023,27 @@ def _standardize_cuboids_impl(
     reground: bool = True,
     frame_from: int | None = None,
     frame_to: int | None = None,
+    track_id: int | None = None,
 ) -> tuple[int, int]:
     updated_shapes = 0
     updated_tracks = 0
 
     with transaction.atomic():
-        if job_id is not None:
+        if track_id is not None:
+            labeled_shapes_qs = models.LabeledShape.objects.none()
+            if job_id is not None:
+                tracked_shapes_qs = models.TrackedShape.objects.filter(
+                    track_id=track_id,
+                    track__job_id=job_id,
+                    type=models.ShapeType.CUBOID,
+                )
+            else:
+                tracked_shapes_qs = models.TrackedShape.objects.filter(
+                    track_id=track_id,
+                    track__job__segment__task_id=task_id,
+                    type=models.ShapeType.CUBOID,
+                )
+        elif job_id is not None:
             labeled_shapes_qs = models.LabeledShape.objects.filter(
                 job_id=job_id,
                 type=models.ShapeType.CUBOID,
@@ -1102,10 +1117,13 @@ def _standardize_cuboids_impl(
             models.TrackedShape.objects.bulk_update(tracks_to_update, ["points"])
             updated_tracks += len(tracks_to_update)
 
+        now = timezone.now()
         if job_id is not None:
-            models.Job.objects.filter(pk=job_id).update(updated_date=timezone.now())
+            models.Job.objects.filter(pk=job_id).update(updated_date=now)
+            models.Task.objects.filter(segment__job__id=job_id).update(updated_date=now)
         elif task_id is not None:
-            models.Task.objects.filter(pk=task_id).update(updated_date=timezone.now())
+            models.Task.objects.filter(pk=task_id).update(updated_date=now)
+            models.Job.objects.filter(segment__task_id=task_id).update(updated_date=now)
 
     return updated_shapes, updated_tracks
 
@@ -1979,6 +1997,7 @@ class TaskViewSet(
         reground = data.get("reground", True)
         frame_from = data.get("frame_from")
         frame_to = data.get("frame_to")
+        track_id = data.get("track_id")
 
         updated_shapes, updated_tracks = _standardize_cuboids_impl(
             task_id=pk,
@@ -1990,6 +2009,7 @@ class TaskViewSet(
             reground=reground,
             frame_from=frame_from,
             frame_to=frame_to,
+            track_id=track_id,
         )
 
         return Response({
@@ -2735,6 +2755,7 @@ class JobViewSet(
         reground = data.get("reground", True)
         frame_from = data.get("frame_from")
         frame_to = data.get("frame_to")
+        track_id = data.get("track_id")
 
         updated_shapes, updated_tracks = _standardize_cuboids_impl(
             task_id=None,
@@ -2746,6 +2767,7 @@ class JobViewSet(
             reground=reground,
             frame_from=frame_from,
             frame_to=frame_to,
+            track_id=track_id,
         )
 
         return Response({

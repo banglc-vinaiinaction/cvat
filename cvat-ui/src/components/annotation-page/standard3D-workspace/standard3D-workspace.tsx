@@ -27,6 +27,11 @@ export default function StandardWorkspace3DComponent(): JSX.Element {
 
     const activeState = typeof activatedStateID === 'number' ?
         states.find((s) => s.clientID === activatedStateID) : null;
+    const activeTrack = activeState?.objectType === 'track' &&
+        (activeState?.shapeType === 'cuboid' || activeState?.shapeType === 'cuboid_3d') ? {
+            serverID: activeState.serverID ?? null,
+            clientID: activeState.clientID as number,
+        } : null;
 
     return (
         <Layout hasSider className='cvat-standard-workspace'>
@@ -42,6 +47,7 @@ export default function StandardWorkspace3DComponent(): JSX.Element {
                 onClose={() => setStandardizeModalVisible(false)}
                 applicableLabels={labels}
                 activeLabelId={activeState?.label?.id || null}
+                activeTrack={activeTrack}
             />
         </Layout>
     );

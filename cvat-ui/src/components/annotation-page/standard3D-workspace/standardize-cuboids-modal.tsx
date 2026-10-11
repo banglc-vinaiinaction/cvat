@@ -13,6 +13,7 @@ import notification from 'antd/lib/notification';
 import { Row, Col } from 'antd/lib/grid';
 import Text from 'antd/lib/typography/Text';
 import Button from 'antd/lib/button';
+import Alert from 'antd/lib/alert';
 import { serverProxy, Label } from 'cvat-core-wrapper';
 import { getClassDimensionPrior } from 'cvat-canvas3d/src/typescript/consts';
 import { fetchAnnotationsAsync } from 'actions/annotation-actions';
@@ -23,11 +24,12 @@ interface Props {
     onClose: () => void;
     applicableLabels: Label[];
     activeLabelId?: number | null;
+    activeTrack?: { serverID: number | null; clientID: number } | null;
 }
 
 export default function StandardizeCuboidsModal(props: Props): JSX.Element {
     const {
-        visible, onClose, applicableLabels, activeLabelId,
+        visible, onClose, applicableLabels, activeLabelId, activeTrack,
     } = props;
     const dispatch = useDispatch();
 
@@ -41,7 +43,7 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
     const [dx, setDx] = useState<number>(4.8);
     const [dy, setDy] = useState<number>(1.9);
     const [dz, setDz] = useState<number>(1.6);
-    const [scope, setScope] = useState<'job' | 'current_frame' | 'range' | 'task'>('job');
+    const [scope, setScope] = useState<'selected_track' | 'job' | 'current_frame' | 'range' | 'task'>('job');
     const [frameFrom, setFrameFrom] = useState<number>(jobInstance?.startFrame || 0);
     const [frameTo, setFrameTo] = useState<number>(jobInstance?.stopFrame || 0);
     const [reground, setReground] = useState<boolean>(true);
@@ -59,20 +61,27 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
         }
     }, [selectedLabelId, applicableLabels]);
 
-    // Update active label when modal opens
+    // Update active label and default scope when modal opens
     useEffect(() => {
-        if (visible && defaultLabel) {
-            setSelectedLabelId(defaultLabel.id);
-            const [pDx, pDy, pDz] = getClassDimensionPrior(defaultLabel);
-            setDx(pDx);
-            setDy(pDy);
-            setDz(pDz);
+        if (visible) {
+            if (activeTrack) {
+                setScope('selected_track');
+            } else {
+                setScope('job');
+            }
+            if (defaultLabel) {
+                setSelectedLabelId(defaultLabel.id);
+                const [pDx, pDy, pDz] = getClassDimensionPrior(defaultLabel);
+                setDx(pDx);
+                setDy(pDy);
+                setDz(pDz);
+            }
             setFrameFrom(jobInstance?.startFrame || 0);
             setFrameTo(jobInstance?.stopFrame || 0);
         }
     }, [visible]);
 
-    const handleApply = async (): Promise<void> => {
+    const executeStandardize = async (): Promise<void> => {
         if (!jobInstance || !selectedLabelId) return;
 
         setLoading(true);
@@ -92,23 +101,32 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
             }
 
             const labelObj = applicableLabels.find((l) => l.id === selectedLabelId);
+            const payload: any = {
+                label_id: selectedLabelId,
+                dimensions: [dx, dy, dz],
+                reground,
+                frame_from: fFrom,
+                frame_to: fTo,
+            };
+
+            if (scope === 'selected_track' && activeTrack?.serverID) {
+                payload.track_id = activeTrack.serverID;
+            }
+
             const result = await (serverProxy.annotations as any).standardizeCuboids(
                 instanceType,
                 instanceId,
-                {
-                    label_id: selectedLabelId,
-                    dimensions: [dx, dy, dz],
-                    reground,
-                    frame_from: fFrom,
-                    frame_to: fTo,
-                },
+                payload,
             );
 
             const targetName = labelObj?.name || selectedLabelId;
+            const scopeDesc = scope === 'selected_track' ?
+                `Track #${activeTrack?.clientID}` : `label "${targetName}"`;
+
             notification.success({
                 message: 'Standardization Complete',
                 description: `Standardized ${result.total} cuboid(s) (${result.updated_shapes} shapes, ` +
-                    `${result.updated_tracks} track frames) for label "${targetName}" ` +
+                    `${result.updated_tracks} track frames) for ${scopeDesc} ` +
                     `to ${dx}m × ${dy}m × ${dz}m.`,
                 duration: 4.5,
             });
@@ -124,6 +142,39 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
         } finally {
             setLoading(false);
         }
+    };
+
+    const handleApply = (): void => {
+        if (!jobInstance || !selectedLabelId) return;
+
+        if (scope === 'selected_track') {
+            if (!activeTrack?.serverID) {
+                notification.error({
+                    message: 'Unsaved Track',
+                    description: `Track #${activeTrack?.clientID} is not saved to the server yet. ` +
+                        'Please save annotations (Ctrl + S) first.',
+                });
+                return;
+            }
+        }
+
+        if (jobInstance.annotations?.hasUnsavedChanges?.()) {
+            Modal.confirm({
+                title: 'Unsaved Changes Detected',
+                content: 'Standardizing dimensions reloads annotations from the database, ' +
+                    'which will discard any unsaved changes in this job. ' +
+                    'Save your annotations (Ctrl + S) first or confirm to proceed.',
+                okText: 'Proceed and Overwrite',
+                okType: 'danger',
+                cancelText: 'Cancel & Save First',
+                onOk: () => {
+                    executeStandardize();
+                },
+            });
+            return;
+        }
+
+        executeStandardize();
     };
 
     return (
@@ -208,8 +259,23 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
                         value={scope}
                         onChange={(e: RadioChangeEvent) => setScope(e.target.value)}
                     >
+                        {activeTrack && (
+                            <Radio value='selected_track'>
+                                <Text strong>Selected Track #{activeTrack.clientID}</Text>
+                                {activeTrack.serverID ? (
+                                    <Text type='secondary'>
+                                        {` (Server ID: ${activeTrack.serverID}) `}
+                                        {'— updates all frames of this track only'}
+                                    </Text>
+                                ) : (
+                                    <Text type='danger'> (Unsaved — save annotations with Ctrl+S first)</Text>
+                                )}
+                            </Radio>
+                        )}
                         <Radio value='job'>
-                            Entire Job ({jobInstance ? `Job #${jobInstance.id}, frames ${jobInstance.startFrame}–${jobInstance.stopFrame}` : 'All frames'})
+                            {`Entire Job (${jobInstance ?
+                                `Job #${jobInstance.id}, frames ${jobInstance.startFrame}–${jobInstance.stopFrame}` :
+                                'All frames'})`}
                         </Radio>
                         <Radio value='current_frame'>
                             Current Frame (Frame #{currentFrame})
@@ -219,10 +285,22 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
                         </Radio>
                         {jobInstance?.taskId && (
                             <Radio value='task'>
-                                Entire Task (All jobs across Task #{jobInstance.taskId})
+                                {`Entire Task (All jobs across Task #${jobInstance.taskId})`}
                             </Radio>
                         )}
                     </Radio.Group>
+                    {scope === 'selected_track' && !activeTrack?.serverID && (
+                        <Alert
+                            style={{ marginTop: 8 }}
+                            type='warning'
+                            showIcon
+                            message='Unsaved Track'
+                            description={
+                                'This track was created recently and has not been committed to the server. ' +
+                                'Save annotations (Ctrl + S) first before running standardization.'
+                            }
+                        />
+                    )}
                     {scope === 'range' && (
                         <Row gutter={8} style={{ marginTop: 8, marginLeft: 24 }}>
                             <Col span={10}>

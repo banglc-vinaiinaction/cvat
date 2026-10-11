@@ -5118,7 +5118,7 @@ class AnnotationGuideWriteSerializer(WriteOnceMixin, serializers.ModelSerializer
 class StandardizeCuboidsSerializer(serializers.Serializer):
     label_id = serializers.IntegerField(required=True)
     dimensions = serializers.ListField(
-        child=serializers.FloatField(),
+        child=serializers.FloatField(min_value=0.01),
         min_length=3,
         max_length=3,
         required=True,
@@ -5126,3 +5126,4 @@ class StandardizeCuboidsSerializer(serializers.Serializer):
     reground = serializers.BooleanField(default=True, required=False)
     frame_from = serializers.IntegerField(required=False, allow_null=True, default=None)
     frame_to = serializers.IntegerField(required=False, allow_null=True, default=None)
+    track_id = serializers.IntegerField(required=False, allow_null=True, default=None)
