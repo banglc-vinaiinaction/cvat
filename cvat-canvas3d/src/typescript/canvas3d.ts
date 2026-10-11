@@ -40,6 +40,12 @@ interface Canvas3d {
     snapToRoad(clientID?: number | null): void;
     revertSnap(clientID?: number | null): boolean;
     getPreviousCuboid(clientID?: number | null): number[] | null;
+    invertHeading(clientID?: number | null): void;
+    snapTrackToRoad(
+        jobInstance: any,
+        clientID?: number | null,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ processedFrames: number }>;
     group(groupData: GroupData): void;
     merge(mergeData: MergeData): void;
     split(splitData: SplitData): void;
@@ -131,6 +137,18 @@ class Canvas3dImpl implements Canvas3d {
 
     public getPreviousCuboid(clientID?: number | null): number[] | null {
         return this.view.getPreviousCuboid(clientID);
+    }
+
+    public invertHeading(clientID?: number | null): void {
+        this.view.invertHeading(clientID);
+    }
+
+    public async snapTrackToRoad(
+        jobInstance: any,
+        clientID?: number | null,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ processedFrames: number }> {
+        return this.view.snapTrackToRoad(jobInstance, clientID, onProgress);
     }
 
     public fit(): void {

@@ -6,6 +6,7 @@
 import React from 'react';
 import { useSelector } from 'react-redux';
 import Layout from 'antd/lib/layout';
+import notification from 'antd/lib/notification';
 import { ActiveControl, CombinedState } from 'reducers';
 import { Label, LabelType } from 'cvat-core-wrapper';
 import { Canvas3d as Canvas } from 'cvat-canvas3d-wrapper';
@@ -105,6 +106,18 @@ const componentShortcuts: Record<string, KeyMapItem> = {
         name: 'Revert Snap to Road',
         description: 'Revert previously snapped 3D cuboid to its original position and orientation',
         sequences: ['shift+f'],
+        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
+    },
+    INVERT_HEADING_3D_CONTROLS: {
+        name: 'Invert Heading (180°)',
+        description: 'Invert selected 3D cuboid heading by 180 degrees',
+        sequences: ['h'],
+        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
+    },
+    SNAP_TRACK_TO_ROAD_3D_CONTROLS: {
+        name: 'Snap Track to Road',
+        description: 'Snap selected track across all frames to the road surface with smoothed trajectory',
+        sequences: ['alt+f'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
 };
@@ -247,6 +260,58 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
             canvasInstance.revertSnap(targetID);
         },
+        INVERT_HEADING_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
+            if (event) event.preventDefault();
+            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            if (targetID === null) {
+                notification.warning({ message: 'No 3D object selected', duration: 2 });
+                return;
+            }
+            canvasInstance.invertHeading(targetID);
+        },
+        SNAP_TRACK_TO_ROAD_3D_CONTROLS: async (event: KeyboardEvent | undefined) => {
+            if (event) event.preventDefault();
+            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            if (targetID === null) {
+                notification.warning({ message: 'No 3D object selected', duration: 2 });
+                return;
+            }
+            try {
+                notification.open({
+                    key: 'track_snap_progress',
+                    message: `Snapping Track #${targetID}`,
+                    description: 'Starting track road snapping...',
+                    duration: 0,
+                });
+                const res = await canvasInstance.snapTrackToRoad(
+                    props.jobInstance,
+                    targetID,
+                    (msg: string, pct: number) => {
+                        notification.open({
+                            key: 'track_snap_progress',
+                            message: `Snapping Track #${targetID} (${pct}%)`,
+                            description: msg,
+                            duration: 0,
+                        });
+                    },
+                );
+                notification.destroy('track_snap_progress');
+                notification.success({
+                    key: `track_snap_success_${Date.now()}`,
+                    message: `Track #${targetID} Snapped`,
+                    description: `Successfully aligned and smoothed ${res.processedFrames} frames along the road.`,
+                    duration: 3,
+                });
+            } catch (err: any) {
+                notification.destroy('track_snap_progress');
+                notification.error({
+                    key: `track_snap_error_${Date.now()}`,
+                    message: 'Track Snap Failed',
+                    description: err?.message || 'Error occurred during track snapping',
+                    duration: 3,
+                });
+            }
+        },
     };
 
     handlers = applicableLabels.length ? {
@@ -285,6 +350,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             <SnapToRoadControl
                 canvasInstance={canvasInstance}
                 disabled={controlsDisabled}
+                jobInstance={props.jobInstance}
             />
 
             <hr />

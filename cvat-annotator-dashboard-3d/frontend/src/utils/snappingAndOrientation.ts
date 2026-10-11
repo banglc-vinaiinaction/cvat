@@ -478,27 +478,30 @@ export function snapAndOrientCuboid(
     return [pointCloud[idx * 3], pointCloud[idx * 3 + 1], pointCloud[idx * 3 + 2]];
   };
 
-  const radius = Math.sqrt((cuboid.l / 2) ** 2 + (cuboid.w / 2) ** 2) + 2.5;
+  const radius = Math.max(3.0, Math.sqrt((cuboid.l / 2) ** 2 + (cuboid.w / 2) ** 2) + 2.5);
   const cosYaw = Math.cos(cuboid.yaw);
   const sinYaw = Math.sin(cuboid.yaw);
 
   const localPoints: [number, number, number][] = [];
   const groundCandidates: [number, number, number][] = [];
 
+  const zMin = Math.min(bottomZ - 5.0, cuboid.z - 6.0);
+  const zMax = cuboid.z + cuboid.h / 2 + 1.5;
+
   for (let i = 0; i < numPoints; i++) {
     const p = getPt(i);
     const dx = p[0] - cuboid.x;
     const dy = p[1] - cuboid.y;
     if (dx * dx + dy * dy <= radius * radius) {
-      if (p[2] >= bottomZ - 1.2 && p[2] <= cuboid.z + cuboid.h / 2 + 0.8) {
+      if (p[2] >= zMin && p[2] <= zMax) {
         localPoints.push(p);
 
         // Check if point is outside the vehicle footprint to avoid body/wheel interference
         const u = dx * cosYaw + dy * sinYaw;
         const v = -dx * sinYaw + dy * cosYaw;
-        const isOutsideVehicle = Math.abs(u) > cuboid.l / 2 + 0.15 || Math.abs(v) > cuboid.w / 2 + 0.15;
+        const isOutsideVehicle = Math.abs(u) > cuboid.l / 2 + 0.10 || Math.abs(v) > cuboid.w / 2 + 0.10;
 
-        if (isOutsideVehicle && p[2] <= bottomZ + 0.35 && p[2] >= bottomZ - 0.8) {
+        if (isOutsideVehicle) {
           groundCandidates.push(p);
         }
       }
@@ -526,28 +529,38 @@ export function snapAndOrientCuboid(
   let newZ = cuboid.z;
 
   if (snapGround) {
-    const ptsForGround = groundCandidates.length >= 8 ?
+    const groundPool = groundCandidates.length >= 8 ?
       groundCandidates :
-      localPoints.filter((p) => p[2] <= bottomZ + 0.25 && p[2] >= bottomZ - 0.8);
+      localPoints.filter((p) => p[2] <= cuboid.z - cuboid.h * 0.15);
 
-    if (ptsForGround.length >= 4) {
-      const sortedZ = ptsForGround.map((p) => p[2]).sort((a, b) => a - b);
-      const p10Idx = Math.max(0, Math.floor(sortedZ.length * 0.10));
-      const robustZ = sortedZ[p10Idx];
+    if (groundPool.length >= 4) {
+      const sortedZ = groundPool.map((p) => p[2]).sort((a, b) => a - b);
+      const lprCount = Math.max(3, Math.floor(sortedZ.length * 0.20));
+      let lprSum = 0;
+      for (let k = 0; k < lprCount; k++) {
+        lprSum += sortedZ[k];
+      }
+      const lprZ = lprSum / lprCount;
 
-      const { plane } = fitGroundPlaneGPF(ptsForGround);
+      const groundSeeds = groundPool.filter((p) => p[2] >= lprZ - 0.12 && p[2] <= lprZ + 0.25);
+      const ptsForFit = groundSeeds.length >= 4 ? groundSeeds : groundPool;
+
+      const { plane } = fitGroundPlaneGPF(ptsForFit);
       const rawPlaneZ = getRoadHeightAt(plane, cuboid.x, cuboid.y);
       const [, , nz] = plane;
 
-      if (nz >= 0.95 && Math.abs(rawPlaneZ - robustZ) <= 0.15) {
+      if (nz >= 0.85) {
         groundZ = rawPlaneZ;
       } else {
-        groundZ = robustZ;
+        groundZ = lprZ;
       }
 
-      // Clamp max adjustment to avoid wild teleporting
-      if (Math.abs(groundZ - bottomZ) > 1.2) {
-        groundZ = bottomZ + (groundZ > bottomZ ? 1.2 : -1.2);
+      const groundSurfaceZ = groundZ + 0.02;
+
+      if (Math.abs(groundSurfaceZ - bottomZ) <= 5.0) {
+        groundZ = groundSurfaceZ;
+      } else {
+        groundZ = bottomZ + (groundSurfaceZ > bottomZ ? 5.0 : -5.0);
       }
 
       newZ = groundZ + cuboid.h / 2;

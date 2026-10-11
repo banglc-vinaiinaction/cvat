@@ -30,6 +30,12 @@ export interface Canvas3dView {
     snapToRoad(clientID?: number | null): void;
     revertSnap(clientID?: number | null): boolean;
     getPreviousCuboid(clientID?: number | null): number[] | null;
+    invertHeading(clientID?: number | null): void;
+    snapTrackToRoad(
+        jobInstance: any,
+        clientID?: number | null,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ processedFrames: number }>;
 }
 
 export enum CameraAction {
@@ -138,7 +144,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private hoverNeedsUpdate: boolean;
     private needsRenderCount: number = 2;
     private pointCloudPoints: any = null;
-    private previousCuboids: Map<number, number[]> = new Map();
+    private previousCuboids: Map<number, number[][]> = new Map();
 
     public requestRender(frameCount: number = 2): void {
         this.needsRenderCount = Math.max(this.needsRenderCount, frameCount);
@@ -191,9 +197,14 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         ];
 
         const previousPoints = [...currentPoints];
-        this.previousCuboids.set(targetClientID, previousPoints);
+        if (!this.previousCuboids.has(targetClientID)) {
+            this.previousCuboids.set(targetClientID, []);
+        }
+        this.previousCuboids.get(targetClientID)!.push(previousPoints);
 
-        const snapResult = snapCuboidToRoadAndOrient(currentPoints, positions);
+        const snapResult = snapCuboidToRoadAndOrient(currentPoints, positions, {
+            labelName: state.label?.name,
+        });
         const [x, y, z, rx, ry, rz, dx, dy, dz] = snapResult.points;
 
         cuboid.setPosition(x, y, z);
@@ -254,7 +265,17 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             return false;
         }
 
-        const prevPoints = this.previousCuboids.get(targetClientID)!;
+        const stack = this.previousCuboids.get(targetClientID)!;
+        if (stack.length === 0) {
+            this.previousCuboids.delete(targetClientID);
+            return false;
+        }
+
+        const prevPoints = stack.pop()!;
+        if (stack.length === 0) {
+            this.previousCuboids.delete(targetClientID);
+        }
+
         const { cuboid, data } = this.drawnObjects[targetClientID] || {};
         if (!cuboid || data?.lock) return false;
 
@@ -313,7 +334,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }),
         );
 
-        this.previousCuboids.delete(targetClientID);
         this.requestRender();
         this.render();
         return true;
@@ -330,9 +350,317 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
 
         if (targetClientID !== null && this.previousCuboids.has(targetClientID)) {
-            return [...this.previousCuboids.get(targetClientID)!];
+            const stack = this.previousCuboids.get(targetClientID)!;
+            if (stack.length > 0) {
+                return [...stack[stack.length - 1]];
+            }
         }
         return null;
+    }
+
+    public invertHeading(clientID?: number | null): void {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            if (this.activatedElementID !== null) {
+                targetClientID = this.activatedElementID;
+            } else if (this.model.data.activeElement.clientID !== null) {
+                targetClientID = +this.model.data.activeElement.clientID;
+            }
+        }
+
+        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+            return;
+        }
+
+        const { cuboid, data } = this.drawnObjects[targetClientID];
+        if (data.lock) return;
+
+        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
+        if (!state) return;
+
+        const previousPoints = [
+            cuboid.perspective.position.x,
+            cuboid.perspective.position.y,
+            cuboid.perspective.position.z,
+            cuboid.perspective.rotation.x,
+            cuboid.perspective.rotation.y,
+            cuboid.perspective.rotation.z,
+            cuboid.perspective.scale.x,
+            cuboid.perspective.scale.y,
+            cuboid.perspective.scale.z,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        if (!this.previousCuboids.has(targetClientID)) {
+            this.previousCuboids.set(targetClientID, []);
+        }
+        this.previousCuboids.get(targetClientID)!.push(previousPoints);
+
+        const currentRot = cuboid.perspective.rotation;
+        const currentEuler = new THREE.Euler(currentRot.x, currentRot.y, currentRot.z, 'XYZ');
+        const norm = new THREE.Vector3(0, 0, 1).applyEuler(currentEuler).normalize();
+
+        // Invert horizontal heading by PI radians
+        const newYaw = Math.atan2(Math.sin(currentRot.z + Math.PI), Math.cos(currentRot.z + Math.PI));
+
+        let finalRx = currentRot.x;
+        let finalRy = currentRot.y;
+        let finalRz = newYaw;
+
+        // If tilted on a road plane, conform inverted heading to terrain slope
+        if (norm.z >= 0.70) {
+            const fHoriz = new THREE.Vector3(Math.cos(newYaw), Math.sin(newYaw), 0);
+            const dot = fHoriz.dot(norm);
+            const xLocal = fHoriz.clone().sub(norm.clone().multiplyScalar(dot));
+            if (xLocal.lengthSq() > 1e-6) {
+                xLocal.normalize();
+                const yLocal = new THREE.Vector3().crossVectors(norm, xLocal).normalize();
+                const zLocal = norm;
+                const basisMatrix = new THREE.Matrix4().makeBasis(xLocal, yLocal, zLocal);
+                const euler = new THREE.Euler().setFromRotationMatrix(basisMatrix, 'XYZ');
+                finalRx = parseFloat(euler.x.toFixed(4));
+                finalRy = parseFloat(euler.y.toFixed(4));
+                finalRz = parseFloat(euler.z.toFixed(4));
+            }
+        }
+
+        cuboid.setRotation(finalRx, finalRy, finalRz);
+        const newPoints = [...previousPoints];
+        newPoints[3] = finalRx;
+        newPoints[4] = finalRy;
+        newPoints[5] = finalRz;
+        data.points = newPoints;
+
+        try {
+            this.rotatePlane(null as any, null as any);
+        } catch (_) {
+            // ignore
+        }
+
+        BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
+        this.updateCameraFrustumPlane();
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.edited', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points: [...newPoints],
+                    previousPoints,
+                },
+            }),
+        );
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.inverted', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    yawDeg: parseFloat(((finalRz * 180) / Math.PI).toFixed(1)),
+                },
+            }),
+        );
+        this.render();
+    }
+
+    public async snapTrackToRoad(
+        jobInstance: any,
+        clientID?: number | null,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ processedFrames: number }> {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            if (this.activatedElementID !== null) {
+                targetClientID = this.activatedElementID;
+            } else if (this.model.data.activeElement.clientID !== null) {
+                targetClientID = +this.model.data.activeElement.clientID;
+            }
+        }
+
+        if (targetClientID === null) {
+            throw new Error('No 3D object selected.');
+        }
+
+        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
+        if (!state) {
+            throw new Error(`Object #${targetClientID} not found.`);
+        }
+
+        if (state.objectType !== ObjectType.TRACK) {
+            this.snapToRoad(targetClientID);
+            return { processedFrames: 1 };
+        }
+
+        const { first, last } = state.keyframes || {};
+        if (first === null || last === null || first === undefined || last === undefined) {
+            this.snapToRoad(targetClientID);
+            return { processedFrames: 1 };
+        }
+
+        const loader = new PCDLoader();
+        const snappedFrames: { frame: number; state: ObjectState; points: number[] }[] = [];
+
+        onProgress?.(`Starting track snap across frames ${first} to ${last}...`, 5);
+
+        // Pre-fetch track states to determine motion vectors
+        const trackStatesByFrame = new Map<number, ObjectState>();
+        for (let f = first; f <= last; f++) {
+            try {
+                const frameStates = await jobInstance.annotations.get(f, true);
+                const trackState = frameStates.find((obj: ObjectState) => obj.clientID === targetClientID);
+                if (trackState && !trackState.outside && trackState.points) {
+                    trackStatesByFrame.set(f, trackState);
+                }
+            } catch (err) {
+                console.warn(`Could not get annotations for frame ${f}:`, err);
+            }
+        }
+
+        const sortedFrames = Array.from(trackStatesByFrame.keys()).sort((a, b) => a - b);
+        if (sortedFrames.length === 0) {
+            throw new Error('No valid track frames found to snap.');
+        }
+
+        if (this.drawnObjects[targetClientID]) {
+            const { cuboid } = this.drawnObjects[targetClientID];
+            const currentPoints = [
+                cuboid.perspective.position.x,
+                cuboid.perspective.position.y,
+                cuboid.perspective.position.z,
+                cuboid.perspective.rotation.x,
+                cuboid.perspective.rotation.y,
+                cuboid.perspective.rotation.z,
+                cuboid.perspective.scale.x,
+                cuboid.perspective.scale.y,
+                cuboid.perspective.scale.z,
+                0, 0, 0, 0, 0, 0, 0,
+            ];
+            if (!this.previousCuboids.has(targetClientID)) {
+                this.previousCuboids.set(targetClientID, []);
+            }
+            this.previousCuboids.get(targetClientID)!.push(currentPoints);
+        }
+
+        for (let idx = 0; idx < sortedFrames.length; idx++) {
+            const f = sortedFrames[idx];
+            const trackState = trackStatesByFrame.get(f)!;
+            const currentPct = 10 + Math.round(((idx + 1) / sortedFrames.length) * 75);
+            onProgress?.(`Processing frame ${f} of ${last}...`, currentPct);
+
+            let positions: ArrayLike<number> | null = null;
+            if (f === this.model.data.imageID && this.pointCloudPoints?.geometry?.attributes?.position?.array) {
+                positions = this.pointCloudPoints.geometry.attributes.position.array;
+            } else {
+                try {
+                    const frameData = await jobInstance.frames.get(f);
+                    if (frameData.deleted) continue;
+                    const frameImage = await frameData.data();
+                    const arrayBuffer = await frameImage.imageData.arrayBuffer();
+                    const pcd = loader.parse(arrayBuffer) as THREE.Points;
+                    if (pcd?.geometry?.attributes?.position?.array) {
+                        positions = pcd.geometry.attributes.position.array;
+                    }
+                } catch (err) {
+                    console.warn(`Could not load PCD for frame ${f}:`, err);
+                    continue;
+                }
+            }
+
+            if (!positions) continue;
+
+            // Compute motion-derived heading vector
+            let motionYaw: number | null = null;
+            let vx = 0;
+            let vy = 0;
+            let dt = 1;
+
+            if (idx + 1 < sortedFrames.length && idx > 0) {
+                const nextState = trackStatesByFrame.get(sortedFrames[idx + 1])!;
+                const prevState = trackStatesByFrame.get(sortedFrames[idx - 1])!;
+                dt = Math.max(1, sortedFrames[idx + 1] - sortedFrames[idx - 1]);
+                vx = (nextState.points[0] - prevState.points[0]) / dt;
+                vy = (nextState.points[1] - prevState.points[1]) / dt;
+            } else if (idx + 1 < sortedFrames.length) {
+                const nextState = trackStatesByFrame.get(sortedFrames[idx + 1])!;
+                dt = Math.max(1, sortedFrames[idx + 1] - f);
+                vx = (nextState.points[0] - trackState.points[0]) / dt;
+                vy = (nextState.points[1] - trackState.points[1]) / dt;
+            } else if (idx > 0) {
+                const prevState = trackStatesByFrame.get(sortedFrames[idx - 1])!;
+                dt = Math.max(1, f - sortedFrames[idx - 1]);
+                vx = (trackState.points[0] - prevState.points[0]) / dt;
+                vy = (trackState.points[1] - prevState.points[1]) / dt;
+            }
+
+            const speed = Math.hypot(vx, vy);
+            if (speed >= 0.15) {
+                motionYaw = Math.atan2(vy, vx);
+            }
+
+            try {
+                const snapResult = snapCuboidToRoadAndOrient(trackState.points, positions, {
+                    motionYaw,
+                    labelName: trackState.label?.name,
+                });
+                snappedFrames.push({
+                    frame: f,
+                    state: trackState,
+                    points: [...snapResult.points],
+                });
+            } catch (err) {
+                console.warn(`Could not snap frame ${f}:`, err);
+            }
+        }
+
+        if (snappedFrames.length === 0) {
+            throw new Error('No valid track frames found to snap.');
+        }
+
+        // Apply 1D Temporal Smoothing to prevent elevation & tilt jitter
+        if (snappedFrames.length >= 3) {
+            onProgress?.('Smoothing road trajectory across track frames...', 88);
+            const zSmoothed = snappedFrames.map((s) => s.points[2]);
+            const rxSmoothed = snappedFrames.map((s) => s.points[3]);
+            const rySmoothed = snappedFrames.map((s) => s.points[4]);
+
+            for (let i = 1; i < snappedFrames.length - 1; i++) {
+                zSmoothed[i] = 0.25 * snappedFrames[i - 1].points[2] + 0.5 * snappedFrames[i].points[2] + 0.25 * snappedFrames[i + 1].points[2];
+                rxSmoothed[i] = 0.25 * snappedFrames[i - 1].points[3] + 0.5 * snappedFrames[i].points[3] + 0.25 * snappedFrames[i + 1].points[3];
+                rySmoothed[i] = 0.25 * snappedFrames[i - 1].points[4] + 0.5 * snappedFrames[i].points[4] + 0.25 * snappedFrames[i + 1].points[4];
+            }
+
+            for (let i = 1; i < snappedFrames.length - 1; i++) {
+                snappedFrames[i].points[2] = parseFloat(zSmoothed[i].toFixed(3));
+                snappedFrames[i].points[3] = parseFloat(rxSmoothed[i].toFixed(4));
+                snappedFrames[i].points[4] = parseFloat(rySmoothed[i].toFixed(4));
+            }
+        }
+
+        onProgress?.('Saving track updates...', 95);
+        for (const item of snappedFrames) {
+            item.state.points = item.points;
+            item.state.keyframe = true;
+        }
+
+        await jobInstance.annotations.saveStates(snappedFrames.map((s) => s.state));
+
+        // If the current active frame was part of the track, update canvas visual
+        if (this.drawnObjects[targetClientID]) {
+            const currentItem = snappedFrames.find((s) => s.frame === this.model.data.imageID);
+            if (currentItem) {
+                const { cuboid, data } = this.drawnObjects[targetClientID];
+                const [x, y, z, rx, ry, rz, dx, dy, dz] = currentItem.points;
+                cuboid.setPosition(x, y, z);
+                cuboid.setRotation(rx, ry, rz);
+                cuboid.setScale(dx, dy, dz);
+                data.points = [...currentItem.points];
+                this.requestRender();
+            }
+        }
+
+        onProgress?.('Track snapping completed.', 100);
+        return { processedFrames: snappedFrames.length };
     }
 
     private action: {

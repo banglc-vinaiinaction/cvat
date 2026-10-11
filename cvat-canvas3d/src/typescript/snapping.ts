@@ -9,6 +9,9 @@ export interface SnapMetrics {
     deltaYawDeg: number;
     groundZ: number;
     pointsCount: number;
+    deltaHeight?: number;
+    deltaWidth?: number;
+    deltaLength?: number;
 }
 
 export interface SnapResult {
@@ -105,8 +108,8 @@ export function fitGroundPlaneGPF(
     } = {},
 ): [number, number, number, number] {
     const {
-        lprRatio = 0.25,
-        seedThreshold = 0.15,
+        lprRatio = 0.15,
+        seedThreshold = 0.10,
         distanceThreshold = 0.08,
         refineIterations = 1,
     } = options;
@@ -326,9 +329,10 @@ export function alignYawWithPoints(
     currentYaw: number,
     dx: number,
     dy: number,
+    motionYaw?: number | null,
 ): number {
     if (pts2D.length < 8) {
-        return currentYaw;
+        return (typeof motionYaw === 'number') ? motionYaw : currentYaw;
     }
 
     // 2D PCA on object points
@@ -361,18 +365,24 @@ export function alignYawWithPoints(
     const isXLongitudinal = dx >= dy;
     const baseTargetAngle = isXLongitudinal ? pcaAngle : pcaAngle - Math.PI / 2;
 
-    // The PCA line is bidirectional (baseTargetAngle or baseTargetAngle + Math.PI).
-    // Pick the direction that is closest to currentYaw.
     const normalizeAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
-    const diff1 = normalizeAngle(baseTargetAngle - currentYaw);
-    const diff2 = normalizeAngle(baseTargetAngle + Math.PI - currentYaw);
+
+    // When motion velocity heading is available, resolve 180-deg ambiguity using motion direction
+    const referenceYaw = (typeof motionYaw === 'number') ? motionYaw : currentYaw;
+    const diff1 = normalizeAngle(baseTargetAngle - referenceYaw);
+    const diff2 = normalizeAngle(baseTargetAngle + Math.PI - referenceYaw);
 
     const bestDiff = Math.abs(diff1) <= Math.abs(diff2) ? diff1 : diff2;
+    const resolvedAngle = normalizeAngle(referenceYaw + bestDiff);
 
-    // Only align if within reasonable tolerance (at most 25 degrees)
-    const maxAllowedAdjustment = (25 * Math.PI) / 180;
+    if (typeof motionYaw === 'number') {
+        return resolvedAngle;
+    }
+
+    // Only align if within reasonable tolerance (at most 30 degrees)
+    const maxAllowedAdjustment = (30 * Math.PI) / 180;
     if (Math.abs(bestDiff) <= maxAllowedAdjustment) {
-        return normalizeAngle(currentYaw + bestDiff);
+        return resolvedAngle;
     }
 
     return currentYaw;
@@ -380,7 +390,8 @@ export function alignYawWithPoints(
 
 /**
  * Snaps a 3D cuboid flush to the road plane and aligns orientation to local LiDAR points.
- * Note: Width, Length, and Height (WLH: dx, dy, dz) are strictly preserved.
+ * Applies class-specific dimension priors (pedestrian, two-wheeler, heavy vehicle) and
+ * resolves heading using trajectory velocity vectors when available.
  */
 export function snapCuboidToRoadAndOrient(
     cuboidPoints: number[],
@@ -388,6 +399,8 @@ export function snapCuboidToRoadAndOrient(
     options: {
         snapGround?: boolean;
         autoOrient?: boolean;
+        labelName?: string;
+        motionYaw?: number | null;
     } = {},
 ): SnapResult {
     const {
@@ -404,20 +417,27 @@ export function snapCuboidToRoadAndOrient(
     const dy = cuboidPoints[7]; // scale Y
     const dz = cuboidPoints[8]; // scale Z (height)
 
-    // Preserve exact dimensions (WLH)
-    const newDx = dx;
-    const newDy = dy;
-    const newDz = dz;
+    // Dimensions and center (mutable for auto-tightening)
+    let newDx = dx;
+    let newDy = dy;
+    let newDz = dz;
+    let finalCx = cx;
+    let finalCy = cy;
 
     const bottomZ = cz - dz / 2;
     const totalPoints = Math.floor(pointCloudPositions.length / 3);
-    const radius = Math.sqrt((dx / 2) ** 2 + (dy / 2) ** 2) + 2.5;
+    const radius = Math.max(3.0, Math.sqrt((dx / 2) ** 2 + (dy / 2) ** 2) + 2.5);
 
     const cosRz = Math.cos(rz);
     const sinRz = Math.sin(rz);
 
     const localIndices: number[] = [];
     const groundCandidateIndices: number[] = [];
+
+    // Allow searching down beneath the cuboid (up to 5.0m below bottomZ or down to cz - 6.0m)
+    // and up to 1.5m above the cuboid
+    const zMin = Math.min(bottomZ - 5.0, cz - 6.0);
+    const zMax = cz + dz / 2 + 1.5;
 
     for (let i = 0; i < totalPoints; i++) {
         const px = pointCloudPositions[i * 3];
@@ -427,15 +447,15 @@ export function snapCuboidToRoadAndOrient(
         const distX = px - cx;
         const distY = py - cy;
         if (distX * distX + distY * distY <= radius * radius) {
-            if (pz >= bottomZ - 1.2 && pz <= cz + dz / 2 + 0.8) {
+            if (pz >= zMin && pz <= zMax) {
                 localIndices.push(i);
 
                 // Check distance outside vehicle footprint to exclude wheels/body
                 const u = distX * cosRz + distY * sinRz;
                 const v = -distX * sinRz + distY * cosRz;
-                const isOutsideVehicle = Math.abs(u) > dx / 2 + 0.15 || Math.abs(v) > dy / 2 + 0.15;
+                const isOutsideVehicle = Math.abs(u) > dx / 2 + 0.10 || Math.abs(v) > dy / 2 + 0.10;
 
-                if (isOutsideVehicle && pz <= bottomZ + 0.35 && pz >= bottomZ - 0.8) {
+                if (isOutsideVehicle) {
                     groundCandidateIndices.push(i);
                 }
             }
@@ -458,42 +478,65 @@ export function snapCuboidToRoadAndOrient(
     // 2. Road plane detection & snapping
     let groundZ = bottomZ;
     let newZ = cz;
+    let detectedPlane: [number, number, number, number] | null = null;
 
     if (snapGround) {
-        const ptsForGround = groundCandidateIndices.length >= 8 ?
+        const groundPool = groundCandidateIndices.length >= 8 ?
             groundCandidateIndices :
             localIndices.filter((idx) => {
                 const pz = pointCloudPositions[idx * 3 + 2];
-                return pz <= bottomZ + 0.25 && pz >= bottomZ - 0.8;
+                return pz <= cz - dz * 0.15;
             });
 
-        if (ptsForGround.length >= 4) {
-            const sortedGroundZ = ptsForGround.map(
+        if (groundPool.length >= 4) {
+            const sortedGroundZ = groundPool.map(
                 (idx) => pointCloudPositions[idx * 3 + 2],
             ).sort((a, b) => a - b);
 
-            // Robust 10th percentile for road elevation
-            const p10Idx = Math.max(0, Math.floor(sortedGroundZ.length * 0.10));
-            const robustZ = sortedGroundZ[p10Idx];
+            // Compute Lowest Point Representative (LPR) of local ground cluster
+            const lprCount = Math.max(3, Math.floor(sortedGroundZ.length * 0.20));
+            let lprSum = 0;
+            for (let k = 0; k < lprCount; k++) {
+                lprSum += sortedGroundZ[k];
+            }
+            const lprZ = lprSum / lprCount;
 
-            // Fit GPF plane
-            const plane = fitGroundPlaneGPF(pointCloudPositions, ptsForGround, {
-                lprRatio: 0.2,
-                seedThreshold: 0.12,
-                distanceThreshold: 0.06,
+            // Extract candidate ground seeds tightly around LPR
+            const groundSeeds = groundPool.filter((idx) => {
+                const pz = pointCloudPositions[idx * 3 + 2];
+                return pz >= lprZ - 0.12 && pz <= lprZ + 0.25;
             });
 
+            // Fit GPF plane on ground seeds
+            const ptsForFit = groundSeeds.length >= 4 ? groundSeeds : groundPool;
+            const plane = fitGroundPlaneGPF(pointCloudPositions, ptsForFit, {
+                lprRatio: 0.25,
+                seedThreshold: 0.15,
+                distanceThreshold: 0.08,
+            });
+
+            detectedPlane = plane;
             const rawPlaneZ = getRoadHeightAt(plane, cx, cy);
             const [, , nz] = plane;
-            if (nz >= 0.95 && Math.abs(rawPlaneZ - robustZ) <= 0.15) {
+
+            if (nz >= 0.85) {
                 groundZ = rawPlaneZ;
             } else {
-                groundZ = robustZ;
+                groundZ = lprZ;
             }
 
-            // Clamp max adjustment to avoid unexpected jumping
-            if (Math.abs(groundZ - bottomZ) > 1.2) {
-                groundZ = bottomZ + (groundZ > bottomZ ? 1.2 : -1.2);
+            // Road surface adjustment:
+            // Ensure the cuboid bottom rests directly ON / ABOVE the road cloud points.
+            // LiDAR ground points have small Gaussian beam dispersion (~2-3cm).
+            // Placing the base flush to the top surface (plane + 0.02m) guarantees the bounding
+            // box rests cleanly above the road point cloud without submerging into the ground.
+            const groundSurfaceZ = groundZ + 0.02;
+
+            // Allow snapping within a realistic vertical range (up to 5m)
+            if (Math.abs(groundSurfaceZ - bottomZ) <= 5.0) {
+                groundZ = groundSurfaceZ;
+            } else {
+                groundZ = bottomZ + (groundSurfaceZ > bottomZ ? 5.0 : -5.0);
             }
 
             newZ = groundZ + dz / 2;
@@ -501,20 +544,25 @@ export function snapCuboidToRoadAndOrient(
     }
 
     // 3. Object points strictly above road surface
+    const objectPoints: { px: number; py: number; pz: number }[] = [];
     const objectPoints2D: [number, number][] = [];
+
+    const searchMarginX = Math.max(0.35, dx * 0.1);
+    const searchMarginY = Math.max(0.35, dy * 0.1);
 
     for (const idx of localIndices) {
         const px = pointCloudPositions[idx * 3];
         const py = pointCloudPositions[idx * 3 + 1];
         const pz = pointCloudPositions[idx * 3 + 2];
 
-        // Points above ground surface and within vehicle height
-        if (pz >= groundZ + 0.15 && pz <= groundZ + dz + 0.2) {
+        // Points above ground surface and within vehicle height + margin
+        if (pz >= groundZ + 0.10 && pz <= groundZ + Math.max(dz, 1.6) + 0.5) {
             const distX = px - cx;
             const distY = py - cy;
             const u = distX * cosRz + distY * sinRz;
             const v = -distX * sinRz + distY * cosRz;
-            if (Math.abs(u) <= dx / 2 + 0.25 && Math.abs(v) <= dy / 2 + 0.25) {
+            if (Math.abs(u) <= dx / 2 + searchMarginX && Math.abs(v) <= dy / 2 + searchMarginY) {
+                objectPoints.push({ px, py, pz });
                 objectPoints2D.push([px, py]);
             }
         }
@@ -522,20 +570,195 @@ export function snapCuboidToRoadAndOrient(
 
     let newYaw = rz;
     if (autoOrient && objectPoints2D.length >= 8) {
-        newYaw = alignYawWithPoints(objectPoints2D, rz, dx, dy);
+        newYaw = alignYawWithPoints(objectPoints2D, rz, dx, dy, options.motionYaw);
+    }
+
+    // Auto-tighten dimensions & center on vehicle points if sufficient points exist
+    if (objectPoints.length >= 10) {
+        const cosYaw = Math.cos(newYaw);
+        const sinYaw = Math.sin(newYaw);
+
+        const uValues: number[] = [];
+        const vValues: number[] = [];
+        const zValues: number[] = [];
+
+        for (const pt of objectPoints) {
+            const distX = pt.px - cx;
+            const distY = pt.py - cy;
+            const u = distX * cosYaw + distY * sinYaw;
+            const v = -distX * sinYaw + distY * cosYaw;
+            uValues.push(u);
+            vValues.push(v);
+            zValues.push(pt.pz);
+        }
+
+        uValues.sort((a, b) => a - b);
+        vValues.sort((a, b) => a - b);
+        zValues.sort((a, b) => a - b);
+
+        const nPts = objectPoints.length;
+        const p05Idx = Math.floor(nPts * 0.05);
+        const p95Idx = Math.min(nPts - 1, Math.floor(nPts * 0.95));
+        const p98Idx = Math.min(nPts - 1, Math.floor(nPts * 0.98));
+
+        const uMin = uValues[p05Idx];
+        const uMax = uValues[p95Idx];
+        const vMin = vValues[p05Idx];
+        const vMax = vValues[p95Idx];
+        const zTop = zValues[p98Idx];
+
+        // Height (dz) fitting:
+        const measuredHeight = zTop - groundZ;
+        if (measuredHeight >= 0.7 && measuredHeight <= 4.5) {
+            let fittedDz = measuredHeight + 0.06;
+            if (dx >= 3.0 && fittedDz < 1.3) fittedDz = 1.3;
+            if (Math.abs(fittedDz - dz) > 0.05) {
+                newDz = parseFloat(fittedDz.toFixed(3));
+                newZ = groundZ + newDz / 2;
+            }
+        }
+
+        // Lateral centering & width (dy):
+        if (vMin < -0.15 && vMax > 0.15) {
+            const shiftV = (vMin + vMax) / 2;
+            const clampedShiftV = Math.max(-0.35, Math.min(0.35, shiftV));
+            finalCx += -clampedShiftV * sinYaw;
+            finalCy += clampedShiftV * cosYaw;
+
+            const measuredWidth = vMax - vMin + 0.12;
+            if (measuredWidth >= 1.2 && measuredWidth <= 3.2) {
+                if (Math.abs(dy - measuredWidth) > 0.15) {
+                    newDy = parseFloat(measuredWidth.toFixed(3));
+                }
+            }
+        }
+
+        // Longitudinal centering & length (dx):
+        if (uMax - uMin >= 2.0) {
+            const shiftU = (uMin + uMax) / 2;
+            const clampedShiftU = Math.max(-0.4, Math.min(0.4, shiftU));
+            finalCx += clampedShiftU * cosYaw;
+            finalCy += clampedShiftU * sinYaw;
+
+            const measuredLength = uMax - uMin + 0.18;
+            if (measuredLength >= 2.5 && measuredLength <= 14.0) {
+                if (dx > measuredLength + 0.5 || dx < measuredLength - 0.2) {
+                    newDx = parseFloat(measuredLength.toFixed(3));
+                }
+            }
+        }
+    }
+
+    // 4. Class-Specific Dimension Constraints & Upright Posture
+    const lowerLabel = (options.labelName || '').toLowerCase();
+    const isPedestrian = lowerLabel.includes('pedestrian') || lowerLabel.includes('person');
+    const isTwoWheeler = lowerLabel.includes('motorcycle') || lowerLabel.includes('bicycle') || lowerLabel.includes('cyclist');
+    const isHeavyVehicle = lowerLabel.includes('truck') || lowerLabel.includes('bus') || lowerLabel.includes('trailer');
+
+    if (isPedestrian) {
+        // Pedestrians stand upright relative to gravity: pitch and roll must remain 0
+        newDx = Math.max(0.45, Math.min(0.85, newDx));
+        newDy = Math.max(0.45, Math.min(0.85, newDy));
+        newDz = Math.max(1.45, Math.min(1.95, newDz));
+        newZ = groundZ + newDz / 2;
+    } else if (isTwoWheeler) {
+        // Motorbikes and bicycles have narrow lateral width
+        newDy = Math.max(0.65, Math.min(0.95, newDy));
+        newDx = Math.max(1.6, Math.min(2.3, newDx));
+        newDz = Math.max(1.1, Math.min(1.65, newDz));
+        newZ = groundZ + newDz / 2;
+    } else if (isHeavyVehicle) {
+        newDy = Math.max(2.3, Math.min(3.0, newDy));
+        newDx = Math.max(6.0, Math.min(14.5, newDx));
+        newDz = Math.max(2.4, Math.min(4.2, newDz));
+        newZ = groundZ + newDz / 2;
+    }
+
+    let finalRx = rx;
+    let finalRy = ry;
+    let finalRz = newYaw;
+
+    // Full 3-DOF Ground Plane Alignment (Pitch + Roll from Road Normal) - skipped for pedestrians
+    if (!isPedestrian && detectedPlane && detectedPlane[2] >= 0.80) {
+        const [nA, nB, nC] = detectedPlane;
+        const norm = new THREE.Vector3(nA, nB, nC).normalize();
+
+        // Project horizontal forward heading onto the road surface
+        const fHoriz = new THREE.Vector3(Math.cos(newYaw), Math.sin(newYaw), 0);
+        const dot = fHoriz.dot(norm);
+        const xLocal = fHoriz.clone().sub(norm.clone().multiplyScalar(dot));
+
+        if (xLocal.lengthSq() > 1e-6) {
+            xLocal.normalize();
+            const yLocal = new THREE.Vector3().crossVectors(norm, xLocal).normalize();
+            const zLocal = norm;
+
+            const basisMatrix = new THREE.Matrix4().makeBasis(xLocal, yLocal, zLocal);
+            const euler = new THREE.Euler().setFromRotationMatrix(basisMatrix, 'XYZ');
+
+            // Limit maximum pitch/roll to realistic road grades (+- 20 deg = 0.35 rad)
+            const maxTilt = (20 * Math.PI) / 180;
+            if (Math.abs(euler.x) <= maxTilt && Math.abs(euler.y) <= maxTilt) {
+                finalRx = parseFloat(euler.x.toFixed(4));
+                finalRy = parseFloat(euler.y.toFixed(4));
+                finalRz = parseFloat(euler.z.toFixed(4));
+            }
+        }
+    }
+
+    // 4. Multi-corner ground clearance verification
+    // Evaluate the 4 bottom corners against the local road plane to guarantee zero road penetration
+    if (detectedPlane && detectedPlane[2] >= 0.80) {
+        const [nA, nB, nC, nD] = detectedPlane;
+        const halfX = newDx / 2;
+        const halfY = newDy / 2;
+        const halfZ = newDz / 2;
+        const cornerOffsets = [
+            [-halfX, -halfY, -halfZ],
+            [-halfX, halfY, -halfZ],
+            [halfX, -halfY, -halfZ],
+            [halfX, halfY, -halfZ],
+        ];
+
+        const basisEuler = new THREE.Euler(finalRx, finalRy, finalRz, 'XYZ');
+        const rotMat = new THREE.Matrix4().makeRotationFromEuler(basisEuler);
+
+        let maxPenetration = 0;
+        for (const [ox, oy, oz] of cornerOffsets) {
+            const cornerVec = new THREE.Vector3(ox, oy, oz).applyMatrix4(rotMat);
+            const cornerWorldX = finalCx + cornerVec.x;
+            const cornerWorldY = finalCy + cornerVec.y;
+            const cornerWorldZ = newZ + cornerVec.z;
+
+            // Road elevation directly beneath this corner
+            const roadAtCorner = -(nA * cornerWorldX + nB * cornerWorldY + nD) / nC;
+            const requiredElevation = roadAtCorner + 0.015;
+
+            if (cornerWorldZ < requiredElevation) {
+                const penetration = requiredElevation - cornerWorldZ;
+                if (penetration > maxPenetration) {
+                    maxPenetration = penetration;
+                }
+            }
+        }
+
+        // If any corner is sinking below the road, elevate the cuboid center
+        if (maxPenetration > 0 && maxPenetration < 0.5) {
+            newZ += maxPenetration;
+        }
     }
 
     const deltaZ = newZ - cz;
-    const rawDeltaYaw = (newYaw - rz) * (180 / Math.PI);
+    const rawDeltaYaw = (finalRz - rz) * (180 / Math.PI);
     const deltaYawDeg = ((rawDeltaYaw + 180) % 360) - 180;
 
     const resultPoints = [
-        parseFloat(cx.toFixed(3)),
-        parseFloat(cy.toFixed(3)),
+        parseFloat(finalCx.toFixed(3)),
+        parseFloat(finalCy.toFixed(3)),
         parseFloat(newZ.toFixed(3)),
-        rx,
-        ry,
-        parseFloat(newYaw.toFixed(4)),
+        finalRx,
+        finalRy,
+        parseFloat(finalRz.toFixed(4)),
         newDx,
         newDy,
         newDz,
@@ -550,6 +773,9 @@ export function snapCuboidToRoadAndOrient(
             deltaYawDeg: parseFloat(deltaYawDeg.toFixed(1)),
             groundZ: parseFloat(groundZ.toFixed(3)),
             pointsCount: objectPoints2D.length,
+            deltaHeight: parseFloat((newDz - dz).toFixed(3)),
+            deltaWidth: parseFloat((newDy - dy).toFixed(3)),
+            deltaLength: parseFloat((newDx - dx).toFixed(3)),
         },
     };
 }
