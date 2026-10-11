@@ -145,9 +145,13 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         resetGroup,
     } = props;
 
-    const selectedStatesID = useSelector(
-        (state: CombinedState) => state.annotation.annotations.selectedStatesID,
+    const { selectedStatesID, activatedStateID } = useSelector(
+        (state: CombinedState) => ({
+            selectedStatesID: state.annotation.annotations.selectedStatesID,
+            activatedStateID: state.annotation.annotations.activatedStateID,
+        }),
     );
+    const activeTargetID = activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null);
 
     const applicableLabels = filterApplicableForType(LabelType.CUBOID, labels);
     const preventDefault = (event: KeyboardEvent | undefined): void => {
@@ -248,7 +252,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         },
         SNAP_TO_ROAD_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();
-            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            const targetID = activeTargetID;
             if (event && (event.shiftKey || event.key === 'F')) {
                 canvasInstance.revertSnap(targetID);
             } else {
@@ -257,12 +261,12 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         },
         REVERT_SNAP_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();
-            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            const targetID = activeTargetID;
             canvasInstance.revertSnap(targetID);
         },
         INVERT_HEADING_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();
-            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            const targetID = activeTargetID;
             if (targetID === null) {
                 notification.warning({ message: 'No 3D object selected', duration: 2 });
                 return;
@@ -271,7 +275,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         },
         SNAP_TRACK_TO_ROAD_3D_CONTROLS: async (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();
-            const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+            const targetID = activeTargetID;
             if (targetID === null) {
                 notification.warning({ message: 'No 3D object selected', duration: 2 });
                 return;

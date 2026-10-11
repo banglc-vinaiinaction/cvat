@@ -183,7 +183,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
         if (!state) return;
 
-        const currentPoints = [
+        const currentPoints = state.points && state.points.length >= 9 ? [...state.points] : [
             cuboid.perspective.position.x,
             cuboid.perspective.position.y,
             cuboid.perspective.position.z,
@@ -219,6 +219,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             // ignore if not all views are initialized
         }
 
+        this.updateResizeHelperPos();
+        this.updateRotationHelperPos();
+        this.detachCamera();
         BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
         this.updateCameraFrustumPlane();
 
@@ -307,6 +310,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             // ignore if not all views initialized
         }
 
+        this.updateResizeHelperPos();
+        this.updateRotationHelperPos();
+        this.detachCamera();
         BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
         this.updateCameraFrustumPlane();
 
@@ -378,7 +384,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
         if (!state) return;
 
-        const previousPoints = [
+        const previousPoints = state.points && state.points.length >= 9 ? [...state.points] : [
             cuboid.perspective.position.x,
             cuboid.perspective.position.y,
             cuboid.perspective.position.z,
@@ -423,19 +429,28 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
         }
 
+        const [x, y, z] = previousPoints;
+        cuboid.setPosition(x, y, z);
         cuboid.setRotation(finalRx, finalRy, finalRz);
         const newPoints = [...previousPoints];
+        newPoints[0] = x;
+        newPoints[1] = y;
+        newPoints[2] = z;
         newPoints[3] = finalRx;
         newPoints[4] = finalRy;
         newPoints[5] = finalRz;
         data.points = newPoints;
 
+        this.translateReferencePlane(new THREE.Vector3(x, y, z));
         try {
             this.rotatePlane(null as any, null as any);
         } catch (_) {
             // ignore
         }
 
+        this.updateResizeHelperPos();
+        this.updateRotationHelperPos();
+        this.detachCamera();
         BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
         this.updateCameraFrustumPlane();
 

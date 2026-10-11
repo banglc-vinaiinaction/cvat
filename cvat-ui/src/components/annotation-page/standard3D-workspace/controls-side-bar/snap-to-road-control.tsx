@@ -21,11 +21,14 @@ export interface Props {
 
 function SnapToRoadControl(props: Props): JSX.Element {
     const { canvasInstance, disabled, jobInstance } = props;
-    const selectedStatesID = useSelector(
-        (state: CombinedState) => state.annotation.annotations.selectedStatesID,
+    const { selectedStatesID, activatedStateID } = useSelector(
+        (state: CombinedState) => ({
+            selectedStatesID: state.annotation.annotations.selectedStatesID,
+            activatedStateID: state.annotation.annotations.activatedStateID,
+        }),
     );
 
-    const targetID = selectedStatesID.length ? selectedStatesID[0] : null;
+    const targetID = activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null);
 
     const onClick = (): void => {
         if (!disabled) {
