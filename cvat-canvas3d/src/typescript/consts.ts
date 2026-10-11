@@ -25,6 +25,38 @@ const MERGING_COLOR = '#0000ff';
 const SPLITTING_COLOR = '#1e90ff';
 const BASE_POINT_SIZE = 4;
 
+export const DEFAULT_DIMENSION_PRIOR: [number, number, number] = [4.5, 2.0, 1.6];
+
+export const CLASS_DIMENSION_PRIORS: Record<string, [number, number, number]> = {
+    vehicles: [4.8, 1.9, 1.6],
+    vehicle: [4.8, 1.9, 1.6],
+    car: [4.7, 1.85, 1.5],
+    suv: [4.8, 1.95, 1.7],
+    van: [5.2, 2.0, 2.0],
+    truck: [10.5, 2.5, 3.2],
+    bus: [12.0, 2.55, 3.4],
+    motorcycle: [2.1, 0.8, 1.2],
+    bicycle: [1.8, 0.6, 1.1],
+    pedestrian: [0.6, 0.6, 1.75],
+    person: [0.6, 0.6, 1.75],
+};
+
+export function getClassDimensionPrior(labelName?: string): [number, number, number] {
+    if (!labelName) {
+        return DEFAULT_DIMENSION_PRIOR;
+    }
+    const lower = labelName.toLowerCase().trim();
+    if (CLASS_DIMENSION_PRIORS[lower]) {
+        return CLASS_DIMENSION_PRIORS[lower];
+    }
+    for (const [key, dims] of Object.entries(CLASS_DIMENSION_PRIORS)) {
+        if (lower.includes(key)) {
+            return dims;
+        }
+    }
+    return DEFAULT_DIMENSION_PRIOR;
+}
+
 export default {
     BASE_GRID_WIDTH,
     MOVEMENT_FACTOR,
@@ -47,4 +79,6 @@ export default {
     MERGING_COLOR,
     SPLITTING_COLOR,
     BASE_POINT_SIZE,
+    CLASS_DIMENSION_PRIORS,
+    DEFAULT_DIMENSION_PRIOR,
 };

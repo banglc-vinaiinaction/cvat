@@ -8,7 +8,7 @@ import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader';
 import CameraControls from 'camera-controls';
 import { Canvas3dController } from './canvas3dController';
 import { Listener, Master } from './master';
-import consts from './consts';
+import consts, { getClassDimensionPrior } from './consts';
 import {
     Canvas3dModel, DrawData, Mode, Planes, UpdateReasons, ViewType,
 } from './canvas3dModel';
@@ -19,7 +19,10 @@ import {
 } from './cuboid';
 import { ObjectState, ObjectType } from '.';
 import { disposeScene } from './utils';
-import { snapCuboidToRoadAndOrient } from './snapping';
+import {
+    snapCuboidToRoadAndOrient, fitClusterAtPoint, estimateLocalRoadPlane,
+    alignEulerToRoadPlane, getRoadHeightAt,
+} from './snapping';
 
 export interface Canvas3dView {
     html(): ViewsDOM;
@@ -31,6 +34,7 @@ export interface Canvas3dView {
     revertSnap(clientID?: number | null): boolean;
     getPreviousCuboid(clientID?: number | null): number[] | null;
     invertHeading(clientID?: number | null): void;
+    getActiveElement(): number | null;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -428,7 +432,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 const euler = new THREE.Euler().setFromRotationMatrix(basisMatrix, 'XYZ');
                 finalRx = parseFloat(euler.x.toFixed(4));
                 finalRy = parseFloat(euler.y.toFixed(4));
-                finalRz = parseFloat(euler.z.toFixed(4));
+                finalRz = Math.cos(euler.z - newYaw) > 0.7 ? parseFloat(euler.z.toFixed(4)) : newYaw;
             }
         }
 
@@ -587,44 +591,23 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
             if (!positions) continue;
 
-            // Compute motion-derived heading vector
-            let motionYaw: number | null = null;
-            let vx = 0;
-            let vy = 0;
-            let dt = 1;
-
-            if (idx + 1 < sortedFrames.length && idx > 0) {
-                const nextState = trackStatesByFrame.get(sortedFrames[idx + 1])!;
-                const prevState = trackStatesByFrame.get(sortedFrames[idx - 1])!;
-                dt = Math.max(1, sortedFrames[idx + 1] - sortedFrames[idx - 1]);
-                vx = (nextState.points[0] - prevState.points[0]) / dt;
-                vy = (nextState.points[1] - prevState.points[1]) / dt;
-            } else if (idx + 1 < sortedFrames.length) {
-                const nextState = trackStatesByFrame.get(sortedFrames[idx + 1])!;
-                dt = Math.max(1, sortedFrames[idx + 1] - f);
-                vx = (nextState.points[0] - trackState.points[0]) / dt;
-                vy = (nextState.points[1] - trackState.points[1]) / dt;
-            } else if (idx > 0) {
-                const prevState = trackStatesByFrame.get(sortedFrames[idx - 1])!;
-                dt = Math.max(1, f - sortedFrames[idx - 1]);
-                vx = (trackState.points[0] - prevState.points[0]) / dt;
-                vy = (trackState.points[1] - prevState.points[1]) / dt;
-            }
-
-            const speed = Math.hypot(vx, vy);
-            if (speed >= 0.15) {
-                motionYaw = Math.atan2(vy, vx);
-            }
+            // Strictly preserve the annotator's existing heading (yaw) on each track frame.
+            // In datasets where ego-vehicle is moving, sensor-frame displacement does not match
+            // vehicle heading and causes 180-degree heading flips.
+            const existingYaw = trackState.points[5];
 
             try {
                 const snapResult = snapCuboidToRoadAndOrient(trackState.points, positions, {
-                    motionYaw,
+                    autoOrient: false,
                     labelName: trackState.label?.name,
                 });
+                const snappedPoints = [...snapResult.points];
+                snappedPoints[5] = existingYaw;
+
                 snappedFrames.push({
                     frame: f,
                     state: trackState,
-                    points: [...snapResult.points],
+                    points: snappedPoints,
                 });
             } catch (err) {
                 console.warn(`Could not snap frame ${f}:`, err);
@@ -643,9 +626,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             const rySmoothed = snappedFrames.map((s) => s.points[4]);
 
             for (let i = 1; i < snappedFrames.length - 1; i++) {
-                zSmoothed[i] = 0.25 * snappedFrames[i - 1].points[2] + 0.5 * snappedFrames[i].points[2] + 0.25 * snappedFrames[i + 1].points[2];
-                rxSmoothed[i] = 0.25 * snappedFrames[i - 1].points[3] + 0.5 * snappedFrames[i].points[3] + 0.25 * snappedFrames[i + 1].points[3];
-                rySmoothed[i] = 0.25 * snappedFrames[i - 1].points[4] + 0.5 * snappedFrames[i].points[4] + 0.25 * snappedFrames[i + 1].points[4];
+                zSmoothed[i] = 0.25 * snappedFrames[i - 1].points[2] +
+                    0.5 * snappedFrames[i].points[2] +
+                    0.25 * snappedFrames[i + 1].points[2];
+                rxSmoothed[i] = 0.25 * snappedFrames[i - 1].points[3] +
+                    0.5 * snappedFrames[i].points[3] +
+                    0.25 * snappedFrames[i + 1].points[3];
+                rySmoothed[i] = 0.25 * snappedFrames[i - 1].points[4] +
+                    0.5 * snappedFrames[i].points[4] +
+                    0.25 * snappedFrames[i + 1].points[4];
             }
 
             for (let i = 1; i < snappedFrames.length - 1; i++) {
@@ -936,8 +925,16 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 const { x, y, z } = this.cube.perspective.position;
                 const { x: width, y: height, z: depth } = this.cube.perspective.scale;
                 const { x: rotationX, y: rotationY, z: rotationZ } = this.cube.perspective.rotation;
-                const points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
+                let points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
                 const initState = this.model.data.drawData.initialState;
+                if (this.pointCloudPoints?.geometry?.attributes?.position?.array) {
+                    const labelName = initState?.label?.name;
+                    points = fitClusterAtPoint(
+                        [x, y, z],
+                        this.pointCloudPoints.geometry.attributes.position.array,
+                        { labelName },
+                    ).points;
+                }
                 this.dispatchEvent(
                     new CustomEvent('canvas.drawn', {
                         bubbles: false,
@@ -961,6 +958,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         });
 
         canvasPerspectiveView.addEventListener('mousedown', this.onPerspectiveDrag);
+        canvasPerspectiveView.addEventListener('mouseup', (e: MouseEvent): void => {
+            if (this.mode === Mode.DRAW && e.button === 0) {
+                this.finalizeDraw();
+            }
+        });
         window.document.addEventListener('mouseup', () => {
             this.disablePerspectiveDragging();
             if (this.isPerspectiveBeingDragged && this.mode !== Mode.DRAG_CANVAS) {
@@ -1088,56 +1090,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 return;
             }
 
-            this.controller.drawData.enabled = false;
-            this.mode = Mode.IDLE;
-            const { x, y, z } = this.cube.perspective.position;
-            const { x: width, y: height, z: depth } = this.cube.perspective.scale;
-            const { x: rotationX, y: rotationY, z: rotationZ } = this.cube.perspective.rotation;
-            const points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
-            const initState = this.model.data.drawData.initialState;
-            const { redraw } = this.model.data.drawData;
-            if (typeof redraw === 'number') {
-                const state = this.model.objects
-                    .find((object: ObjectState): boolean => object.clientID === redraw);
-                const { cuboid } = this.drawnObjects[redraw];
-                cuboid.perspective.visible = true;
-
-                this.dispatchEvent(
-                    new CustomEvent('canvas.edited', {
-                        bubbles: false,
-                        cancelable: true,
-                        detail: {
-                            state,
-                            points,
-                        },
-                    }),
-                );
-            } else {
-                this.dispatchEvent(
-                    new CustomEvent('canvas.drawn', {
-                        bubbles: false,
-                        cancelable: true,
-                        detail: {
-                            state: {
-                                shapeType: 'cuboid',
-                                frame: this.model.data.imageID,
-                                points,
-                                ...(initState ? {
-                                    attributes: { ...initState.attributes },
-                                    group: initState.group?.id || null,
-                                    label: initState.label,
-                                    shapeType: initState.shapeType,
-                                    objectType: initState.objectType,
-                                } : {}),
-                            },
-                            duration: 0,
-                        },
-                    }),
-                );
-            }
-
-            this.views[ViewType.PERSPECTIVE].scene.children[0].remove(this.cube.perspective);
-            this.dispatchEvent(new CustomEvent('canvas.canceled'));
+            this.finalizeDraw();
         });
 
         this.mode = Mode.IDLE;
@@ -1253,6 +1206,71 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         });
 
         model.subscribe(this);
+    }
+
+    private finalizeDraw(): void {
+        if (this.mode !== Mode.DRAW) return;
+
+        this.controller.drawData.enabled = false;
+        this.mode = Mode.IDLE;
+        const { x, y, z } = this.cube.perspective.position;
+        const { x: width, y: height, z: depth } = this.cube.perspective.scale;
+        const { x: rotationX, y: rotationY, z: rotationZ } = this.cube.perspective.rotation;
+        let points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
+        const initState = this.model.data.drawData.initialState;
+        const { redraw } = this.model.data.drawData;
+        if (typeof redraw === 'number') {
+            const state = this.model.objects
+                .find((object: ObjectState): boolean => object.clientID === redraw);
+            const { cuboid } = this.drawnObjects[redraw];
+            cuboid.perspective.visible = true;
+
+            this.dispatchEvent(
+                new CustomEvent('canvas.edited', {
+                    bubbles: false,
+                    cancelable: true,
+                    detail: {
+                        state,
+                        points,
+                    },
+                }),
+            );
+        } else {
+            if (this.pointCloudPoints?.geometry?.attributes?.position?.array) {
+                const labelName = initState?.label?.name;
+                const fitted = fitClusterAtPoint(
+                    [x, y, z],
+                    this.pointCloudPoints.geometry.attributes.position.array,
+                    { labelName },
+                );
+                points = fitted.points;
+            }
+
+            this.dispatchEvent(
+                new CustomEvent('canvas.drawn', {
+                    bubbles: false,
+                    cancelable: true,
+                    detail: {
+                        state: {
+                            shapeType: 'cuboid',
+                            frame: this.model.data.imageID,
+                            points,
+                            ...(initState ? {
+                                attributes: { ...initState.attributes },
+                                group: initState.group?.id || null,
+                                label: initState.label,
+                                shapeType: initState.shapeType,
+                                objectType: initState.objectType,
+                            } : {}),
+                        },
+                        duration: 0,
+                    },
+                }),
+            );
+        }
+
+        this.views[ViewType.PERSPECTIVE].scene.children[0].remove(this.cube.perspective);
+        this.dispatchEvent(new CustomEvent('canvas.canceled'));
     }
 
     private fitObject(object: CuboidModel, animate: boolean = false): void {
@@ -2167,7 +2185,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     model.cancel();
                     return;
                 }
-            } else if (data.initialState) {
+            } else if (data.initialState && Array.isArray(data.initialState.points)) {
                 if (!data.initialState.outside && !data.initialState.hidden) {
                     this.cube = this.addCuboid(data.initialState);
                 } else {
@@ -2178,6 +2196,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             } else {
                 this.cube = new CuboidModel('line', '#ffffff');
                 this.cube.setOrientationVisibility(this.model.data.configuration.orientationVisibility);
+            }
+
+            const labelName = data.initialState?.label?.name;
+            const [dx, dy, dz] = getClassDimensionPrior(labelName);
+            if (!Number.isInteger(data.redraw) && (!data.initialState || !Array.isArray(data.initialState.points))) {
+                this.cube.perspective.scale.set(dx, dy, dz);
             }
 
             this.cube.setName('drawTemplate');
@@ -2596,8 +2620,36 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 .intersectObjects(this.views.perspective.scene.children, false);
             if (intersection) {
                 const object = this.views.perspective.scene.getObjectByName('drawTemplate');
-                const { x, y, z } = intersection.point;
-                object.position.set(x, y, z);
+                if (object) {
+                    const { x, y, z } = intersection.point;
+                    const h = this.cube.perspective.scale.z;
+                    const positions = this.pointCloudPoints?.geometry?.attributes?.position?.array;
+                    let zGround = z;
+                    let rx = 0;
+                    let ry = 0;
+                    const rz = object.rotation.z;
+
+                    if (positions) {
+                        const plane = estimateLocalRoadPlane(x, y, z, positions);
+                        if (plane) {
+                            const roadZ = getRoadHeightAt(plane, x, y);
+                            if (Math.abs(roadZ - z) <= 2.5) {
+                                zGround = roadZ;
+                            }
+                            const labelName = this.controller.drawData.initialState?.label?.name;
+                            const lowerLabel = (labelName || '').toLowerCase().trim();
+                            const isPedestrian = lowerLabel.includes('pedestrian') || lowerLabel.includes('person');
+                            if (!isPedestrian) {
+                                const aligned = alignEulerToRoadPlane(rz, plane);
+                                rx = aligned.rx;
+                                ry = aligned.ry;
+                            }
+                        }
+                    }
+
+                    object.position.set(x, y, zGround + h / 2);
+                    object.rotation.set(rx, ry, rz);
+                }
             }
         } else {
             const { renderer } = this.views.perspective.rayCaster;
@@ -2689,7 +2741,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 this.isPerspectiveBeingDragged
             );
 
-            const shouldRender = forceRenderAll || resized || controlsUpdated || isScanningView || needsPerspectiveInteraction;
+            const shouldRender = forceRenderAll || resized ||
+                controlsUpdated || isScanningView || needsPerspectiveInteraction;
 
             if (shouldRender) {
                 viewType.renderer.render(viewType.scene, viewType.camera);
