@@ -915,11 +915,21 @@ export function estimateLocalRoadPlane(
 export function fitClusterAtPoint(
     clickedPoint: [number, number, number],
     positions: ArrayLike<number>,
-    options: { labelName?: string } = {},
+    options: {
+        labelName?: string;
+        defaultDims?: [number, number, number];
+        snapGround?: boolean;
+        autoOrient?: boolean;
+    } = {},
 ): { points: number[] } {
     const [cx, cy, cz] = clickedPoint;
-    const { labelName } = options;
-    const [dx, dy, dz] = getClassDimensionPrior(labelName);
+    const {
+        labelName,
+        defaultDims,
+        snapGround = true,
+        autoOrient = true,
+    } = options;
+    const [dx, dy, dz] = defaultDims || getClassDimensionPrior(labelName);
     const lowerLabel = (labelName || '').toLowerCase().trim();
     const isPedestrian = lowerLabel.includes('pedestrian') || lowerLabel.includes('person');
 
@@ -957,7 +967,7 @@ export function fitClusterAtPoint(
     let detectedPlane: [number, number, number, number] | null = null;
     let zGround = cz;
 
-    if (localIndices.length >= 4) {
+    if (snapGround && localIndices.length >= 4) {
         const sortedIndices = [...localIndices].sort(
             (a, b) => positions[a * 3 + 2] - positions[b * 3 + 2],
         );
@@ -998,7 +1008,7 @@ export function fitClusterAtPoint(
         const py = positions[idx * 3 + 1];
         const pz = positions[idx * 3 + 2];
 
-        const localRoadZ = detectedPlane ? getRoadHeightAt(detectedPlane, px, py) : zGround;
+        const localRoadZ = (snapGround && detectedPlane) ? getRoadHeightAt(detectedPlane, px, py) : zGround;
         if (pz >= localRoadZ + 0.15 && pz <= localRoadZ + Math.max(dz, 1.8) + 0.8) {
             vehiclePoints.push({ px, py, pz });
         }
@@ -1006,12 +1016,12 @@ export function fitClusterAtPoint(
 
     let finalX = cx;
     let finalY = cy;
-    let finalZ = zGround + dz / 2;
+    let finalZ = (snapGround ? zGround : cz) + dz / 2;
     let rx = 0;
     let ry = 0;
     let rz = 0;
 
-    if (vehiclePoints.length >= 8) {
+    if (autoOrient && vehiclePoints.length >= 8) {
         let sumX = 0;
         let sumY = 0;
         for (const pt of vehiclePoints) {
@@ -1042,21 +1052,26 @@ export function fitClusterAtPoint(
             rx = 0;
             ry = 0;
             rz = 0;
-        } else {
+        } else if (snapGround && detectedPlane) {
             const aligned = alignEulerToRoadPlane(yaw, detectedPlane);
             rx = aligned.rx;
             ry = aligned.ry;
             rz = aligned.rz;
+        } else {
+            rx = 0;
+            ry = 0;
+            rz = yaw;
         }
 
-        const roadZAtCentroid = detectedPlane ? getRoadHeightAt(detectedPlane, finalX, finalY) : zGround;
-        finalZ = roadZAtCentroid + dz / 2;
+        const roadZAtCentroid = (snapGround && detectedPlane) ?
+            getRoadHeightAt(detectedPlane, finalX, finalY) : zGround;
+        finalZ = (snapGround ? roadZAtCentroid : cz) + dz / 2;
     } else {
         finalX = cx;
         finalY = cy;
-        finalZ = zGround + dz / 2;
+        finalZ = (snapGround ? zGround : cz) + dz / 2;
 
-        if (isPedestrian) {
+        if (isPedestrian || !snapGround || !detectedPlane) {
             rx = 0;
             ry = 0;
             rz = 0;

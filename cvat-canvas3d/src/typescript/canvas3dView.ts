@@ -35,6 +35,7 @@ export interface Canvas3dView {
     getPreviousCuboid(clientID?: number | null): number[] | null;
     invertHeading(clientID?: number | null): void;
     getActiveElement(): number | null;
+    setCuboidDimensions(clientID: number | null, dimensions: [number, number, number]): void;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -480,6 +481,76 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 detail: {
                     state,
                     yawDeg: parseFloat(((finalRz * 180) / Math.PI).toFixed(1)),
+                },
+            }),
+        );
+        this.render();
+    }
+
+    public setCuboidDimensions(clientID: number | null, dimensions: [number, number, number]): void {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            targetClientID = this.getActiveElement();
+        }
+
+        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+            return;
+        }
+
+        this.model.data.activeElement.clientID = `${targetClientID}`;
+        this.activatedElementID = targetClientID;
+
+        const { cuboid, data } = this.drawnObjects[targetClientID];
+        if (data.lock) return;
+
+        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
+        if (!state) return;
+
+        const previousPoints = state.points && state.points.length >= 9 ? [...state.points] : [
+            cuboid.perspective.position.x,
+            cuboid.perspective.position.y,
+            cuboid.perspective.position.z,
+            cuboid.perspective.rotation.x,
+            cuboid.perspective.rotation.y,
+            cuboid.perspective.rotation.z,
+            cuboid.perspective.scale.x,
+            cuboid.perspective.scale.y,
+            cuboid.perspective.scale.z,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        if (!this.previousCuboids.has(targetClientID)) {
+            this.previousCuboids.set(targetClientID, []);
+        }
+        this.previousCuboids.get(targetClientID)!.push(previousPoints);
+
+        const [dx, dy, dz] = dimensions;
+        cuboid.setScale(dx, dy, dz);
+
+        const newPoints = [...previousPoints];
+        newPoints[6] = dx;
+        newPoints[7] = dy;
+        newPoints[8] = dz;
+        data.points = newPoints;
+        if (state.points && state.points.length >= 9) {
+            state.points[6] = dx;
+            state.points[7] = dy;
+            state.points[8] = dz;
+        }
+
+        this.updateResizeHelperPos();
+        this.updateRotationHelperPos();
+        this.detachCamera();
+        BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
+        this.updateCameraFrustumPlane();
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.edited', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points: [...newPoints],
+                    previousPoints,
                 },
             }),
         );
@@ -932,7 +1003,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     points = fitClusterAtPoint(
                         [x, y, z],
                         this.pointCloudPoints.geometry.attributes.position.array,
-                        { labelName },
+                        {
+                            labelName,
+                            defaultDims: this.controller.drawData.initialDimensions,
+                            snapGround: this.controller.drawData.snapGround ?? true,
+                            autoOrient: this.controller.drawData.autoOrient ?? true,
+                        },
                     ).points;
                 }
                 this.dispatchEvent(
@@ -1241,7 +1317,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 const fitted = fitClusterAtPoint(
                     [x, y, z],
                     this.pointCloudPoints.geometry.attributes.position.array,
-                    { labelName },
+                    {
+                        labelName,
+                        defaultDims: this.controller.drawData.initialDimensions,
+                        snapGround: this.controller.drawData.snapGround ?? true,
+                        autoOrient: this.controller.drawData.autoOrient ?? true,
+                    },
                 );
                 points = fitted.points;
             }
@@ -1643,13 +1724,42 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             return;
         }
 
-        const { x, y, z } = this.selectedCuboid[scan].position;
+        const isTranslation = Boolean(this.action.translation.status);
+        const targetClientID = Number(this.selectedCuboid[scan].name);
+        const autoRoadSnap = this.model.data.configuration.autoRoadSnap ?? true;
+
+        let { x, y, z } = this.selectedCuboid[scan].position;
         const { x: width, y: height, z: depth } = this.selectedCuboid[scan].scale;
         const { x: rotationX, y: rotationY, z: rotationZ } = this.selectedCuboid[scan].rotation;
-        const points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
+        let points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
         const [state] = this.model.objects.filter(
-            (_state: any): boolean => _state.clientID === Number(this.selectedCuboid[scan].name),
+            (_state: any): boolean => _state.clientID === targetClientID,
         );
+
+        if (isTranslation && autoRoadSnap && this.pointCloudPoints?.geometry?.attributes?.position?.array) {
+            const positions = this.pointCloudPoints.geometry.attributes.position.array;
+            try {
+                const snapResult = snapCuboidToRoadAndOrient(points, positions, {
+                    labelName: state?.label?.name,
+                    autoOrient: false,
+                    snapGround: true,
+                });
+                points = [...snapResult.points];
+                const [sx, sy, sz, srx, sry, srz, sdx, sdy, sdz] = points;
+                this.selectedCuboid.setPosition(sx, sy, sz);
+                this.selectedCuboid.setRotation(srx, sry, srz);
+                this.selectedCuboid.setScale(sdx, sdy, sdz);
+                if (targetClientID in this.drawnObjects) {
+                    this.drawnObjects[targetClientID].data.points = [...points];
+                }
+                x = sx;
+                y = sy;
+                z = sz;
+            } catch (err) {
+                console.warn('Auto road snap on translation failed:', err);
+            }
+        }
+
         this.dispatchEvent(
             new CustomEvent('canvas.edited', {
                 bubbles: false,
@@ -2199,7 +2309,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
 
             const labelName = data.initialState?.label?.name;
-            const [dx, dy, dz] = getClassDimensionPrior(labelName);
+            const [dx, dy, dz] = data.initialDimensions || getClassDimensionPrior(labelName);
             if (!Number.isInteger(data.redraw) && (!data.initialState || !Array.isArray(data.initialState.points))) {
                 this.cube.perspective.scale.set(dx, dy, dz);
             }

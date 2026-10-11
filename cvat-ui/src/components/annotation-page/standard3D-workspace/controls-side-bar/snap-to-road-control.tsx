@@ -30,8 +30,31 @@ function SnapToRoadControl(props: Props): JSX.Element {
 
     const canvasActiveID = canvasInstance && typeof (canvasInstance as any).getActiveElement === 'function' ?
         (canvasInstance as any).getActiveElement() : null;
-    const targetID = canvasActiveID !== null ? canvasActiveID :
-        (activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null));
+    let targetID: number | null = canvasActiveID;
+    if (targetID === null) {
+        if (activatedStateID !== null) {
+            targetID = activatedStateID;
+        } else if (selectedStatesID.length) {
+            [targetID] = selectedStatesID;
+        }
+    }
+
+    const [autoSnap, setAutoSnap] = React.useState<boolean>(true);
+
+    const toggleAutoSnap = (): void => {
+        const next = !autoSnap;
+        setAutoSnap(next);
+        if (canvasInstance && typeof (canvasInstance as any).configure === 'function') {
+            (canvasInstance as any).configure({ autoRoadSnap: next });
+        }
+        notification.info({
+            message: `Auto-Snap to Road: ${next ? 'ENABLED' : 'DISABLED'}`,
+            description: next ?
+                'Cuboids will automatically snap flush to the road pavement when translated.' :
+                'Automatic road snapping disabled. Press F to snap manually.',
+            duration: 2.5,
+        });
+    };
 
     const onClick = (): void => {
         if (!disabled) {
@@ -40,6 +63,14 @@ function SnapToRoadControl(props: Props): JSX.Element {
     };
 
     const menuItems = [
+        {
+            key: 'auto_snap_toggle',
+            label: autoSnap ? '✓ Auto-Snap on Move (Active)' : 'Auto-Snap on Move (Disabled)',
+            onClick: toggleAutoSnap,
+        },
+        {
+            type: 'divider' as const,
+        },
         {
             key: 'snap',
             label: 'Snap to Road & Orient (F)',
@@ -123,7 +154,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
     return (
         <Dropdown menu={{ items: menuItems }} trigger={['contextMenu']}>
             <span className='cvat-snap-to-road-control-wrapper'>
-                <CVATTooltip title='Snap to Road & Orient (F) • Right-click for Track & Invert' placement='right'>
+                <CVATTooltip title={`Snap to Road (F) • Auto-Snap on Move: ${autoSnap ? 'ACTIVE' : 'OFF'} (Right-click menu)`} placement='right'>
                     <Icon
                         className='cvat-snap-to-road-control'
                         component={SnapToolsIcon}

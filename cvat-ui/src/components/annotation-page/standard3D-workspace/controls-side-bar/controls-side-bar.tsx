@@ -28,15 +28,13 @@ import MergeControl, {
 import SplitControl, {
     Props as SplitControlProps,
 } from 'components/annotation-page/standard-workspace/controls-side-bar/split-control';
-import SnapToRoadControl, {
-    Props as SnapToRoadControlProps,
-} from './snap-to-road-control';
 import GlobalHotKeys, { KeyMap, KeyMapItem } from 'utils/mousetrap-react';
 import ControlVisibilityObserver from 'components/annotation-page/standard-workspace/controls-side-bar/control-visibility-observer';
 import { filterApplicableForType } from 'utils/filter-applicable-labels';
 import { subKeyMap } from 'utils/component-subkeymap';
 import { ShortcutScope } from 'utils/enums';
 import { registerComponentShortcuts } from 'actions/shortcuts-actions';
+import SnapToRoadControl from './snap-to-road-control';
 
 interface Props {
     keyMap: KeyMap;
@@ -153,8 +151,14 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
     );
     const canvasActiveID = canvasInstance && typeof (canvasInstance as any).getActiveElement === 'function' ?
         (canvasInstance as any).getActiveElement() : null;
-    const activeTargetID = canvasActiveID !== null ? canvasActiveID :
-        (activatedStateID !== null ? activatedStateID : (selectedStatesID.length ? selectedStatesID[0] : null));
+    let activeTargetID: number | null = canvasActiveID;
+    if (activeTargetID === null) {
+        if (activatedStateID !== null) {
+            activeTargetID = activatedStateID;
+        } else if (selectedStatesID.length) {
+            [activeTargetID] = selectedStatesID;
+        }
+    }
 
     const applicableLabels = filterApplicableForType(LabelType.CUBOID, labels);
     const preventDefault = (event: KeyboardEvent | undefined): void => {

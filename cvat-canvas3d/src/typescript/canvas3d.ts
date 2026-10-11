@@ -42,6 +42,7 @@ interface Canvas3d {
     getPreviousCuboid(clientID?: number | null): number[] | null;
     invertHeading(clientID?: number | null): void;
     getActiveElement(): number | null;
+    setCuboidDimensions(clientID: number | null, dimensions: [number, number, number]): void;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -146,6 +147,10 @@ class Canvas3dImpl implements Canvas3d {
 
     public getActiveElement(): number | null {
         return this.view.getActiveElement();
+    }
+
+    public setCuboidDimensions(clientID: number | null, dimensions: [number, number, number]): void {
+        this.view.setCuboidDimensions(clientID, dimensions);
     }
 
     public async snapTrackToRoad(

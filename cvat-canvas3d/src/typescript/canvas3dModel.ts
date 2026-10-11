@@ -40,6 +40,9 @@ export interface DrawData {
     initialState?: any;
     redraw?: number;
     shapeType?: string;
+    initialDimensions?: [number, number, number];
+    snapGround?: boolean;
+    autoOrient?: boolean;
 }
 
 export enum FrameZoom {
@@ -81,6 +84,7 @@ export interface Configuration {
     controlPointsSize: number;
     focusedObjectPadding: number;
     orientationVisibility: OrientationVisibility;
+    autoRoadSnap?: boolean;
 }
 
 export enum UpdateReasons {
@@ -205,6 +209,7 @@ export class Canvas3dModelImpl extends MasterImpl implements Canvas3dModel {
                     y: false,
                     z: false,
                 },
+                autoRoadSnap: true,
             },
             isFrameUpdating: false,
             nextSetupRequest: null,
@@ -435,6 +440,10 @@ export class Canvas3dModelImpl extends MasterImpl implements Canvas3dModel {
             this.data.configuration.focusedObjectPadding = Math.max(
                 configuration.focusedObjectPadding, 0,
             );
+        }
+
+        if (typeof configuration.autoRoadSnap === 'boolean') {
+            this.data.configuration.autoRoadSnap = configuration.autoRoadSnap;
         }
 
         this.notify(UpdateReasons.CONFIG_UPDATED);
