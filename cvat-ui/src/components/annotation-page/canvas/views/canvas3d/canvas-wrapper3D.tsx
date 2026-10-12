@@ -702,6 +702,10 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
     };
 
     const keyControlsKeyDown = (key: KeyboardEvent): void => {
+        const target = key.target as HTMLElement | null;
+        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+            return;
+        }
         canvasInstance.keyControls(key);
     };
 
@@ -809,6 +813,25 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
             description: 'Restored cuboid position and orientation prior to snapping.',
             duration: 3,
         });
+    };
+
+    const onCanvasIsolated = (event: any): void => {
+        const { isolated, clientID } = event.detail || {};
+        if (isolated) {
+            notification.info({
+                key: 'object_isolation_notice',
+                message: 'Object Isolation Active',
+                description: `Clipped point cloud and isolated Object #${clientID}. Press 'I' to toggle off.`,
+                duration: 2.5,
+            });
+        } else {
+            notification.info({
+                key: 'object_isolation_notice',
+                message: 'Object Isolation Disabled',
+                description: 'Restored full point cloud view and all scene objects.',
+                duration: 2.0,
+            });
+        }
     };
 
     useEffect(() => {
@@ -926,6 +949,7 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
         canvasInstanceDOM.perspective.addEventListener('canvas.edited', onCanvasEditDone);
         canvasInstanceDOM.perspective.addEventListener('canvas.snapped', onCanvasSnapped as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.inverted', onCanvasInverted as EventListener);
+        canvasInstanceDOM.perspective.addEventListener('canvas.isolated', onCanvasIsolated as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.reverted', onCanvasReverted as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.contextmenu', onContextMenu);
         canvasInstanceDOM.perspective.addEventListener('click', onCanvasClick);
@@ -941,6 +965,7 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
             canvasInstanceDOM.perspective.removeEventListener('canvas.edited', onCanvasEditDone);
             canvasInstanceDOM.perspective.removeEventListener('canvas.snapped', onCanvasSnapped as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.inverted', onCanvasInverted as EventListener);
+            canvasInstanceDOM.perspective.removeEventListener('canvas.isolated', onCanvasIsolated as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.reverted', onCanvasReverted as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.contextmenu', onContextMenu);
             canvasInstanceDOM.perspective.removeEventListener('click', onCanvasClick);

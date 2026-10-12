@@ -113,6 +113,12 @@ const componentShortcuts: Record<string, KeyMapItem> = {
         sequences: ['h'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
+    ISOLATE_OBJECT_3D_CONTROLS: {
+        name: 'Toggle Object Isolation',
+        description: 'Clip point cloud to local volume around active cuboid and dim scene clutter',
+        sequences: ['i'],
+        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
+    },
     SNAP_TRACK_TO_ROAD_3D_CONTROLS: {
         name: 'Snap Track to Road',
         description: 'Snap selected track across all frames to the road surface with smoothed trajectory',
@@ -280,6 +286,17 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
                 return;
             }
             canvasInstance.invertHeading(targetID);
+        },
+        ISOLATE_OBJECT_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
+            if (event) event.preventDefault();
+            const targetID = activeTargetID;
+            if (targetID === null) {
+                notification.warning({ message: 'No 3D object selected', duration: 2 });
+                return;
+            }
+            if (canvasInstance?.toggleObjectIsolation) {
+                canvasInstance.toggleObjectIsolation(targetID);
+            }
         },
         SNAP_TRACK_TO_ROAD_3D_CONTROLS: async (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();

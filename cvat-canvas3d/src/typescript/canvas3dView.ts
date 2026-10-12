@@ -36,6 +36,15 @@ export interface Canvas3dView {
     invertHeading(clientID?: number | null): void;
     getActiveElement(): number | null;
     setCuboidDimensions(clientID: number | null, dimensions: [number, number, number]): void;
+    nudgeCuboid(
+        dxLocal: number,
+        dyLocal: number,
+        dzWorld: number,
+        dYawRad: number,
+        clientID?: number | null,
+    ): boolean;
+    toggleObjectIsolation(clientID?: number | null): boolean;
+    isObjectIsolatedState(): boolean;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -151,6 +160,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private pointCloudPoints: any = null;
     private groundGrid: GroundElevationGrid | null = null;
     private previousCuboids: Map<number, number[][]> = new Map();
+    private isObjectIsolated: boolean = false;
+    private isolatedClientID: number | null = null;
+    private pointCloudMeshes: THREE.Points[] = [];
+    private hiddenByIsolation: Set<number> = new Set();
 
     public requestRender(frameCount: number = 2): void {
         this.needsRenderCount = Math.max(this.needsRenderCount, frameCount);
@@ -558,6 +571,239 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.render();
     }
 
+    public nudgeCuboid(
+        dxLocal: number,
+        dyLocal: number,
+        dzWorld: number,
+        dYawRad: number,
+        clientID?: number | null,
+    ): boolean {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            targetClientID = this.getActiveElement();
+        }
+
+        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+            return false;
+        }
+
+        const { cuboid, data } = this.drawnObjects[targetClientID];
+        if (data.lock) return false;
+
+        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
+        if (!state) return false;
+
+        const previousPoints = state.points && state.points.length >= 9 ? [...state.points] : [
+            cuboid.perspective.position.x,
+            cuboid.perspective.position.y,
+            cuboid.perspective.position.z,
+            cuboid.perspective.rotation.x,
+            cuboid.perspective.rotation.y,
+            cuboid.perspective.rotation.z,
+            cuboid.perspective.scale.x,
+            cuboid.perspective.scale.y,
+            cuboid.perspective.scale.z,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        if (!this.previousCuboids.has(targetClientID)) {
+            this.previousCuboids.set(targetClientID, []);
+        }
+        this.previousCuboids.get(targetClientID)!.push(previousPoints);
+
+        const [x, y, z, rx, ry, rz] = previousPoints;
+        const euler = new THREE.Euler(rx, ry, rz, 'XYZ');
+
+        // Displace position along object's local orientation frame
+        const localDelta = new THREE.Vector3(dxLocal, dyLocal, 0).applyEuler(euler);
+        const newX = parseFloat((x + localDelta.x).toFixed(4));
+        const newY = parseFloat((y + localDelta.y).toFixed(4));
+        const newZ = parseFloat((z + dzWorld).toFixed(4));
+
+        let finalRx = rx;
+        let finalRy = ry;
+        let finalRz = rz;
+
+        if (dYawRad !== 0) {
+            let newYaw = rz + dYawRad;
+            newYaw = Math.atan2(Math.sin(newYaw), Math.cos(newYaw));
+            finalRz = parseFloat(newYaw.toFixed(4));
+
+            // If object is tilted on road plane, conform yaw to terrain slope normal
+            const norm = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
+            if (norm.z >= 0.70) {
+                const fHoriz = new THREE.Vector3(Math.cos(newYaw), Math.sin(newYaw), 0);
+                const dot = fHoriz.dot(norm);
+                const xLocal = fHoriz.clone().sub(norm.clone().multiplyScalar(dot));
+                if (xLocal.lengthSq() > 1e-6) {
+                    xLocal.normalize();
+                    const yLocal = new THREE.Vector3().crossVectors(norm, xLocal).normalize();
+                    const zLocal = norm;
+                    const basisMatrix = new THREE.Matrix4().makeBasis(xLocal, yLocal, zLocal);
+                    const newEuler = new THREE.Euler().setFromRotationMatrix(basisMatrix, 'XYZ');
+                    finalRx = parseFloat(newEuler.x.toFixed(4));
+                    finalRy = parseFloat(newEuler.y.toFixed(4));
+                    finalRz = Math.cos(newEuler.z - newYaw) > 0.7 ? parseFloat(newEuler.z.toFixed(4)) : finalRz;
+                }
+            }
+        }
+
+        cuboid.setPosition(newX, newY, newZ);
+        cuboid.setRotation(finalRx, finalRy, finalRz);
+        const newPoints = [...previousPoints];
+        newPoints[0] = newX;
+        newPoints[1] = newY;
+        newPoints[2] = newZ;
+        newPoints[3] = finalRx;
+        newPoints[4] = finalRy;
+        newPoints[5] = finalRz;
+        data.points = newPoints;
+        if (state.points && state.points.length >= 9) {
+            state.points[0] = newX;
+            state.points[1] = newY;
+            state.points[2] = newZ;
+            state.points[3] = finalRx;
+            state.points[4] = finalRy;
+            state.points[5] = finalRz;
+        }
+
+        this.translateReferencePlane(new THREE.Vector3(newX, newY, newZ));
+        try {
+            this.rotatePlane(null as any, null as any);
+        } catch (_) {
+            // ignore
+        }
+
+        this.updateResizeHelperPos();
+        this.updateRotationHelperPos();
+        this.detachCamera();
+        BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
+        this.updateCameraFrustumPlane();
+
+        this.dispatchEvent(
+            new CustomEvent('canvas.edited', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points: [...newPoints],
+                    previousPoints,
+                },
+            }),
+        );
+
+        if (this.isObjectIsolated) {
+            this.updateIsolationPlanes();
+        }
+
+        this.requestRender();
+        return true;
+    }
+
+    private updateIsolationPlanes(): void {
+        if (!this.isObjectIsolated || this.isolatedClientID === null) {
+            for (const cloud of this.pointCloudMeshes) {
+                if (cloud && cloud.material) {
+                    (cloud.material as THREE.PointsMaterial).clippingPlanes = [];
+                }
+            }
+            return;
+        }
+
+        const drawn = this.drawnObjects[this.isolatedClientID];
+        if (!drawn || !drawn.cuboid) return;
+
+        const { cuboid } = drawn;
+        const { position: pos, rotation: rot, scale } = cuboid.perspective;
+
+        const euler = new THREE.Euler(rot.x, rot.y, rot.z, 'XYZ');
+        const ux = new THREE.Vector3(1, 0, 0).applyEuler(euler).normalize();
+        const uy = new THREE.Vector3(0, 1, 0).applyEuler(euler).normalize();
+        const uz = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
+
+        const marginHoriz = 1.5;
+        const marginVert = 1.0;
+
+        const halfL = scale.x / 2 + marginHoriz;
+        const halfW = scale.y / 2 + marginHoriz;
+        const halfH = scale.z / 2 + marginVert;
+
+        const pPosX = new THREE.Plane(ux.clone().negate(), ux.dot(pos) + halfL);
+        const pNegX = new THREE.Plane(ux.clone(), -ux.dot(pos) + halfL);
+
+        const pPosY = new THREE.Plane(uy.clone().negate(), uy.dot(pos) + halfW);
+        const pNegY = new THREE.Plane(uy.clone(), -uy.dot(pos) + halfW);
+
+        const pPosZ = new THREE.Plane(uz.clone().negate(), uz.dot(pos) + halfH);
+        const pNegZ = new THREE.Plane(uz.clone(), -uz.dot(pos) + halfH);
+
+        const planes = [pPosX, pNegX, pPosY, pNegY, pPosZ, pNegZ];
+
+        for (const cloud of this.pointCloudMeshes) {
+            if (cloud && cloud.material) {
+                (cloud.material as THREE.PointsMaterial).clippingPlanes = planes;
+            }
+        }
+    }
+
+    public toggleObjectIsolation(clientID?: number | null): boolean {
+        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
+        if (targetClientID === null) {
+            targetClientID = this.getActiveElement();
+        }
+
+        if (this.isObjectIsolated) {
+            this.isObjectIsolated = false;
+            this.isolatedClientID = null;
+            this.updateIsolationPlanes();
+
+            for (const id of this.hiddenByIsolation) {
+                if (this.drawnObjects[id]?.cuboid?.perspective) {
+                    this.drawnObjects[id].cuboid.perspective.visible = true;
+                }
+            }
+            this.hiddenByIsolation.clear();
+
+            this.updateCameraFrustumPlane();
+            this.dispatchEvent(new CustomEvent('canvas.isolated', {
+                bubbles: false,
+                cancelable: true,
+                detail: { isolated: false, clientID: null },
+            }));
+            this.requestRender();
+            return false;
+        }
+
+        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+            return false;
+        }
+
+        this.isObjectIsolated = true;
+        this.isolatedClientID = targetClientID;
+        this.updateIsolationPlanes();
+
+        this.hiddenByIsolation.clear();
+        Object.keys(this.drawnObjects).forEach((strId: string) => {
+            const id = +strId;
+            if (id !== targetClientID && this.drawnObjects[id]?.cuboid?.perspective?.visible) {
+                this.drawnObjects[id].cuboid.perspective.visible = false;
+                this.hiddenByIsolation.add(id);
+            }
+        });
+
+        this.updateCameraFrustumPlane();
+        this.dispatchEvent(new CustomEvent('canvas.isolated', {
+            bubbles: false,
+            cancelable: true,
+            detail: { isolated: true, clientID: targetClientID },
+        }));
+        this.requestRender();
+        return true;
+    }
+
+    public isObjectIsolatedState(): boolean {
+        return this.isObjectIsolated;
+    }
+
     public async snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -855,6 +1101,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             powerPreference: 'high-performance',
             preserveDrawingBuffer: true,
         });
+        this.masterRenderer.localClippingEnabled = true;
 
         const createViewRenderer = (): THREE.WebGLRenderer => {
             const canvas = window.document.createElement('canvas');
@@ -1468,8 +1715,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 camera.near = distanceUpToCamera * objectOffset - MARGIN;
                 camera.far = camera.near + length + MARGIN * 2;
             } else if (view === ViewType.TOP) {
-                camera.near = 0;
-                camera.far = 1000;
+                if (this.isObjectIsolated && this.selectedCuboid) {
+                    const height = dimensions.z;
+                    const objectOffset = Math.min(1, 1 - ((height / 2) / distanceUpToCamera));
+                    camera.near = Math.max(0.01, distanceUpToCamera * objectOffset - 0.5);
+                    camera.far = camera.near + height + 1.0;
+                } else {
+                    camera.near = 0;
+                    camera.far = 1000;
+                }
             }
         };
 
@@ -1501,6 +1755,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             setCameraFrustumPlane(
                 this.views.side.camera as THREE.OrthographicCamera, center, dimensions, ViewType.SIDE,
             );
+        }
+
+        if (this.isObjectIsolated) {
+            this.updateIsolationPlanes();
         }
     }
 
@@ -1940,6 +2198,22 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private activateObject(): void {
         const { selectedShapeOpacity } = this.model.data.configuration;
         const { clientID } = this.model.data.activeElement;
+        if (clientID !== null && this.isObjectIsolated && +clientID !== this.isolatedClientID) {
+            const newId = +clientID;
+            this.isolatedClientID = newId;
+            if (this.drawnObjects[newId]?.cuboid?.perspective) {
+                this.drawnObjects[newId].cuboid.perspective.visible = true;
+            }
+            this.hiddenByIsolation.delete(newId);
+            Object.keys(this.drawnObjects).forEach((strId: string) => {
+                const id = +strId;
+                if (id !== newId && this.drawnObjects[id]?.cuboid?.perspective?.visible) {
+                    this.drawnObjects[id].cuboid.perspective.visible = false;
+                    this.hiddenByIsolation.add(id);
+                }
+            });
+            this.updateIsolationPlanes();
+        }
         if (clientID !== null && this.drawnObjects[+clientID]?.cuboid?.perspective?.visible) {
             const { cuboid, data } = this.drawnObjects[+clientID];
             cuboid.setOpacity(selectedShapeOpacity);
@@ -2425,6 +2699,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.pointCloudPoints = null;
         this.groundGrid = null;
         this.previousCuboids.clear();
+        this.isObjectIsolated = false;
+        this.isolatedClientID = null;
+        this.hiddenByIsolation.clear();
+        this.pointCloudMeshes = [];
         Object.entries(this.drawnObjects).forEach(([clientID, { cuboid }]) => {
             this.removeSceneChildren(cuboid, +clientID);
         });
@@ -2686,6 +2964,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const frontCloud = new THREE.Points(points.geometry, material);
         this.views.front.scene.add(frontCloud);
         this.views.front.scene.add(frontScenePlane);
+
+        this.pointCloudMeshes = [points, topCloud, sideCloud, frontCloud];
+        if (this.isObjectIsolated && this.isolatedClientID !== null) {
+            this.updateIsolationPlanes();
+        }
 
         if (this.mode === Mode.DRAW) {
             this.views[ViewType.PERSPECTIVE].scene.children[0].add(this.cube.perspective);
@@ -3375,6 +3658,75 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     public keyControls(key: any): void {
+        const activeClientID = this.getActiveElement();
+
+        // Object micro-nudging and hotkeys when a cuboid is active
+        if (activeClientID !== null && activeClientID in this.drawnObjects) {
+            const step = key.altKey ? 0.20 : 0.05;
+            const zStep = (key.altKey || key.shiftKey) ? 0.10 : 0.02;
+            const yawStepRad = (key.altKey || key.shiftKey) ? ((5 * Math.PI) / 180) : (Math.PI / 180);
+
+            // Plain or Alt Arrow keys: nudge along vehicle local longitudinal (X) and lateral (Y) axes
+            // (Leave Shift+Arrow free for perspective camera roll/tilt below)
+            if (!key.shiftKey) {
+                if (key.code === 'ArrowUp') {
+                    if (this.nudgeCuboid(step, 0, 0, 0, activeClientID)) {
+                        key.preventDefault?.();
+                        key.stopPropagation?.();
+                        return;
+                    }
+                } else if (key.code === 'ArrowDown') {
+                    if (this.nudgeCuboid(-step, 0, 0, 0, activeClientID)) {
+                        key.preventDefault?.();
+                        key.stopPropagation?.();
+                        return;
+                    }
+                } else if (key.code === 'ArrowLeft') {
+                    if (this.nudgeCuboid(0, step, 0, 0, activeClientID)) {
+                        key.preventDefault?.();
+                        key.stopPropagation?.();
+                        return;
+                    }
+                } else if (key.code === 'ArrowRight') {
+                    if (this.nudgeCuboid(0, -step, 0, 0, activeClientID)) {
+                        key.preventDefault?.();
+                        key.stopPropagation?.();
+                        return;
+                    }
+                }
+            }
+
+            // Elevation nudges: PageUp / PageDown (or Alt+KeyE / Alt+KeyQ)
+            if (key.code === 'PageUp' || (key.altKey && key.code === 'KeyE')) {
+                if (this.nudgeCuboid(0, 0, zStep, 0, activeClientID)) {
+                    key.preventDefault?.();
+                    key.stopPropagation?.();
+                    return;
+                }
+            } else if (key.code === 'PageDown' || (key.altKey && key.code === 'KeyQ')) {
+                if (this.nudgeCuboid(0, 0, -zStep, 0, activeClientID)) {
+                    key.preventDefault?.();
+                    key.stopPropagation?.();
+                    return;
+                }
+            }
+
+            // Yaw micro-rotation: BracketLeft [ and BracketRight ]
+            if (key.code === 'BracketLeft') {
+                if (this.nudgeCuboid(0, 0, 0, -yawStepRad, activeClientID)) {
+                    key.preventDefault?.();
+                    key.stopPropagation?.();
+                    return;
+                }
+            } else if (key.code === 'BracketRight') {
+                if (this.nudgeCuboid(0, 0, 0, yawStepRad, activeClientID)) {
+                    key.preventDefault?.();
+                    key.stopPropagation?.();
+                    return;
+                }
+            }
+        }
+
         const { controls } = this.views.perspective;
         if (!controls) return;
         if (key.shiftKey) {

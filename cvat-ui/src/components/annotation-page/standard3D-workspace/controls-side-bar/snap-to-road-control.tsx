@@ -144,6 +144,15 @@ function SnapToRoadControl(props: Props): JSX.Element {
             },
         },
         {
+            key: 'isolate',
+            label: 'Toggle Object Isolation (I)',
+            onClick: () => {
+                if (canvasInstance?.toggleObjectIsolation) {
+                    canvasInstance.toggleObjectIsolation(targetID);
+                }
+            },
+        },
+        {
             type: 'divider' as const,
         },
         {

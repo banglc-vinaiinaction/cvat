@@ -43,6 +43,15 @@ interface Canvas3d {
     invertHeading(clientID?: number | null): void;
     getActiveElement(): number | null;
     setCuboidDimensions(clientID: number | null, dimensions: [number, number, number]): void;
+    nudgeCuboid(
+        dxLocal: number,
+        dyLocal: number,
+        dzWorld: number,
+        dYawRad: number,
+        clientID?: number | null,
+    ): boolean;
+    toggleObjectIsolation(clientID?: number | null): boolean;
+    isObjectIsolated(): boolean;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -151,6 +160,24 @@ class Canvas3dImpl implements Canvas3d {
 
     public setCuboidDimensions(clientID: number | null, dimensions: [number, number, number]): void {
         this.view.setCuboidDimensions(clientID, dimensions);
+    }
+
+    public nudgeCuboid(
+        dxLocal: number,
+        dyLocal: number,
+        dzWorld: number,
+        dYawRad: number,
+        clientID?: number | null,
+    ): boolean {
+        return this.view.nudgeCuboid(dxLocal, dyLocal, dzWorld, dYawRad, clientID);
+    }
+
+    public toggleObjectIsolation(clientID?: number | null): boolean {
+        return this.view.toggleObjectIsolation(clientID);
+    }
+
+    public isObjectIsolated(): boolean {
+        return this.view.isObjectIsolatedState();
     }
 
     public async snapTrackToRoad(
