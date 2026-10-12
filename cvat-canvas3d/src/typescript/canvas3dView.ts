@@ -30,7 +30,7 @@ export interface Canvas3dView {
     requestRender(frameCount?: number): void;
     keyControls(keys: KeyboardEvent): void;
     focusObjectByClientId(clientID: number, animate?: boolean): void;
-    snapToRoad(clientID?: number | null): void;
+    snapToRoad(clientID?: number | null, options?: { snapGround?: boolean; autoOrient?: boolean; snapGeometry?: boolean; }): void;
     revertSnap(clientID?: number | null): boolean;
     getPreviousCuboid(clientID?: number | null): number[] | null;
     invertHeading(clientID?: number | null): void;
@@ -183,7 +183,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return null;
     }
 
-    public snapToRoad(clientID?: number | null): void {
+    public snapToRoad(clientID?: number | null, options?: { snapGround?: boolean; autoOrient?: boolean; snapGeometry?: boolean; }): void {
         let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
         if (targetClientID === null) {
             targetClientID = this.getActiveElement();
@@ -226,8 +226,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
         this.previousCuboids.get(targetClientID)!.push(previousPoints);
 
+        const snapMode = this.model.data.configuration.snapMode ?? 'ground';
+        const defaultFlags = snapMode === 'ground' ?
+            { snapGround: true, autoOrient: false, snapGeometry: false } :
+            { snapGround: true, autoOrient: true, snapGeometry: true };
+
         const snapResult = snapCuboidToRoadAndOrient(currentPoints, positions, {
             labelName: state.label?.name,
+            ...defaultFlags,
+            ...(options || {}),
         });
         const [x, y, z, rx, ry, rz, dx, dy, dz] = snapResult.points;
 

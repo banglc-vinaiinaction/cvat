@@ -43,6 +43,35 @@ function SnapToRoadControl(props: Props): JSX.Element {
     }
 
     const [autoSnap, setAutoSnap] = React.useState<boolean>(true);
+    const [snapMode, setSnapMode] = React.useState<'ground' | 'full'>(() => {
+        const saved = localStorage.getItem('cvat-snap-mode');
+        return (saved === 'full' || saved === 'ground') ? saved : 'ground';
+    });
+
+    React.useEffect(() => {
+        if (canvasInstance && typeof (canvasInstance as any).configure === 'function') {
+            (canvasInstance as any).configure({ snapMode, autoRoadSnap: autoSnap });
+        }
+    }, [canvasInstance]);
+
+    const setMode = (mode: 'ground' | 'full'): void => {
+        setSnapMode(mode);
+        try {
+            localStorage.setItem('cvat-snap-mode', mode);
+        } catch (_) {
+            // ignore localStorage errors
+        }
+        if (canvasInstance && typeof (canvasInstance as any).configure === 'function') {
+            (canvasInstance as any).configure({ snapMode: mode });
+        }
+        notification.info({
+            message: `Snap Mode: ${mode === 'ground' ? 'Ground Only (Safe)' : 'Full Fit (Scratch)'}`,
+            description: mode === 'ground' ?
+                'Snaps Z flush to road pavement. Preserves bounding box LWH, centroid, and yaw.' :
+                'Fits centroid, aligns yaw to points, and snaps to road pavement.',
+            duration: 2.5,
+        });
+    };
 
     const toggleAutoSnap = (): void => {
         const next = !autoSnap;
@@ -51,7 +80,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
             (canvasInstance as any).configure({ autoRoadSnap: next });
         }
         notification.info({
-            message: `Auto-Snap to Road: ${next ? 'ENABLED' : 'DISABLED'}`,
+            message: `Auto-Snap on Move: ${next ? 'ENABLED' : 'DISABLED'}`,
             description: next ?
                 'Cuboids will automatically snap flush to the road pavement when translated.' :
                 'Automatic road snapping disabled. Press F to snap manually.',
@@ -67,30 +96,25 @@ function SnapToRoadControl(props: Props): JSX.Element {
 
     const menuItems = [
         {
+            key: 'mode_ground',
+            label: snapMode === 'ground' ? '● Mode: Ground Only (Safe / Pre-labels)' : '○ Mode: Ground Only (Safe / Pre-labels)',
+            onClick: () => setMode('ground'),
+        },
+        {
+            key: 'mode_full',
+            label: snapMode === 'full' ? '● Mode: Full Fit (Scratch Annotation)' : '○ Mode: Full Fit (Scratch Annotation)',
+            onClick: () => setMode('full'),
+        },
+        {
+            type: 'divider' as const,
+        },
+        {
             key: 'auto_snap_toggle',
             label: autoSnap ? '✓ Auto-Snap on Move (Active)' : 'Auto-Snap on Move (Disabled)',
             onClick: toggleAutoSnap,
         },
         {
             type: 'divider' as const,
-        },
-        {
-            key: 'snap',
-            label: 'Snap to Road & Orient (F)',
-            onClick: () => {
-                if (targetID !== null) {
-                    canvasInstance.snapToRoad(targetID);
-                }
-            },
-        },
-        {
-            key: 'invert',
-            label: 'Invert Heading 180° (H)',
-            onClick: () => {
-                if (targetID !== null) {
-                    canvasInstance.invertHeading(targetID);
-                }
-            },
         },
         {
             key: 'snap_track',
@@ -143,27 +167,16 @@ function SnapToRoadControl(props: Props): JSX.Element {
                 }
             },
         },
-        {
-            key: 'isolate',
-            label: 'Toggle Object Isolation (I)',
-            onClick: () => {
-                if (canvasInstance?.toggleObjectIsolation) {
-                    canvasInstance.toggleObjectIsolation(targetID);
-                }
+        ...(onOpenStandardizeModal ? [
+            {
+                type: 'divider' as const,
             },
-        },
-        {
-            type: 'divider' as const,
-        },
-        {
-            key: 'standardize',
-            label: 'Standardize Dimensions (En-Masse)...',
-            onClick: () => {
-                if (onOpenStandardizeModal) {
-                    onOpenStandardizeModal();
-                }
+            {
+                key: 'standardize',
+                label: 'Standardize Dimensions (En-Masse)...',
+                onClick: onOpenStandardizeModal,
             },
-        },
+        ] : []),
     ];
 
     if (disabled) {
@@ -175,10 +188,15 @@ function SnapToRoadControl(props: Props): JSX.Element {
         );
     }
 
+    const modeLabel = snapMode === 'ground' ? 'Ground Only' : 'Full Fit';
+
     return (
         <Dropdown menu={{ items: menuItems }} trigger={['contextMenu']}>
             <span className='cvat-snap-to-road-control-wrapper'>
-                <CVATTooltip title={`Snap to Road (F) • Auto-Snap on Move: ${autoSnap ? 'ACTIVE' : 'OFF'} (Right-click menu)`} placement='right'>
+                <CVATTooltip
+                    title={`Snap (F): ${modeLabel} • Auto-Snap: ${autoSnap ? 'ON' : 'OFF'} (Right-click to configure)`}
+                    placement='right'
+                >
                     <Icon
                         className='cvat-snap-to-road-control'
                         component={SnapToolsIcon}

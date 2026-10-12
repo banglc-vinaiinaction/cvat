@@ -37,7 +37,7 @@ interface Canvas3d {
     fitCanvas(): void;
     fit(): void;
     focus(clientID: number): void;
-    snapToRoad(clientID?: number | null): void;
+    snapToRoad(clientID?: number | null, options?: { snapGround?: boolean; autoOrient?: boolean; snapGeometry?: boolean; }): void;
     revertSnap(clientID?: number | null): boolean;
     getPreviousCuboid(clientID?: number | null): number[] | null;
     invertHeading(clientID?: number | null): void;
@@ -138,8 +138,8 @@ class Canvas3dImpl implements Canvas3d {
         this.view.focusObjectByClientId(clientID, true);
     }
 
-    public snapToRoad(clientID?: number | null): void {
-        this.view.snapToRoad(clientID);
+    public snapToRoad(clientID?: number | null, options?: { snapGround?: boolean; autoOrient?: boolean; snapGeometry?: boolean; }): void {
+        this.view.snapToRoad(clientID, options);
     }
 
     public revertSnap(clientID?: number | null): boolean {

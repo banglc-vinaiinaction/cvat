@@ -406,12 +406,13 @@ export function snapCuboidToRoadAndOrient(
     options: {
         snapGround?: boolean;
         autoOrient?: boolean;
+        snapGeometry?: boolean;
         labelName?: string;
         motionYaw?: number | null;
     } = {},
 ): SnapResult {
     const {
-        snapGround = true, autoOrient = true,
+        snapGround = true, autoOrient = true, snapGeometry = true,
     } = options;
 
     const cx = cuboidPoints[0];
@@ -424,10 +425,10 @@ export function snapCuboidToRoadAndOrient(
     const dy = cuboidPoints[7]; // scale Y
     const dz = cuboidPoints[8]; // scale Z (height)
 
-    // Dimensions and center (mutable for auto-tightening)
-    let newDx = dx;
-    let newDy = dy;
-    let newDz = dz;
+    // Dimensions remain strictly constant during snap and orient (LWH invariant)
+    const newDx = dx;
+    const newDy = dy;
+    const newDz = dz;
     let finalCx = cx;
     let finalCy = cy;
 
@@ -588,7 +589,7 @@ export function snapCuboidToRoadAndOrient(
     }
 
     // Auto-tighten dimensions & center on vehicle points if sufficient points exist
-    if (objectPoints.length >= 10) {
+    if (snapGeometry && objectPoints.length >= 10) {
         const cosYaw = Math.cos(newYaw);
         const sinYaw = Math.sin(newYaw);
 
@@ -621,72 +622,25 @@ export function snapCuboidToRoadAndOrient(
         const vMax = vValues[p95Idx];
         const zTop = zValues[p98Idx];
 
-        // Height (dz) fitting:
-        const measuredHeight = zTop - groundZ;
-        if (measuredHeight >= 0.7 && measuredHeight <= 4.5) {
-            let fittedDz = measuredHeight + 0.06;
-            if (dx >= 3.0 && fittedDz < 1.3) fittedDz = 1.3;
-            if (Math.abs(fittedDz - dz) > 0.05) {
-                newDz = parseFloat(fittedDz.toFixed(3));
-                newZ = groundZ + newDz / 2;
-            }
-        }
-
-        // Lateral centering & width (dy):
+        // Lateral centering (box dimensions dx, dy, dz remain strictly constant):
         if (vMin < -0.15 && vMax > 0.15) {
             const shiftV = (vMin + vMax) / 2;
             const clampedShiftV = Math.max(-0.35, Math.min(0.35, shiftV));
             finalCx += -clampedShiftV * sinYaw;
             finalCy += clampedShiftV * cosYaw;
-
-            const measuredWidth = vMax - vMin + 0.12;
-            if (measuredWidth >= 1.2 && measuredWidth <= 3.2) {
-                if (Math.abs(dy - measuredWidth) > 0.15) {
-                    newDy = parseFloat(measuredWidth.toFixed(3));
-                }
-            }
         }
 
-        // Longitudinal centering & length (dx):
+        // Longitudinal centering (box dimensions dx, dy, dz remain strictly constant):
         if (uMax - uMin >= 2.0) {
             const shiftU = (uMin + uMax) / 2;
             const clampedShiftU = Math.max(-0.4, Math.min(0.4, shiftU));
             finalCx += clampedShiftU * cosYaw;
             finalCy += clampedShiftU * sinYaw;
-
-            const measuredLength = uMax - uMin + 0.18;
-            if (measuredLength >= 2.5 && measuredLength <= 14.0) {
-                if (dx > measuredLength + 0.5 || dx < measuredLength - 0.2) {
-                    newDx = parseFloat(measuredLength.toFixed(3));
-                }
-            }
         }
     }
 
-    // 4. Class-Specific Dimension Constraints & Upright Posture
+    // 4. Upright Posture for Pedestrians (dimensions remain strictly constant)
     const isPedestrian = isPedestrianClass(options.labelName);
-    const lowerLabel = (options.labelName || '').toLowerCase().trim();
-    const isTwoWheeler = lowerLabel.includes('motorcycle') || lowerLabel.includes('bicycle') || lowerLabel.includes('cyclist') || lowerLabel.includes('bike');
-    const isHeavyVehicle = lowerLabel.includes('truck') || lowerLabel.includes('bus') || lowerLabel.includes('trailer');
-
-    if (isPedestrian) {
-        // Pedestrians stand upright relative to gravity: pitch and roll must remain 0
-        newDx = Math.max(0.45, Math.min(0.85, newDx));
-        newDy = Math.max(0.45, Math.min(0.85, newDy));
-        newDz = Math.max(1.45, Math.min(1.95, newDz));
-        newZ = groundZ + newDz / 2;
-    } else if (isTwoWheeler) {
-        // Motorbikes and bicycles have narrow lateral width
-        newDy = Math.max(0.65, Math.min(0.95, newDy));
-        newDx = Math.max(1.6, Math.min(2.3, newDx));
-        newDz = Math.max(1.1, Math.min(1.65, newDz));
-        newZ = groundZ + newDz / 2;
-    } else if (isHeavyVehicle) {
-        newDy = Math.max(2.3, Math.min(3.0, newDy));
-        newDx = Math.max(6.0, Math.min(14.5, newDx));
-        newDz = Math.max(2.4, Math.min(4.2, newDz));
-        newZ = groundZ + newDz / 2;
-    }
 
     let finalRx = rx;
     let finalRy = ry;
@@ -790,9 +744,9 @@ export function snapCuboidToRoadAndOrient(
             deltaYawDeg: parseFloat(deltaYawDeg.toFixed(1)),
             groundZ: parseFloat(groundZ.toFixed(3)),
             pointsCount: objectPoints2D.length,
-            deltaHeight: parseFloat((newDz - dz).toFixed(3)),
-            deltaWidth: parseFloat((newDy - dy).toFixed(3)),
-            deltaLength: parseFloat((newDx - dx).toFixed(3)),
+            deltaHeight: 0,
+            deltaWidth: 0,
+            deltaLength: 0,
         },
     };
 }

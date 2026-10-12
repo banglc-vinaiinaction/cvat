@@ -85,6 +85,7 @@ export interface Configuration {
     focusedObjectPadding: number;
     orientationVisibility: OrientationVisibility;
     autoRoadSnap?: boolean;
+    snapMode?: 'ground' | 'full';
 }
 
 export enum UpdateReasons {
@@ -210,6 +211,7 @@ export class Canvas3dModelImpl extends MasterImpl implements Canvas3dModel {
                     z: false,
                 },
                 autoRoadSnap: true,
+                snapMode: 'ground',
             },
             isFrameUpdating: false,
             nextSetupRequest: null,
@@ -444,6 +446,10 @@ export class Canvas3dModelImpl extends MasterImpl implements Canvas3dModel {
 
         if (typeof configuration.autoRoadSnap === 'boolean') {
             this.data.configuration.autoRoadSnap = configuration.autoRoadSnap;
+        }
+
+        if (configuration.snapMode === 'ground' || configuration.snapMode === 'full') {
+            this.data.configuration.snapMode = configuration.snapMode;
         }
 
         this.notify(UpdateReasons.CONFIG_UPDATED);

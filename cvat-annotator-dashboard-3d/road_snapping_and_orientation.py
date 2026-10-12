@@ -191,11 +191,11 @@ class RoadPointCloudSnapper:
         padding: float = 0.4,
         snap_ground: bool = True,
         auto_orient: bool = True,
-        tighten_extents: bool = True
+        tighten_extents: bool = False
     ) -> Dict[str, Any]:
         """
         Takes raw cuboid parameters {x, y, z, l, w, h, yaw} and point cloud,
-        snaps bottom to road, aligns heading, and tightens dimensions.
+        snaps bottom to road and aligns heading while keeping dimensions (l, w, h) constant.
         """
         cx, cy, cz = cuboid["x"], cuboid["y"], cuboid["z"]
         l, w, h = cuboid["l"], cuboid["w"], cuboid["h"]
@@ -247,15 +247,9 @@ class RoadPointCloudSnapper:
                 best_yaw, min_l, min_w, new_c2d = OrientationEstimator.fit_minimum_area_bbox(obj_pts, current_yaw=yaw)
                 new_yaw = best_yaw
                 
-                # 5. Extent Tightening
+                # 5. Centering (keep LWH dimensions strictly constant)
                 if tighten_extents:
                     new_cx, new_cy = float(new_c2d[0]), float(new_c2d[1])
-                    # Add small clearance padding
-                    new_l = max(1.2, float(min_l + padding))
-                    new_w = max(0.8, float(min_w + padding / 2.0))
-                    # Height from ground to highest point
-                    new_h = max(0.8, float(np.max(obj_pts[:, 2]) - ground_z + 0.05))
-                    cz_new = ground_z + (new_h / 2.0)
 
         result_cuboid = {
             "x": round(float(new_cx), 3),
