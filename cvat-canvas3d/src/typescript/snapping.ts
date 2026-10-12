@@ -338,57 +338,58 @@ export function alignYawWithPoints(
     const normalizeAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
 
     if (pts2D.length < 8) {
-        if (typeof motionYaw === 'number' && Math.cos(motionYaw - currentYaw) > 0.7) {
+        if (typeof motionYaw === 'number' && Math.cos(motionYaw - currentYaw) > 0.85) {
             return normalizeAngle(motionYaw);
         }
         return currentYaw;
     }
 
-    // 2D PCA on object points
-    let meanX = 0;
-    let meanY = 0;
+    // Work strictly in the vehicle's local frame relative to currentYaw:
+    // u: longitudinal axis (along vehicle length / heading)
+    // v: lateral axis (along vehicle width)
+    const cosY = Math.cos(currentYaw);
+    const sinY = Math.sin(currentYaw);
+    let meanU = 0;
+    let meanV = 0;
     const N = pts2D.length;
+    const localPts: [number, number][] = new Array(N);
+
     for (let i = 0; i < N; i++) {
-        meanX += pts2D[i][0];
-        meanY += pts2D[i][1];
+        const px = pts2D[i][0];
+        const py = pts2D[i][1];
+        const u = px * cosY + py * sinY;
+        const v = -px * sinY + py * cosY;
+        meanU += u;
+        meanV += v;
+        localPts[i] = [u, v];
     }
-    meanX /= N;
-    meanY /= N;
+    meanU /= N;
+    meanV /= N;
 
-    let cxx = 0;
-    let cxy = 0;
-    let cyy = 0;
+    let cuu = 0;
+    let cuv = 0;
+    let cvv = 0;
     for (let i = 0; i < N; i++) {
-        const x = pts2D[i][0] - meanX;
-        const y = pts2D[i][1] - meanY;
-        cxx += x * x;
-        cxy += x * y;
-        cyy += y * y;
+        const du = localPts[i][0] - meanU;
+        const dv = localPts[i][1] - meanV;
+        cuu += du * du;
+        cuv += du * dv;
+        cvv += du * dv;
     }
 
-    // Principal orientation from 2x2 covariance
-    const pcaAngle = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+    // Guard against partial returns: If variance along length (cuu) is not significantly
+    // greater than width (cvv), the points are either on a bumper or isotropic cluster.
+    // Under no circumstances should bumper points twist the vehicle 90 degrees or flip 180 degrees.
+    if (cuu <= cvv * 1.5) {
+        return currentYaw;
+    }
 
-    // If dx >= dy, longitudinal axis is along local X.
-    // If dy > dx, longitudinal axis is along local Y (offset by 90 deg).
-    const isXLongitudinal = dx >= dy;
-    const baseTargetAngle = isXLongitudinal ? pcaAngle : pcaAngle - Math.PI / 2;
+    // Principal orientation in vehicle local frame:
+    const localDeltaAngle = 0.5 * Math.atan2(2 * cuv, cuu - cvv);
+    const maxAllowedAdjustment = (5 * Math.PI) / 180; // +/- 5 degrees max subtle refinement
 
-    // Heading direction MUST be referenced against the annotator's currentYaw.
-    // Under no circumstances should heading flip 180 degrees or twist 90 degrees.
-    const diff1 = normalizeAngle(baseTargetAngle - currentYaw);
-    const diff2 = normalizeAngle(baseTargetAngle + Math.PI - currentYaw);
-
-    const bestDiff = Math.abs(diff1) <= Math.abs(diff2) ? diff1 : diff2;
-    const resolvedAngle = normalizeAngle(currentYaw + bestDiff);
-
-    // Enforce dot product of heading vectors > 0.7 (within ~45 degrees of current yaw)
-    // and never flip heading (dot product must be strictly positive and > 0.7)
-    const dotProduct = Math.cos(resolvedAngle - currentYaw);
-    const maxAllowedAdjustment = (25 * Math.PI) / 180; // +/- 25 degrees max refinement
-
-    if (dotProduct > 0.7 && Math.abs(bestDiff) <= maxAllowedAdjustment) {
-        return resolvedAngle;
+    if (Math.abs(localDeltaAngle) <= maxAllowedAdjustment) {
+        return normalizeAngle(currentYaw + localDeltaAngle);
     }
 
     return currentYaw;
@@ -714,19 +715,13 @@ export function snapCuboidToRoadAndOrient(
             if (Math.abs(euler.x) <= maxTilt && Math.abs(euler.y) <= maxTilt) {
                 finalRx = parseFloat(euler.x.toFixed(4));
                 finalRy = parseFloat(euler.y.toFixed(4));
-                if (autoOrient && Math.cos(euler.z - rz) > 0.7) {
-                    finalRz = parseFloat(euler.z.toFixed(4));
-                } else {
-                    finalRz = rz;
-                }
+                finalRz = parseFloat(newYaw.toFixed(4));
             }
         }
     }
 
-    // Strictly enforce heading preservation when autoOrient is false or if heading deviated
-    if (!autoOrient || Math.cos(finalRz - rz) <= 0.7) {
-        finalRz = rz;
-    }
+    // Strictly enforce heading preservation
+    finalRz = parseFloat(newYaw.toFixed(4));
 
     // 4. Multi-corner ground clearance verification
     // Evaluate the 4 bottom corners against the local road plane to guarantee zero road penetration
@@ -832,7 +827,7 @@ export function alignEulerToRoadPlane(
             return {
                 rx: parseFloat(euler.x.toFixed(4)),
                 ry: parseFloat(euler.y.toFixed(4)),
-                rz: parseFloat(euler.z.toFixed(4)),
+                rz: parseFloat(yaw.toFixed(4)),
             };
         }
     }

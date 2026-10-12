@@ -163,15 +163,10 @@ class OrientationEstimator:
             if area < best_area:
                 best_area = area
                 best_yaw = theta
-                # Determine which axis is vehicle length (typically longer axis)
-                if len_x >= len_y:
-                    length, width = len_x, len_y
-                    box_yaw = theta
-                    center_rot = np.array([(min_x + max_x) / 2.0, (min_y + max_y) / 2.0])
-                else:
-                    length, width = len_y, len_x
-                    box_yaw = theta + np.pi / 2
-                    center_rot = np.array([(min_x + max_x) / 2.0, (min_y + max_y) / 2.0])
+                # Vehicle length is along heading axis (theta), width is lateral
+                length, width = len_x, len_y
+                box_yaw = theta
+                center_rot = np.array([(min_x + max_x) / 2.0, (min_y + max_y) / 2.0])
 
                 inv_rot = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
                 best_center = inv_rot @ center_rot

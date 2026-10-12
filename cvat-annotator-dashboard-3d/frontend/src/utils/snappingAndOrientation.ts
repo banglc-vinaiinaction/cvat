@@ -350,16 +350,8 @@ export function fitBoundingBox2D(
 
     if (area < bestArea) {
       bestArea = area;
-      let finalYaw = theta;
-      let length = lenX;
-      let width = lenY;
-
-      if (lenY > lenX) {
-        // Longer axis is vehicle length
-        length = lenY;
-        width = lenX;
-        finalYaw = theta + Math.PI / 2;
-      }
+      const length = lenX;
+      const width = lenY;
 
       const midRotX = (minX + maxX) / 2;
       const midRotY = (minY + maxY) / 2;
@@ -370,7 +362,7 @@ export function fitBoundingBox2D(
 
       bestDims = [length, width];
       bestCenter = [worldCenterX, worldCenterY];
-      bestYaw = Math.atan2(Math.sin(finalYaw), Math.cos(finalYaw));
+      bestYaw = Math.atan2(Math.sin(theta), Math.cos(theta));
     }
   }
 
@@ -384,7 +376,7 @@ export function fitBoundingBox2D(
 
 /**
  * Aligns vehicle heading angle (yaw) with object LiDAR points along the longitudinal axis.
- * Strictly preserves vehicle dimensions (WLH) and limits adjustment to +/- 25 degrees.
+ * Strictly preserves vehicle dimensions (WLH) and limits adjustment to +/- 5 degrees.
  */
 export function alignYawWithPoints(
   pts2D: [number, number][],
@@ -392,52 +384,54 @@ export function alignYawWithPoints(
   l: number,
   w: number
 ): number {
+  const normalizeAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
+
   if (pts2D.length < 8) {
     return currentYaw;
   }
 
-  // 2D PCA on object points
-  let meanX = 0;
-  let meanY = 0;
+  // Work strictly in vehicle's local frame relative to currentYaw:
+  const cosY = Math.cos(currentYaw);
+  const sinY = Math.sin(currentYaw);
+  let meanU = 0;
+  let meanV = 0;
   const N = pts2D.length;
+  const localPts: [number, number][] = new Array(N);
+
   for (let i = 0; i < N; i++) {
-    meanX += pts2D[i][0];
-    meanY += pts2D[i][1];
+    const px = pts2D[i][0];
+    const py = pts2D[i][1];
+    const u = px * cosY + py * sinY;
+    const v = -px * sinY + py * cosY;
+    meanU += u;
+    meanV += v;
+    localPts[i] = [u, v];
   }
-  meanX /= N;
-  meanY /= N;
+  meanU /= N;
+  meanV /= N;
 
-  let cxx = 0;
-  let cxy = 0;
-  let cyy = 0;
+  let cuu = 0;
+  let cuv = 0;
+  let cvv = 0;
   for (let i = 0; i < N; i++) {
-    const x = pts2D[i][0] - meanX;
-    const y = pts2D[i][1] - meanY;
-    cxx += x * x;
-    cxy += x * y;
-    cyy += y * y;
+    const du = localPts[i][0] - meanU;
+    const dv = localPts[i][1] - meanV;
+    cuu += du * du;
+    cuv += du * dv;
+    cvv += dv * dv;
   }
 
-  // Principal orientation from 2x2 covariance
-  const pcaAngle = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+  // If variance along length is not significantly greater than width,
+  // points are on a bumper or isotropic cluster -> strictly keep user heading!
+  if (cuu <= cvv * 1.5) {
+    return currentYaw;
+  }
 
-  // If length >= width, longitudinal axis is along local X.
-  // If width > length, longitudinal axis is along local Y (offset by 90 deg).
-  const isXLongitudinal = l >= w;
-  const baseTargetAngle = isXLongitudinal ? pcaAngle : pcaAngle - Math.PI / 2;
+  const localDeltaAngle = 0.5 * Math.atan2(2 * cuv, cuu - cvv);
+  const maxAllowedAdjustment = (5 * Math.PI) / 180; // +/- 5 degrees max subtle refinement
 
-  // The PCA line is bidirectional (baseTargetAngle or baseTargetAngle + Math.PI).
-  // Pick the direction that is closest to currentYaw.
-  const normalizeAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
-  const diff1 = normalizeAngle(baseTargetAngle - currentYaw);
-  const diff2 = normalizeAngle(baseTargetAngle + Math.PI - currentYaw);
-
-  const bestDiff = Math.abs(diff1) <= Math.abs(diff2) ? diff1 : diff2;
-
-  // Only align if within reasonable tolerance (at most 25 degrees)
-  const maxAllowedAdjustment = (25 * Math.PI) / 180;
-  if (Math.abs(bestDiff) <= maxAllowedAdjustment) {
-    return normalizeAngle(currentYaw + bestDiff);
+  if (Math.abs(localDeltaAngle) <= maxAllowedAdjustment) {
+    return normalizeAngle(currentYaw + localDeltaAngle);
   }
 
   return currentYaw;

@@ -207,7 +207,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
         if (!state) return;
 
-        const currentPoints = state.points && state.points.length >= 9 ? [...state.points] : [
+        const currentPoints = [
             cuboid.perspective.position.x,
             cuboid.perspective.position.y,
             cuboid.perspective.position.z,
