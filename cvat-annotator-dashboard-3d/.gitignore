@@ -12,6 +12,18 @@ data/
 *.tar.gz
 *.pcd
 *.pkl
+*.parquet
+*.parquet*
+*.gstmp
+*.tfrecord*
+*.bag
+waymo*/
+argoverse*/
+argodrive*/
+av2*/
+nuscenes*/
+pandaset*/
+kitti*/
 
 # Frontend dependencies & build output
 dist/

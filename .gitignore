@@ -88,3 +88,21 @@ cvat-ui/dist
 /cvat-annotator-dashboard-3d/frontend/node_modules/
 /cvat-annotator-dashboard-3d/frontend/dist/
 
+# Autonomous driving datasets & samples (Waymo, Argoverse / ArgoDrive 2, nuScenes, KITTI, etc.)
+waymo*/
+argoverse*/
+argodrive*/
+av2*/
+nuscenes*/
+pandaset*/
+kitti*/
+once_data*/
+once_sample*/
+
+# Dataset file formats & temporary download files
+*.parquet
+*.parquet*
+*.gstmp
+*.tfrecord*
+*.bag
+
