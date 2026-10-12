@@ -34,11 +34,12 @@ class GroundPlaneRANSAC:
         """
         if len(points) < 3:
             # Fallback to horizontal ground at mean Z
-            mean_z = np.mean(points[:, 2]) if len(points) > 0 else -1.65
+            mean_z = float(np.mean(points[:, 2])) if len(points) > 0 else 0.0
             return np.array([0.0, 0.0, 1.0, -mean_z]), np.ones(len(points), dtype=bool)
 
         pts = points[:, :3]
-        best_plane = np.array([0.0, 0.0, 1.0, 1.65])
+        default_z = float(np.percentile(pts[:, 2], 5)) if len(pts) > 0 else 0.0
+        best_plane = np.array([0.0, 0.0, 1.0, -default_z])
         best_inliers = np.zeros(len(pts), dtype=bool)
         max_inlier_count = -1
 
@@ -182,7 +183,7 @@ class OrientationEstimator:
 
 class RoadPointCloudSnapper:
     def __init__(self):
-        self.plane_fitter = GroundPlaneRANSAC(distance_threshold=0.10, max_iterations=300)
+        self.plane_fitter = GroundPlaneRANSAC(distance_threshold=0.08, max_iterations=300)
 
     def snap_and_orient(
         self,
@@ -191,15 +192,18 @@ class RoadPointCloudSnapper:
         padding: float = 0.4,
         snap_ground: bool = True,
         auto_orient: bool = True,
-        tighten_extents: bool = False
+        tighten_extents: bool = False,
+        ground_clearance: float = 0.04
     ) -> Dict[str, Any]:
         """
         Takes raw cuboid parameters {x, y, z, l, w, h, yaw} and point cloud,
-        snaps bottom to road and aligns heading while keeping dimensions (l, w, h) constant.
+        snaps bottom to road with multi-corner terrain clearance and aligns heading
+        while keeping dimensions (l, w, h) strictly constant.
         """
-        cx, cy, cz = cuboid["x"], cuboid["y"], cuboid["z"]
-        l, w, h = cuboid["l"], cuboid["w"], cuboid["h"]
-        yaw = cuboid.get("yaw", 0.0)
+        cx, cy, cz = float(cuboid["x"]), float(cuboid["y"]), float(cuboid["z"])
+        l, w, h = float(cuboid["l"]), float(cuboid["w"]), float(cuboid["h"])
+        yaw = float(cuboid.get("yaw", 0.0))
+        bottom_z = cz - (h / 2.0)
 
         # 1. Extract Local Neighborhood Points
         roi_radius = math.sqrt((l / 2.0) ** 2 + (w / 2.0) ** 2) + 2.5
@@ -208,36 +212,190 @@ class RoadPointCloudSnapper:
         local_pts = point_cloud[local_mask]
 
         if len(local_pts) < 10:
+            default_est_z = float(np.percentile(point_cloud[:, 2], 5)) if len(point_cloud) > 0 else 0.0
             return {
                 "cuboid": cuboid,
-                "ground_z": -1.65,
+                "ground_z": default_est_z,
                 "inliers_count": 0,
                 "status": "sparse_points_unchanged"
             }
 
+        # Exclude points inside the vehicle footprint (chassis/wheels/doors)
+        cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+        rot_2d = np.array([[cos_yaw, sin_yaw], [-sin_yaw, cos_yaw]])
+        rel_xy = local_pts[:, :2] - np.array([cx, cy])
+        u_v = rel_xy @ rot_2d.T
+        is_outside = (np.abs(u_v[:, 0]) > l / 2.0 + 0.12) | (np.abs(u_v[:, 1]) > w / 2.0 + 0.12)
+
         # 2. Road Ground Snapping
-        ground_z = -1.65
-        road_plane = np.array([0.0, 0.0, 1.0, 1.65])
+        local_p05 = float(np.percentile(local_pts[:, 2], 5))
+        ground_z = local_p05
+        road_plane = np.array([0.0, 0.0, 1.0, -local_p05])
+        cz_new = cz
+        final_rx, final_ry, final_rz = 0.0, 0.0, yaw
         
         if snap_ground:
-            # Candidates for ground: points below top of box
-            ground_candidates = local_pts[local_pts[:, 2] <= cz - (h / 4.0)]
-            if len(ground_candidates) >= 15:
-                road_plane, _ = self.plane_fitter.fit_plane(ground_candidates)
-                ground_z = GroundPlaneRANSAC.get_road_height(road_plane, cx, cy)
-            else:
-                ground_z = float(np.min(local_pts[:, 2]))
+            # Candidates for ground: strictly outside vehicle footprint and below lower body
+            z_max_ground = min(bottom_z + 0.35, cz - (h * 0.15))
+            ground_candidates = local_pts[is_outside & (local_pts[:, 2] <= z_max_ground)]
+            
+            if len(ground_candidates) < 12:
+                ground_candidates = local_pts[local_pts[:, 2] <= z_max_ground]
 
-            # Snap bottom of cuboid flush to ground: z_center = ground_z + h / 2
-            cz_new = ground_z + (h / 2.0)
-        else:
-            cz_new = cz
+            if len(ground_candidates) >= 12:
+                # 1. Identify Lowest Point Representative (LPR) of ground candidates
+                sorted_idx = np.argsort(ground_candidates[:, 2])
+                n_seeds = max(6, int(len(sorted_idx) * 0.15))
+                seed_pts = ground_candidates[sorted_idx[:n_seeds]]
+                lpr_z = float(np.median(seed_pts[:, 2]))
+                
+                # Seeds tightly within 0.15m of LPR to prevent obstacle contamination
+                seeds = seed_pts[seed_pts[:, 2] <= lpr_z + 0.15]
+                if len(seeds) < 3:
+                    seeds = seed_pts[:max(3, len(seed_pts))]
+
+                road_plane, _ = self.plane_fitter.fit_plane(seeds)
+                A, B, C, D = road_plane
+                if C < 0:
+                    A, B, C, D = -A, -B, -C, -D
+                    road_plane = np.array([A, B, C, D])
+
+                # GUARD: Road normal MUST be predominantly vertical (Nz >= 0.85, i.e. < 31 deg tilt)
+                if road_plane[2] < 0.85:
+                    road_plane = np.array([0.0, 0.0, 1.0, -lpr_z])
+                else:
+                    # Refine with consensus ground inliers
+                    norm_v = road_plane[:3]
+                    dist_to_plane = np.abs(ground_candidates @ norm_v + road_plane[3])
+                    inliers = ground_candidates[(dist_to_plane <= 0.06) & (ground_candidates[:, 2] <= lpr_z + 0.30)]
+                    if len(inliers) >= 10:
+                        ref_plane, _ = self.plane_fitter.fit_plane(inliers)
+                        if ref_plane[2] < 0:
+                            ref_plane = -ref_plane
+                        if ref_plane[2] >= 0.85:
+                            road_plane = ref_plane
+
+                raw_plane_z = GroundPlaneRANSAC.get_road_height(road_plane, cx, cy)
+                raw_plane_z = float(np.clip(raw_plane_z, lpr_z - 0.20, lpr_z + 0.35))
+                
+                # Upper envelope of consensus ground seeds (beam scatter ~2-3cm)
+                sorted_seed_z = np.sort(seeds[:, 2])
+                p90_idx = min(len(sorted_seed_z) - 1, int(len(sorted_seed_z) * 0.90))
+                ground_p90 = float(sorted_seed_z[p90_idx])
+                
+                ground_z = max(raw_plane_z, ground_p90) + ground_clearance
+                cz_new = ground_z + (h / 2.0)
+
+                # Sectional profiling: angle cuboid between highest average point vs lowest average point and everything in-between
+                half_l = l / 2.0
+                half_w = w / 2.0
+                margin_x = max(0.35, l * 0.10)
+                margin_y = max(0.35, w * 0.10)
+
+                cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+                dx_loc = (local_pts[:, 0] - cx) * cos_yaw + (local_pts[:, 1] - cy) * sin_yaw
+                dy_loc = -(local_pts[:, 0] - cx) * sin_yaw + (local_pts[:, 1] - cy) * cos_yaw
+
+                in_footprint = (np.abs(dx_loc) <= half_l + margin_x) & (np.abs(dy_loc) <= half_w + margin_y)
+                footprint_ground = local_pts[in_footprint & (local_pts[:, 2] <= bottom_z + 0.35) & (local_pts[:, 2] >= bottom_z - 0.70)]
+
+                if len(footprint_ground) >= 10:
+                    sorted_z = np.sort(footprint_ground[:, 2])
+                    lpr_val = float(np.median(sorted_z[:max(3, int(len(sorted_z) * 0.15))]))
+                    surface_pts = footprint_ground[(footprint_ground[:, 2] >= lpr_val - 0.15) & (footprint_ground[:, 2] <= lpr_val + 0.22)]
+
+                    surf_u = (surface_pts[:, 0] - cx) * cos_yaw + (surface_pts[:, 1] - cy) * sin_yaw
+                    surf_v = -(surface_pts[:, 0] - cx) * sin_yaw + (surface_pts[:, 1] - cy) * cos_yaw
+                    surf_z = surface_pts[:, 2]
+
+                    # 1. Longitudinal slices (5 bins)
+                    x_edges = np.linspace(-half_l, half_l, 6)
+                    bin_centers_x = []
+                    bin_avg_z_x = []
+                    for b in range(5):
+                        b_mask = (surf_u >= x_edges[b] - 0.10) & (surf_u <= x_edges[b+1] + 0.10)
+                        if np.sum(b_mask) >= 2:
+                            bin_centers_x.append(0.5 * (x_edges[b] + x_edges[b+1]))
+                            bin_avg_z_x.append(float(np.mean(surf_z[b_mask])))
+
+                    # 2. Lateral slices (3 bins)
+                    y_edges = np.linspace(-half_w, half_w, 4)
+                    bin_centers_y = []
+                    bin_avg_z_y = []
+                    for b in range(3):
+                        b_mask = (surf_v >= y_edges[b] - 0.10) & (surf_v <= y_edges[b+1] + 0.10)
+                        if np.sum(b_mask) >= 2:
+                            bin_centers_y.append(0.5 * (y_edges[b] + y_edges[b+1]))
+                            bin_avg_z_y.append(float(np.mean(surf_z[b_mask])))
+
+                    slope_x = 0.0
+                    if len(bin_centers_x) >= 2:
+                        bx, bz = np.array(bin_centers_x), np.array(bin_avg_z_x)
+                        if np.var(bx) > 1e-4:
+                            slope_x = float(np.cov(bx, bz)[0, 1] / np.var(bx))
+
+                    slope_y = 0.0
+                    if len(bin_centers_y) >= 2:
+                        by, bz = np.array(bin_centers_y), np.array(bin_avg_z_y)
+                        if np.var(by) > 1e-4:
+                            slope_y = float(np.cov(by, bz)[0, 1] / np.var(by))
+
+                    max_slope = 0.176
+                    slope_x = float(np.clip(slope_x, -max_slope, max_slope))
+                    slope_y = float(np.clip(slope_y, -max_slope, max_slope))
+
+                    all_bin_z = bin_avg_z_x + bin_avg_z_y
+                    mean_ground_z = float(np.mean(all_bin_z)) if len(all_bin_z) > 0 else lpr_val
+
+                    base_z = mean_ground_z + ground_clearance
+                    cz_new = base_z + h / 2.0
+                    cz_new = float(np.clip(cz_new, cz - 0.25, cz + 0.35))
+
+                    theta_long = np.arctan(slope_x)
+                    theta_lat = np.arctan(slope_y)
+
+                    if abs(theta_long) > 1e-4 or abs(theta_lat) > 1e-4:
+                        fwd_loc = np.array([np.cos(theta_long), 0.0, np.sin(theta_long)])
+                        left_loc = np.array([0.0, np.cos(theta_lat), np.sin(theta_lat)])
+                        up_loc = np.cross(fwd_loc, left_loc)
+                        up_loc /= np.linalg.norm(up_loc)
+                        re_left = np.cross(up_loc, fwd_loc)
+                        re_left /= np.linalg.norm(re_left)
+                        re_fwd = np.cross(re_left, up_loc)
+                        re_fwd /= np.linalg.norm(re_fwd)
+
+                        R_local = np.column_stack([re_fwd, re_left, up_loc])
+                        R_yaw = np.array([
+                            [cos_yaw, -sin_yaw, 0.0],
+                            [sin_yaw,  cos_yaw, 0.0],
+                            [0.0,      0.0,     1.0]
+                        ])
+                        R_world = R_yaw @ R_local
+
+                        sy = np.sqrt(R_world[0, 0]**2 + R_world[1, 0]**2)
+                        final_rx = float(np.arctan2(R_world[2, 1], R_world[2, 2]))
+                        final_ry = float(np.arctan2(-R_world[2, 0], sy))
+                        final_rz = float(np.arctan2(R_world[1, 0], R_world[0, 0]))
+                    else:
+                        final_rx = 0.0
+                        final_ry = 0.0
+                        final_rz = yaw
+                else:
+                    final_rx = 0.0
+                    final_ry = 0.0
+                    final_rz = yaw
+            else:
+                ground_z = local_p05 + ground_clearance
+                cz_new = ground_z + (h / 2.0)
+                final_rx = 0.0
+                final_ry = 0.0
+                final_rz = yaw
 
         # 3. Object Cluster Filtering (points strictly above road surface)
         object_mask = (local_pts[:, 2] >= ground_z + 0.08) & (local_pts[:, 2] <= ground_z + h + 0.4)
         obj_pts = local_pts[object_mask]
 
-        new_yaw = yaw
+        new_yaw = final_rz
         new_l, new_w, new_h = l, w, h
         new_cx, new_cy = cx, cy
 
@@ -255,6 +413,9 @@ class RoadPointCloudSnapper:
             "x": round(float(new_cx), 3),
             "y": round(float(new_cy), 3),
             "z": round(float(cz_new), 3),
+            "rx": round(float(final_rx), 4),
+            "ry": round(float(final_ry), 4),
+            "rz": round(float(new_yaw), 4),
             "l": round(float(new_l), 3),
             "w": round(float(new_w), 3),
             "h": round(float(new_h), 3),

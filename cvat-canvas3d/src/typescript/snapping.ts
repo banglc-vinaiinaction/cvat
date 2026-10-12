@@ -118,7 +118,14 @@ export function fitGroundPlaneGPF(
     } = options;
 
     if (indices.length < 3) {
-        return [0, 0, 1, 1.65];
+        let estZ = 0.0;
+        if (positions.length >= 3) {
+            const sampleCount = Math.min(100, Math.floor(positions.length / 3));
+            let sumZ = 0;
+            for (let i = 0; i < sampleCount; i++) sumZ += positions[i * 3 + 2];
+            estZ = sumZ / sampleCount;
+        }
+        return [0, 0, 1, -estZ];
     }
 
     // Sort indices by ascending Z
@@ -240,7 +247,14 @@ export function fitGroundPlaneRANSAC(
     maxIterations: number = 150,
 ): [number, number, number, number] {
     if (indices.length < 3) {
-        return [0, 0, 1, 1.65];
+        let estZ = 0.0;
+        if (positions.length >= 3) {
+            const sampleCount = Math.min(100, Math.floor(positions.length / 3));
+            let sumZ = 0;
+            for (let i = 0; i < sampleCount; i++) sumZ += positions[i * 3 + 2];
+            estZ = sumZ / sampleCount;
+        }
+        return [0, 0, 1, -estZ];
     }
 
     let bestPlane: [number, number, number, number] = [0, 0, 1, 1.65];
@@ -409,10 +423,11 @@ export function snapCuboidToRoadAndOrient(
         snapGeometry?: boolean;
         labelName?: string;
         motionYaw?: number | null;
+        groundClearance?: number;
     } = {},
 ): SnapResult {
     const {
-        snapGround = true, autoOrient = true, snapGeometry = true,
+        snapGround = true, autoOrient = true, snapGeometry = true, groundClearance = 0.04,
     } = options;
 
     const cx = cuboidPoints[0];
@@ -443,9 +458,10 @@ export function snapCuboidToRoadAndOrient(
     const groundCandidateIndices: number[] = [];
 
     // Allow searching down beneath the cuboid (up to 5.0m below bottomZ or down to cz - 6.0m)
-    // and up to 1.5m above the cuboid
+    // For ground candidates, exclude anything higher than bottomZ + 0.35m or cz - dz * 0.15m
     const zMin = Math.min(bottomZ - 5.0, cz - 6.0);
     const zMax = cz + dz / 2 + 1.5;
+    const zMaxGround = Math.min(bottomZ + 0.35, cz - dz * 0.15);
 
     for (let i = 0; i < totalPoints; i++) {
         const px = pointCloudPositions[i * 3];
@@ -463,7 +479,7 @@ export function snapCuboidToRoadAndOrient(
                 const v = -distX * sinRz + distY * cosRz;
                 const isOutsideVehicle = Math.abs(u) > dx / 2 + 0.10 || Math.abs(v) > dy / 2 + 0.10;
 
-                if (isOutsideVehicle) {
+                if (isOutsideVehicle && pz <= zMaxGround) {
                     groundCandidateIndices.push(i);
                 }
             }
@@ -493,61 +509,68 @@ export function snapCuboidToRoadAndOrient(
             groundCandidateIndices :
             localIndices.filter((idx) => {
                 const pz = pointCloudPositions[idx * 3 + 2];
-                return pz <= cz - dz * 0.15;
+                return pz <= zMaxGround;
             });
 
-        if (groundPool.length >= 4) {
+        if (groundPool.length >= 8) {
             const sortedGroundZ = groundPool.map(
                 (idx) => pointCloudPositions[idx * 3 + 2],
             ).sort((a, b) => a - b);
 
             // Compute Lowest Point Representative (LPR) of local ground cluster
-            const lprCount = Math.max(3, Math.floor(sortedGroundZ.length * 0.20));
+            const lprCount = Math.max(3, Math.floor(sortedGroundZ.length * 0.15));
             let lprSum = 0;
             for (let k = 0; k < lprCount; k++) {
                 lprSum += sortedGroundZ[k];
             }
             const lprZ = lprSum / lprCount;
 
-            // Extract candidate ground seeds tightly around LPR
-            const groundSeeds = groundPool.filter((idx) => {
-                const pz = pointCloudPositions[idx * 3 + 2];
-                return pz >= lprZ - 0.12 && pz <= lprZ + 0.25;
-            });
+            // If the lowest observed point is significantly higher than the cuboid bottom,
+            // the ground beneath is occluded/unobserved. Do not move vertically.
+            if (lprZ <= bottomZ + 0.25) {
+                // Extract candidate ground seeds tightly around LPR
+                const groundSeeds = groundPool.filter((idx) => {
+                    const pz = pointCloudPositions[idx * 3 + 2];
+                    return pz >= lprZ - 0.12 && pz <= lprZ + 0.20;
+                });
 
-            // Fit GPF plane on ground seeds
-            const ptsForFit = groundSeeds.length >= 4 ? groundSeeds : groundPool;
-            const plane = fitGroundPlaneGPF(pointCloudPositions, ptsForFit, {
-                lprRatio: 0.25,
-                seedThreshold: 0.15,
-                distanceThreshold: 0.08,
-            });
+                // Fit GPF plane on ground seeds
+                const ptsForFit = groundSeeds.length >= 4 ? groundSeeds : groundPool;
+                const plane = fitGroundPlaneGPF(pointCloudPositions, ptsForFit, {
+                    lprRatio: 0.25,
+                    seedThreshold: 0.15,
+                    distanceThreshold: 0.08,
+                });
 
-            detectedPlane = plane;
-            const rawPlaneZ = getRoadHeightAt(plane, cx, cy);
-            const [, , nz] = plane;
+                detectedPlane = plane;
+                const rawPlaneZ = getRoadHeightAt(plane, cx, cy);
+                const [, , nz] = plane;
 
-            if (nz >= 0.85) {
-                groundZ = rawPlaneZ;
-            } else {
-                groundZ = lprZ;
+                if (nz >= 0.85) {
+                    groundZ = Math.max(lprZ - 0.20, Math.min(lprZ + 0.35, rawPlaneZ));
+                } else {
+                    groundZ = lprZ;
+                }
+
+                // Road surface upper envelope adjustment:
+                // Automotive LiDAR ground points have vertical beam scatter (~2-3cm).
+                // Use the 90th percentile of consensus ground seeds.
+                const seedZValues = (groundSeeds.length >= 3 ? groundSeeds : groundPool)
+                    .map((idx) => pointCloudPositions[idx * 3 + 2])
+                    .sort((a, b) => a - b);
+                const p90Idx = Math.min(seedZValues.length - 1, Math.floor(seedZValues.length * 0.90));
+                const groundP90Z = seedZValues[p90Idx];
+                const baseGroundZ = Math.max(groundZ, groundP90Z) + groundClearance;
+
+                // Restrict ground snapping adjustment to realistic range
+                if (Math.abs(baseGroundZ - bottomZ) <= 0.45) {
+                    groundZ = baseGroundZ;
+                } else {
+                    groundZ = bottomZ + (baseGroundZ > bottomZ ? 0.40 : -0.25);
+                }
+
+                newZ = groundZ + dz / 2;
             }
-
-            // Road surface adjustment:
-            // Ensure the cuboid bottom rests directly ON / ABOVE the road cloud points.
-            // LiDAR ground points have small Gaussian beam dispersion (~2-3cm).
-            // Placing the base flush to the top surface (plane + 0.02m) guarantees the bounding
-            // box rests cleanly above the road point cloud without submerging into the ground.
-            const groundSurfaceZ = groundZ + 0.02;
-
-            // Allow snapping within a realistic vertical range (up to 5m)
-            if (Math.abs(groundSurfaceZ - bottomZ) <= 5.0) {
-                groundZ = groundSurfaceZ;
-            } else {
-                groundZ = bottomZ + (groundSurfaceZ > bottomZ ? 5.0 : -5.0);
-            }
-
-            newZ = groundZ + dz / 2;
         }
     }
 
@@ -642,80 +665,171 @@ export function snapCuboidToRoadAndOrient(
     // 4. Upright Posture for Pedestrians (dimensions remain strictly constant)
     const isPedestrian = isPedestrianClass(options.labelName);
 
-    let finalRx = rx;
-    let finalRy = ry;
-    let finalRz = newYaw;
+    // 4. Sectional Terrain Profiling: Angle cuboid between highest average point vs lowest average point and everything in-between
+    let finalRx = 0.0;
+    let finalRy = 0.0;
+    const finalRz = parseFloat(newYaw.toFixed(4));
 
-    // Full 3-DOF Ground Plane Alignment (Pitch + Roll from Road Normal) - skipped for pedestrians
-    if (!isPedestrian && detectedPlane && detectedPlane[2] >= 0.80) {
-        const [nA, nB, nC] = detectedPlane;
-        const norm = new THREE.Vector3(nA, nB, nC).normalize();
+    if (!isPedestrian && localIndices.length >= 8) {
+        const cosYaw = Math.cos(finalRz);
+        const sinYaw = Math.sin(finalRz);
+        const halfL = newDx / 2;
+        const halfW = newDy / 2;
+        const marginX = Math.max(0.35, newDx * 0.10);
+        const marginY = Math.max(0.35, newDy * 0.10);
 
-        // Project horizontal forward heading onto the road surface
-        const fHoriz = new THREE.Vector3(Math.cos(newYaw), Math.sin(newYaw), 0);
-        const dot = fHoriz.dot(norm);
-        const xLocal = fHoriz.clone().sub(norm.clone().multiplyScalar(dot));
+        // Ground candidates in footprint
+        interface LocalGroundPt { u: number; v: number; z: number; }
+        const footprintGround: LocalGroundPt[] = [];
 
-        if (xLocal.lengthSq() > 1e-6) {
-            xLocal.normalize();
-            const yLocal = new THREE.Vector3().crossVectors(norm, xLocal).normalize();
-            const zLocal = norm;
+        const poolIndices = groundCandidateIndices.length >= 8 ? groundCandidateIndices : localIndices;
+        for (let k = 0; k < poolIndices.length; k++) {
+            const idx = poolIndices[k];
+            const px = pointCloudPositions[idx * 3];
+            const py = pointCloudPositions[idx * 3 + 1];
+            const pz = pointCloudPositions[idx * 3 + 2];
+            const distX = px - finalCx;
+            const distY = py - finalCy;
+            const u = distX * cosYaw + distY * sinYaw;
+            const v = -distX * sinYaw + distY * cosYaw;
 
-            const basisMatrix = new THREE.Matrix4().makeBasis(xLocal, yLocal, zLocal);
-            const euler = new THREE.Euler().setFromRotationMatrix(basisMatrix, 'XYZ');
-
-            // Limit maximum pitch/roll to realistic road grades (+- 20 deg = 0.35 rad)
-            const maxTilt = (20 * Math.PI) / 180;
-            if (Math.abs(euler.x) <= maxTilt && Math.abs(euler.y) <= maxTilt) {
-                finalRx = parseFloat(euler.x.toFixed(4));
-                finalRy = parseFloat(euler.y.toFixed(4));
-                finalRz = parseFloat(newYaw.toFixed(4));
-            }
-        }
-    }
-
-    // Strictly enforce heading preservation
-    finalRz = parseFloat(newYaw.toFixed(4));
-
-    // 4. Multi-corner ground clearance verification
-    // Evaluate the 4 bottom corners against the local road plane to guarantee zero road penetration
-    if (detectedPlane && detectedPlane[2] >= 0.80) {
-        const [nA, nB, nC, nD] = detectedPlane;
-        const halfX = newDx / 2;
-        const halfY = newDy / 2;
-        const halfZ = newDz / 2;
-        const cornerOffsets = [
-            [-halfX, -halfY, -halfZ],
-            [-halfX, halfY, -halfZ],
-            [halfX, -halfY, -halfZ],
-            [halfX, halfY, -halfZ],
-        ];
-
-        const basisEuler = new THREE.Euler(finalRx, finalRy, finalRz, 'XYZ');
-        const rotMat = new THREE.Matrix4().makeRotationFromEuler(basisEuler);
-
-        let maxPenetration = 0;
-        for (const [ox, oy, oz] of cornerOffsets) {
-            const cornerVec = new THREE.Vector3(ox, oy, oz).applyMatrix4(rotMat);
-            const cornerWorldX = finalCx + cornerVec.x;
-            const cornerWorldY = finalCy + cornerVec.y;
-            const cornerWorldZ = newZ + cornerVec.z;
-
-            // Road elevation directly beneath this corner
-            const roadAtCorner = -(nA * cornerWorldX + nB * cornerWorldY + nD) / nC;
-            const requiredElevation = roadAtCorner + 0.015;
-
-            if (cornerWorldZ < requiredElevation) {
-                const penetration = requiredElevation - cornerWorldZ;
-                if (penetration > maxPenetration) {
-                    maxPenetration = penetration;
+            if (Math.abs(u) <= halfL + marginX && Math.abs(v) <= halfW + marginY) {
+                if (pz <= bottomZ + 0.35 && pz >= bottomZ - 0.70) {
+                    footprintGround.push({ u, v, z: pz });
                 }
             }
         }
 
-        // If any corner is sinking below the road, elevate the cuboid center
-        if (maxPenetration > 0 && maxPenetration < 0.5) {
-            newZ += maxPenetration;
+        if (footprintGround.length >= 10) {
+            // Find Lowest Point Representative
+            const sortedFootprintZ = footprintGround.map((pt) => pt.z).sort((a, b) => a - b);
+            const lprSeedCount = Math.max(3, Math.floor(sortedFootprintZ.length * 0.15));
+            let lprSum = 0;
+            for (let i = 0; i < lprSeedCount; i++) lprSum += sortedFootprintZ[i];
+            const lprZ = lprSum / lprSeedCount;
+
+            // Restrict to surface points tightly around LPR to exclude high obstacles
+            const surfacePts = footprintGround.filter((pt) => pt.z >= lprZ - 0.15 && pt.z <= lprZ + 0.22);
+
+            // 1. Longitudinal slices along vehicle length (Rear -> Center -> Front)
+            const numBinsX = 5;
+            const stepX = (halfL * 2) / numBinsX;
+            const binCentersX: number[] = [];
+            const binAvgZX: number[] = [];
+
+            for (let b = 0; b < numBinsX; b++) {
+                const xMin = -halfL + b * stepX - 0.10;
+                const xMax = -halfL + (b + 1) * stepX + 0.10;
+                const ptsInBin = surfacePts.filter((pt) => pt.u >= xMin && pt.u <= xMax);
+                if (ptsInBin.length >= 2) {
+                    let sumZ = 0;
+                    for (let i = 0; i < ptsInBin.length; i++) sumZ += ptsInBin[i].z;
+                    binCentersX.push(-halfL + (b + 0.5) * stepX);
+                    binAvgZX.push(sumZ / ptsInBin.length);
+                }
+            }
+
+            // 2. Lateral slices across vehicle width (Right -> Center -> Left)
+            const numBinsY = 3;
+            const stepY = (halfW * 2) / numBinsY;
+            const binCentersY: number[] = [];
+            const binAvgZY: number[] = [];
+
+            for (let b = 0; b < numBinsY; b++) {
+                const yMin = -halfW + b * stepY - 0.10;
+                const yMax = -halfW + (b + 1) * stepY + 0.10;
+                const ptsInBin = surfacePts.filter((pt) => pt.v >= yMin && pt.v <= yMax);
+                if (ptsInBin.length >= 2) {
+                    let sumZ = 0;
+                    for (let i = 0; i < ptsInBin.length; i++) sumZ += ptsInBin[i].z;
+                    binCentersY.push(-halfW + (b + 0.5) * stepY);
+                    binAvgZY.push(sumZ / ptsInBin.length);
+                }
+            }
+
+            // 3. Slope regression between highest average point, lowest average point, and everything in-between
+            let slopeX = 0;
+            if (binCentersX.length >= 2) {
+                let meanX = 0; let meanZ = 0;
+                for (let i = 0; i < binCentersX.length; i++) {
+                    meanX += binCentersX[i];
+                    meanZ += binAvgZX[i];
+                }
+                meanX /= binCentersX.length;
+                meanZ /= binCentersX.length;
+
+                let varX = 0; let covXZ = 0;
+                for (let i = 0; i < binCentersX.length; i++) {
+                    const dx = binCentersX[i] - meanX;
+                    varX += dx * dx;
+                    covXZ += dx * (binAvgZX[i] - meanZ);
+                }
+                if (varX > 1e-4) {
+                    slopeX = covXZ / varX;
+                }
+            }
+
+            let slopeY = 0;
+            if (binCentersY.length >= 2) {
+                let meanY = 0; let meanZ = 0;
+                for (let i = 0; i < binCentersY.length; i++) {
+                    meanY += binCentersY[i];
+                    meanZ += binAvgZY[i];
+                }
+                meanY /= binCentersY.length;
+                meanZ /= binCentersY.length;
+
+                let varY = 0; let covYZ = 0;
+                for (let i = 0; i < binCentersY.length; i++) {
+                    const dy = binCentersY[i] - meanY;
+                    varY += dy * dy;
+                    covYZ += dy * (binAvgZY[i] - meanZ);
+                }
+                if (varY > 1e-4) {
+                    slopeY = covYZ / varY;
+                }
+            }
+
+            // Clamp slopes to realistic roadway grades (+- 10 deg = ~0.176 rad/m)
+            const maxSlope = 0.176;
+            slopeX = Math.max(-maxSlope, Math.min(maxSlope, slopeX));
+            slopeY = Math.max(-maxSlope, Math.min(maxSlope, slopeY));
+
+            // Average ground height across all observed bins (everything in-between)
+            const allBinZ = [...binAvgZX, ...binAvgZY];
+            let meanGroundZ = lprZ;
+            if (allBinZ.length > 0) {
+                let sumZ = 0;
+                for (let i = 0; i < allBinZ.length; i++) sumZ += allBinZ[i];
+                meanGroundZ = sumZ / allBinZ.length;
+            }
+
+            // Balanced in-between elevation: base rests at meanGroundZ + groundClearance
+            const baseZ = meanGroundZ + groundClearance;
+            newZ = baseZ + newDz / 2;
+
+            // Restrict vertical shift to realistic bound relative to cz
+            newZ = Math.max(cz - 0.25, Math.min(cz + 0.35, newZ));
+
+            // Convert longitudinal tilt (thetaLong) and lateral tilt (thetaLat) to 3D Euler angles (XYZ)
+            const thetaLong = Math.atan(slopeX);
+            const thetaLat = Math.atan(slopeY);
+
+            if (Math.abs(thetaLong) > 1e-4 || Math.abs(thetaLat) > 1e-4) {
+                const fwdLocal = new THREE.Vector3(Math.cos(thetaLong), 0, Math.sin(thetaLong));
+                const leftLocal = new THREE.Vector3(0, Math.cos(thetaLat), Math.sin(thetaLat));
+                const upLocal = new THREE.Vector3().crossVectors(fwdLocal, leftLocal).normalize();
+                const reLeftLocal = new THREE.Vector3().crossVectors(upLocal, fwdLocal).normalize();
+                const reFwdLocal = new THREE.Vector3().crossVectors(reLeftLocal, upLocal).normalize();
+
+                const rotBasis = new THREE.Matrix4().makeBasis(reFwdLocal, reLeftLocal, upLocal);
+                const rotYaw = new THREE.Matrix4().makeRotationZ(finalRz);
+                const rotWorld = new THREE.Matrix4().multiplyMatrices(rotYaw, rotBasis);
+
+                const euler = new THREE.Euler().setFromRotationMatrix(rotWorld, 'XYZ');
+                finalRx = parseFloat(euler.x.toFixed(4));
+                finalRy = parseFloat(euler.y.toFixed(4));
+            }
         }
     }
 
