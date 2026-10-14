@@ -25,6 +25,7 @@ import {
 } from './snapping';
 import { MainSceneWorker, areSceneWorkersActive } from './sceneWorkers';
 import { detectGpuCapabilities, GpuCapabilities } from './gpuDetector';
+import { stitchAndSmoothPointClouds, FramePointData } from './sceneStitcher';
 
 export interface Canvas3dPerformanceStats {
     fps: number;
@@ -67,6 +68,13 @@ export interface Canvas3dView {
         clientID?: number | null,
         onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }>;
+    toggleSceneStitching(
+        jobInstance: any,
+        windowRadius?: number,
+        voxelSize?: number,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ stitched: boolean; pointsCount: number; originalCount: number }>;
+    isSceneStitched(): boolean;
     getPerformanceStats(): Canvas3dPerformanceStats;
     togglePerformanceHud(enabled?: boolean): boolean;
     destroy(): void;
@@ -197,6 +205,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private isolatedClientID: number | null = null;
     private isGroundStripped: boolean = false;
     private groundStrippingOffset: number = 0.12;
+    private isSceneStitchedState: boolean = false;
+    private unstitchedBaseGeometry: THREE.BufferGeometry | null = null;
+    private stitchedCache: Map<number, THREE.BufferGeometry> = new Map();
     private groundClippingPlane: THREE.Plane | null = null;
     private cachedGlobalGroundPlane: [number, number, number, number] | null = null;
     private pointCloudMeshes: THREE.Points[] = [];
@@ -1034,7 +1045,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     private applyPointCloudFilter(): void {
-        const baseGeo = this.basePointCloudGeometry;
+        const baseGeo = this.basePointCloudGeometry || this.pointCloudPoints?.geometry;
         if (!baseGeo || this.pointCloudMeshes.length === 0) return;
 
         if (this.filteredPointCloudGeometry) {
@@ -1061,6 +1072,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
         }
         this.updateClippingPlanes(false);
+        this.requestRender();
     }
 
     private updateClippingPlanes(rebuildGeometry: boolean = true): void {
@@ -1339,8 +1351,174 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         _clientID?: number | null,
         _onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }> {
-        // Snap tools disabled
         return { processedFrames: 0 };
+    }
+
+    public isSceneStitched(): boolean {
+        return this.isSceneStitchedState;
+    }
+
+    public async toggleSceneStitching(
+        jobInstance: any,
+        windowRadius: number = 1,
+        voxelSize: number = 0.05,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ stitched: boolean; pointsCount: number; originalCount: number }> {
+        const frameNumber = this.model.data.imageID;
+        const currentGeo = this.basePointCloudGeometry || this.pointCloudPoints?.geometry;
+        const origCount = currentGeo?.attributes?.position?.count || 0;
+
+        if (this.isSceneStitchedState) {
+            // REVERT: Back to single-frame geometry
+            if (this.unstitchedBaseGeometry) {
+                this.basePointCloudGeometry = this.unstitchedBaseGeometry;
+            }
+            this.isSceneStitchedState = false;
+            this.applyPointCloudFilter();
+            this.requestRender();
+
+            this.dispatchEvent(new CustomEvent('canvas.sceneStitched', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    stitched: false,
+                    pointsCount: this.basePointCloudGeometry?.attributes?.position?.count || 0,
+                    originalCount: origCount,
+                },
+            }));
+
+            return {
+                stitched: false,
+                pointsCount: this.basePointCloudGeometry?.attributes?.position?.count || 0,
+                originalCount: origCount,
+            };
+        }
+
+        if (!jobInstance || frameNumber === null || !currentGeo) {
+            throw new Error('Scene stitching requires active 3D point cloud and job instance.');
+        }
+
+        onProgress?.('Preparing current frame point cloud...', 10);
+        this.unstitchedBaseGeometry = currentGeo;
+
+        // Check in-memory cache
+        if (this.stitchedCache.has(frameNumber)) {
+            const cachedGeo = this.stitchedCache.get(frameNumber)!;
+            this.basePointCloudGeometry = cachedGeo;
+            this.isSceneStitchedState = true;
+            this.applyPointCloudFilter();
+            this.requestRender();
+
+            const ptsCount = cachedGeo.attributes?.position?.count || 0;
+            this.dispatchEvent(new CustomEvent('canvas.sceneStitched', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    stitched: true,
+                    pointsCount: ptsCount,
+                    originalCount: origCount,
+                },
+            }));
+
+            return {
+                stitched: true,
+                pointsCount: ptsCount,
+                originalCount: origCount,
+            };
+        }
+
+        const curPos = currentGeo.attributes.position.array as Float32Array;
+        const curCol = currentGeo.attributes.color ? (currentGeo.attributes.color.array as Float32Array) : null;
+
+        const startFrame = Math.max(0, frameNumber - windowRadius);
+        const stopFrame = frameNumber + windowRadius;
+        const neighborFrames: FramePointData[] = [];
+        const framesToFetch: number[] = [];
+
+        for (let f = startFrame; f <= stopFrame; f++) {
+            if (f !== frameNumber) {
+                framesToFetch.push(f);
+            }
+        }
+
+        const loader = new PCDLoader();
+        for (let i = 0; i < framesToFetch.length; i++) {
+            const f = framesToFetch[i];
+            const pct = 15 + Math.round(((i + 1) / framesToFetch.length) * 55);
+            onProgress?.(`Fetching neighbor frame ${f}...`, pct);
+
+            try {
+                let nPos: Float32Array | null = null;
+                let nCol: Float32Array | null = null;
+
+                if (this.geometryCache.has(f)) {
+                    const cached = this.geometryCache.get(f)!;
+                    nPos = cached.geometry.attributes.position?.array as Float32Array;
+                    nCol = cached.geometry.attributes.color ? (cached.geometry.attributes.color.array as Float32Array) : null;
+                } else {
+                    const frameData = await jobInstance.frames.get(f);
+                    if (frameData && !frameData.deleted) {
+                        const frameImage = await frameData.data();
+                        const arrayBuffer = await frameImage.imageData.arrayBuffer();
+                        const defaultImpl = console.error;
+                        let pcd: THREE.Points;
+                        try {
+                            console.error = () => {};
+                            pcd = loader.parse(arrayBuffer) as THREE.Points;
+                        } finally {
+                            console.error = defaultImpl;
+                        }
+
+                        if (pcd?.geometry?.attributes?.position) {
+                            nPos = pcd.geometry.attributes.position.array as Float32Array;
+                            nCol = pcd.geometry.attributes.color ? (pcd.geometry.attributes.color.array as Float32Array) : null;
+                        }
+                    }
+                }
+
+                if (nPos && nPos.length >= 9) {
+                    neighborFrames.push({
+                        frameNumber: f,
+                        positions: nPos,
+                        colors: nCol,
+                    });
+                }
+            } catch (err) {
+                console.warn(`Could not load neighbor frame ${f} for scene stitching:`, err);
+            }
+        }
+
+        onProgress?.('Applying Voxel Smoothing & Outlier Removal...', 80);
+        const stitchedGeo = stitchAndSmoothPointClouds(
+            { positions: curPos, colors: curCol },
+            neighborFrames,
+            { voxelSize, enableSOR: true },
+        );
+
+        this.stitchedCache.set(frameNumber, stitchedGeo);
+        this.basePointCloudGeometry = stitchedGeo;
+        this.isSceneStitchedState = true;
+        this.applyPointCloudFilter();
+        this.requestRender();
+
+        const ptsCount = stitchedGeo.attributes?.position?.count || 0;
+        onProgress?.(`Scene stitched: ${ptsCount} points`, 100);
+
+        this.dispatchEvent(new CustomEvent('canvas.sceneStitched', {
+            bubbles: false,
+            cancelable: true,
+            detail: {
+                stitched: true,
+                pointsCount: ptsCount,
+                originalCount: origCount,
+            },
+        }));
+
+        return {
+            stitched: true,
+            pointsCount: ptsCount,
+            originalCount: origCount,
+        };
     }
 
     private action: {
@@ -3325,6 +3503,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     private onSceneImageLoaded(points: any, preInitialized: boolean = false): void {
         const newGeo: THREE.BufferGeometry = points.geometry;
+        this.basePointCloudGeometry = newGeo;
+        this.isSceneStitchedState = false;
+        this.unstitchedBaseGeometry = null;
         const positions = newGeo?.attributes?.position?.array;
         this.perfPointCount = positions ? Math.floor(positions.length / 3) : 0;
         if (!preInitialized) {

@@ -28,6 +28,12 @@ import MergeControl, {
 import SplitControl, {
     Props as SplitControlProps,
 } from 'components/annotation-page/standard-workspace/controls-side-bar/split-control';
+import SnapToRoadControl, {
+    Props as SnapToRoadControlProps,
+} from './snap-to-road-control';
+import SceneStitchControl, {
+    Props as SceneStitchControlProps,
+} from './scene-stitch-control';
 import GlobalHotKeys, { KeyMap, KeyMapItem } from 'utils/mousetrap-react';
 import ControlVisibilityObserver from 'components/annotation-page/standard-workspace/controls-side-bar/control-visibility-observer';
 import { filterApplicableForType } from 'utils/filter-applicable-labels';
@@ -105,6 +111,12 @@ const componentShortcuts: Record<string, KeyMapItem> = {
         sequences: ['shift+i'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
+    TOGGLE_SCENE_STITCHING_3D_CONTROLS: {
+        name: 'Toggle Scene Stitching',
+        description: 'Accumulate and smooth point cloud from neighbor frames',
+        sequences: ['alt+m'],
+        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
+    },
 };
 
 registerComponentShortcuts(componentShortcuts);
@@ -112,6 +124,8 @@ registerComponentShortcuts(componentShortcuts);
 const ObservedCursorControl = ControlVisibilityObserver<CursorControlProps>(CursorControl, 'CursorControl');
 const ObservedMoveControl = ControlVisibilityObserver<MoveControlProps>(MoveControl, 'MoveControl');
 const ObservedDrawCuboidControl = ControlVisibilityObserver<DrawCuboidControlProps>(DrawCuboidControl, 'DrawCuboidControl');
+const ObservedSnapToRoadControl = ControlVisibilityObserver<SnapToRoadControlProps>(SnapToRoadControl, 'SnapToRoadControl');
+const ObservedSceneStitchControl = ControlVisibilityObserver<SceneStitchControlProps>(SceneStitchControl, 'SceneStitchControl');
 const ObservedGroupControl = ControlVisibilityObserver<GroupControlProps>(GroupControl, 'GroupControl');
 const ObservedMergeControl = ControlVisibilityObserver<MergeControlProps>(MergeControl, 'MergeControl');
 const ObservedSplitControl = ControlVisibilityObserver<SplitControlProps>(SplitControl, 'SplitControl');
@@ -264,6 +278,12 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
                 canvasInstance.toggleObjectIsolation(targetID);
             }
         },
+        TOGGLE_SCENE_STITCHING_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
+            if (event) event.preventDefault();
+            if (canvasInstance && typeof (canvasInstance as any).toggleSceneStitching === 'function') {
+                (canvasInstance as any).toggleSceneStitching(jobInstance);
+            }
+        },
     };
 
     handlers = applicableLabels.length ? {
@@ -297,6 +317,16 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             <ObservedDrawCuboidControl
                 canvasInstance={canvasInstance}
                 isDrawing={activeControl === ActiveControl.DRAW_CUBOID}
+                disabled={controlsDisabled}
+            />
+            <ObservedSnapToRoadControl
+                canvasInstance={canvasInstance}
+                jobInstance={jobInstance}
+                disabled={controlsDisabled}
+            />
+            <ObservedSceneStitchControl
+                canvasInstance={canvasInstance}
+                jobInstance={jobInstance}
                 disabled={controlsDisabled}
             />
 

@@ -59,6 +59,13 @@ interface Canvas3d {
         clientID?: number | null,
         onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }>;
+    toggleSceneStitching(
+        jobInstance: any,
+        windowRadius?: number,
+        voxelSize?: number,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ stitched: boolean; pointsCount: number; originalCount: number }>;
+    isSceneStitched(): boolean;
     getPerformanceStats(): Canvas3dPerformanceStats;
     togglePerformanceHud(enabled?: boolean): boolean;
     group(groupData: GroupData): void;
@@ -198,6 +205,19 @@ class Canvas3dImpl implements Canvas3d {
         onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }> {
         return this.view.snapTrackToRoad(jobInstance, clientID, onProgress);
+    }
+
+    public async toggleSceneStitching(
+        jobInstance: any,
+        windowRadius?: number,
+        voxelSize?: number,
+        onProgress?: (message: string, percent: number) => void,
+    ): Promise<{ stitched: boolean; pointsCount: number; originalCount: number }> {
+        return this.view.toggleSceneStitching(jobInstance, windowRadius, voxelSize, onProgress);
+    }
+
+    public isSceneStitched(): boolean {
+        return this.view.isSceneStitched();
     }
 
     public getPerformanceStats(): Canvas3dPerformanceStats {
