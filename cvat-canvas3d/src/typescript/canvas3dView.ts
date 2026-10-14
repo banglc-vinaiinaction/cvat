@@ -3300,7 +3300,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                         const rawNorm = normAttr ? (normAttr.array as Float32Array) : null;
                                         const len = rawPos.length;
                                         const validPositions = new Float32Array(len);
-                                        const validColors = rawCol ? new Float32Array(len) : null;
+                                        const validColors = new Float32Array(len);
+                                        if (!rawCol) {
+                                            validColors.fill(1);
+                                        }
                                         const validNormals = rawNorm ? new Float32Array(len) : null;
                                         let validCount = 0;
                                         for (let i = 0; i < len; i += 3) {
@@ -3312,8 +3315,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                                 validPositions[outIdx] = x;
                                                 validPositions[outIdx + 1] = y;
                                                 validPositions[outIdx + 2] = z;
-                                                if (validColors && rawCol) {
-                                                    if (Number.isFinite(rawCol[i])) {
+                                                if (rawCol) {
+                                                    if (
+                                                        Number.isFinite(rawCol[i]) &&
+                                                        Number.isFinite(rawCol[i + 1]) &&
+                                                        Number.isFinite(rawCol[i + 2])
+                                                    ) {
                                                         validColors[outIdx] = rawCol[i];
                                                         validColors[outIdx + 1] = rawCol[i + 1];
                                                         validColors[outIdx + 2] = rawCol[i + 2];
@@ -3333,7 +3340,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                         }
                                         return {
                                             positions: validPositions.subarray(0, validCount * 3),
-                                            colors: validColors ? validColors.subarray(0, validCount * 3) : null,
+                                            colors: validColors.subarray(0, validCount * 3),
                                             normals: validNormals ? validNormals.subarray(0, validCount * 3) : null,
                                         };
                                     },

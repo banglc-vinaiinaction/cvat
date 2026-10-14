@@ -372,23 +372,21 @@ export function stitchAndSmoothPointClouds(
 
     // 1. Compute total points and allocate unified merged buffer directly
     let totalPoints = Math.floor(currentFrame.positions.length / 3);
-    let hasColors = Boolean(currentFrame.colors && currentFrame.colors.length >= currentFrame.positions.length);
 
     for (const neighbor of neighborFrames) {
         totalPoints += Math.floor(neighbor.positions.length / 3);
-        if (!neighbor.colors || neighbor.colors.length < neighbor.positions.length) {
-            hasColors = false;
-        }
     }
 
     const mergedPositions = new Float32Array(totalPoints * 3);
-    const mergedColors = hasColors ? new Float32Array(totalPoints * 3) : null;
+    const mergedColors = new Float32Array(totalPoints * 3);
 
     let offset = 0;
     const currentLen = Math.floor(currentFrame.positions.length / 3) * 3;
     mergedPositions.set(currentFrame.positions.subarray(0, currentLen), offset);
-    if (mergedColors && currentFrame.colors) {
+    if (currentFrame.colors && currentFrame.colors.length >= currentLen) {
         mergedColors.set(currentFrame.colors.subarray(0, currentLen), offset);
+    } else {
+        mergedColors.fill(1.0, offset, offset + currentLen);
     }
     offset += currentLen;
 
@@ -400,8 +398,10 @@ export function stitchAndSmoothPointClouds(
         } else {
             mergedPositions.set(posSub, offset);
         }
-        if (mergedColors && neighbor.colors) {
+        if (neighbor.colors && neighbor.colors.length >= len) {
             mergedColors.set(neighbor.colors.subarray(0, len), offset);
+        } else {
+            mergedColors.fill(1.0, offset, offset + len);
         }
         offset += len;
     }

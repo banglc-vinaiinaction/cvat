@@ -362,7 +362,9 @@ function parsePCDHeader(binaryData) {
 function parsePCDInWorker(buffer) {
     const PCDheader = parsePCDHeader(buffer);
     const offset = PCDheader.offset;
-    const hasRGB = offset.rgb !== undefined;
+    const rgbFieldName = offset.rgb !== undefined ? 'rgb' : (offset.rgba !== undefined ? 'rgba' : null);
+    const hasPackedRGB = rgbFieldName !== null;
+    const hasSeparateRGB = offset.r !== undefined && offset.g !== undefined && offset.b !== undefined;
     const hasNormal = offset.normal_x !== undefined;
 
     let maxPoints = PCDheader.points || 0;
@@ -375,7 +377,10 @@ function parsePCDInWorker(buffer) {
     }
 
     const rawPositions = new Float32Array(maxPoints * 3);
-    const rawColors = hasRGB ? new Float32Array(maxPoints * 3) : null;
+    const rawColors = new Float32Array(maxPoints * 3);
+    if (!hasPackedRGB && !hasSeparateRGB) {
+        rawColors.fill(1.0);
+    }
     const rawNormals = hasNormal ? new Float32Array(maxPoints * 3) : null;
 
     let validCount = 0;
@@ -408,9 +413,20 @@ function parsePCDInWorker(buffer) {
     const nySize = nyIndex >= 0 ? PCDheader.size[nyIndex] : 4;
     const nzSize = nzIndex >= 0 ? PCDheader.size[nzIndex] : 4;
 
+    const rIndex = hasSeparateRGB ? PCDheader.fields.indexOf('r') : -1;
+    const gIndex = hasSeparateRGB ? PCDheader.fields.indexOf('g') : -1;
+    const bIndex = hasSeparateRGB ? PCDheader.fields.indexOf('b') : -1;
+    const rType = rIndex >= 0 ? PCDheader.type[rIndex] : 'U';
+    const gType = gIndex >= 0 ? PCDheader.type[gIndex] : 'U';
+    const bType = bIndex >= 0 ? PCDheader.type[bIndex] : 'U';
+    const rSize = rIndex >= 0 ? PCDheader.size[rIndex] : 1;
+    const gSize = gIndex >= 0 ? PCDheader.size[gIndex] : 1;
+    const bSize = bIndex >= 0 ? PCDheader.size[bIndex] : 1;
+
     if (PCDheader.data === 'ascii' && asciiLines) {
-        const rgbFieldIndex = hasRGB ? PCDheader.fields.indexOf('rgb') : -1;
+        const rgbFieldIndex = hasPackedRGB ? PCDheader.fields.indexOf(rgbFieldName) : -1;
         const rgbType = rgbFieldIndex >= 0 ? PCDheader.type[rgbFieldIndex] : 'U';
+        const packedRgbCol = hasPackedRGB ? offset[rgbFieldName] : -1;
         const farr = new Float32Array(1);
         const iarr = new Int32Array(farr.buffer);
 
@@ -437,16 +453,41 @@ function parsePCDInWorker(buffer) {
             if (pz < minZ) minZ = pz;
             if (pz > maxZ) maxZ = pz;
 
-            if (hasRGB) {
-                const flt = parseFloat(line[offset.rgb]);
-                let rgb = flt;
-                if (rgbType === 'F') {
-                    farr[0] = flt;
-                    rgb = iarr[0];
+            if (hasPackedRGB) {
+                const flt = parseFloat(line[packedRgbCol]);
+                if (Number.isFinite(flt)) {
+                    let rgb = flt;
+                    if (rgbType === 'F') {
+                        farr[0] = flt;
+                        rgb = iarr[0];
+                    }
+                    rawColors[outIdx] = SRGB_TO_LINEAR_LUT[(rgb >> 16) & 0xff];
+                    rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[(rgb >> 8) & 0xff];
+                    rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[rgb & 0xff];
+                } else {
+                    rawColors[outIdx] = 1.0;
+                    rawColors[outIdx + 1] = 1.0;
+                    rawColors[outIdx + 2] = 1.0;
                 }
-                rawColors[outIdx] = SRGB_TO_LINEAR_LUT[(rgb >> 16) & 0xff];
-                rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[(rgb >> 8) & 0xff];
-                rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[rgb & 0xff];
+            } else if (hasSeparateRGB) {
+                let rv = parseFloat(line[offset.r]);
+                let gv = parseFloat(line[offset.g]);
+                let bv = parseFloat(line[offset.b]);
+                if (Number.isFinite(rv) && Number.isFinite(gv) && Number.isFinite(bv)) {
+                    if (rv > 1.0 || gv > 1.0 || bv > 1.0 || rType !== 'F') {
+                        rawColors[outIdx] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(rv)))];
+                        rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(gv)))];
+                        rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(bv)))];
+                    } else {
+                        rawColors[outIdx] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(rv * 255)))];
+                        rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(gv * 255)))];
+                        rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(bv * 255)))];
+                    }
+                } else {
+                    rawColors[outIdx] = 1.0;
+                    rawColors[outIdx + 1] = 1.0;
+                    rawColors[outIdx + 2] = 1.0;
+                }
             }
 
             if (hasNormal && rawNormals) {
@@ -470,12 +511,15 @@ function parsePCDInWorker(buffer) {
         );
         const dataview = new DataView(decompressed.buffer);
         const pts = PCDheader.points;
-        const rgbIndex = hasRGB ? PCDheader.fields.indexOf('rgb') : -1;
+        const rgbIndex = hasPackedRGB ? PCDheader.fields.indexOf(rgbFieldName) : -1;
         const rgbSize = rgbIndex >= 0 ? PCDheader.size[rgbIndex] : 4;
         const xBase = pts * offset.x;
         const yBase = pts * offset.y;
         const zBase = pts * offset.z;
-        const rgbBase = hasRGB ? pts * offset.rgb : 0;
+        const rgbBase = hasPackedRGB ? pts * offset[rgbFieldName] : 0;
+        const rBase = hasSeparateRGB ? pts * offset.r : 0;
+        const gBase = hasSeparateRGB ? pts * offset.g : 0;
+        const bBase = hasSeparateRGB ? pts * offset.b : 0;
         const nxBase = hasNormal ? pts * offset.normal_x : 0;
         const nyBase = hasNormal ? pts * offset.normal_y : 0;
         const nzBase = hasNormal ? pts * offset.normal_z : 0;
@@ -506,11 +550,19 @@ function parsePCDInWorker(buffer) {
             if (pz < minZ) minZ = pz;
             if (pz > maxZ) maxZ = pz;
 
-            if (hasRGB) {
+            if (hasPackedRGB) {
                 const rgbOff = rgbBase + rgbSize * i;
                 rawColors[outIdx] = SRGB_TO_LINEAR_LUT[dataview.getUint8(rgbOff + 2)];
                 rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[dataview.getUint8(rgbOff + 1)];
                 rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[dataview.getUint8(rgbOff + 0)];
+            } else if (hasSeparateRGB) {
+                const rv = getDataViewValue(dataview, rBase + rSize * i, rType, rSize);
+                const gv = getDataViewValue(dataview, gBase + gSize * i, gType, gSize);
+                const bv = getDataViewValue(dataview, bBase + bSize * i, bType, bSize);
+                const scale = (rType === 'F' && rv <= 1.0 && gv <= 1.0 && bv <= 1.0) ? 255 : 1;
+                rawColors[outIdx] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(rv * scale)))];
+                rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(gv * scale)))];
+                rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(bv * scale)))];
             }
 
             if (hasNormal && rawNormals) {
@@ -531,7 +583,10 @@ function parsePCDInWorker(buffer) {
         const offX = offset.x;
         const offY = offset.y;
         const offZ = offset.z;
-        const offRGB = offset.rgb;
+        const offRGB = hasPackedRGB ? offset[rgbFieldName] : undefined;
+        const offR = offset.r;
+        const offG = offset.g;
+        const offB = offset.b;
         const offNX = offset.normal_x;
         const offNY = offset.normal_y;
         const offNZ = offset.normal_z;
@@ -562,10 +617,18 @@ function parsePCDInWorker(buffer) {
             if (pz < minZ) minZ = pz;
             if (pz > maxZ) maxZ = pz;
 
-            if (hasRGB) {
+            if (hasPackedRGB) {
                 rawColors[outIdx] = SRGB_TO_LINEAR_LUT[dataview.getUint8(row + offRGB + 2)];
                 rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[dataview.getUint8(row + offRGB + 1)];
                 rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[dataview.getUint8(row + offRGB + 0)];
+            } else if (hasSeparateRGB) {
+                const rv = getDataViewValue(dataview, row + offR, rType, rSize);
+                const gv = getDataViewValue(dataview, row + offG, gType, gSize);
+                const bv = getDataViewValue(dataview, row + offB, bType, bSize);
+                const scale = (rType === 'F' && rv <= 1.0 && gv <= 1.0 && bv <= 1.0) ? 255 : 1;
+                rawColors[outIdx] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(rv * scale)))];
+                rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(gv * scale)))];
+                rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[Math.max(0, Math.min(255, Math.round(bv * scale)))];
             }
 
             if (hasNormal && rawNormals) {
@@ -582,9 +645,7 @@ function parsePCDInWorker(buffer) {
     }
 
     const positions = validCount === maxPoints ? rawPositions : rawPositions.slice(0, validCount * 3);
-    const colors = rawColors ?
-        (validCount === maxPoints ? rawColors : rawColors.slice(0, validCount * 3)) :
-        null;
+    const colors = validCount === maxPoints ? rawColors : rawColors.slice(0, validCount * 3);
     const normals = rawNormals ?
         (validCount === maxPoints ? rawNormals : rawNormals.slice(0, validCount * 3)) :
         null;

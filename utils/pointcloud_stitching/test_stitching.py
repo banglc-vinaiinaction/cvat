@@ -163,5 +163,36 @@ class TestPointCloudStitching(unittest.TestCase):
         self.assertGreater(stats["raw_accumulated_points"], stats["original_points"])
         print(f"\n[Integration Test Passed] Successfully stitched frame #{first_idx}: {len(stitched_pts)} points.")
 
+    def test_packed_rgb_preservation(self):
+        """Kiểm tra bảo toàn màu RGB đóng gói (packed float32/uint32) qua PCD I/O và Voxel Downsampling."""
+        smoother = PointCloudSmoother(voxel_size=1.0)
+        # Hai điểm cùng nằm trong voxel [0, 0, 0] với màu RGB: (200, 100, 50) và (100, 200, 150)
+        c1 = np.array([(200 << 16) | (100 << 8) | 50], dtype=np.uint32).view(np.float32)[0]
+        c2 = np.array([(100 << 16) | (200 << 8) | 150], dtype=np.uint32).view(np.float32)[0]
+        pts = np.array([
+            [0.1, 0.2, 0.3, c1],
+            [0.2, 0.3, 0.4, c2],
+        ], dtype=np.float32)
+
+        down = smoother.voxel_downsample(pts, voxel_size=1.0, fields=['x', 'y', 'z', 'rgb'])
+        self.assertEqual(len(down), 1)
+        packed_out = np.ascontiguousarray(down[:, 3], dtype=np.float32).view(np.uint32)[0]
+        r_out = (packed_out >> 16) & 0xFF
+        g_out = (packed_out >> 8) & 0xFF
+        b_out = packed_out & 0xFF
+        self.assertEqual((r_out, g_out, b_out), (150, 150, 100))
+
+        # Kiểm tra ghi/đọc ASCII và Binary cho trường 'rgb'
+        for mode_bin in (False, True):
+            p = str(self.tmp_dir / f"test_rgb_{'bin' if mode_bin else 'ascii'}.pcd")
+            write_pcd(p, down, fields=['x', 'y', 'z', 'rgb'], binary=mode_bin)
+            loaded, loaded_fields, _ = read_pcd(p)
+            self.assertEqual(loaded_fields, ['x', 'y', 'z', 'rgb'])
+            u32_loaded = np.ascontiguousarray(loaded[:, 3], dtype=np.float32).view(np.uint32)[0]
+            self.assertEqual(
+                ((u32_loaded >> 16) & 0xFF, (u32_loaded >> 8) & 0xFF, u32_loaded & 0xFF),
+                (150, 150, 100),
+            )
+
 if __name__ == "__main__":
     unittest.main()

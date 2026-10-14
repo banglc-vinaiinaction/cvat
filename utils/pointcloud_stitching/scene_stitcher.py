@@ -191,7 +191,9 @@ class SceneStitcher:
 
         # Thuật toán làm mượt bề mặt: Voxel Grid Downsampling
         if self.voxel_size > 0:
-            smoothed_points = self.cloud_smoother.voxel_downsample(merged_points, self.voxel_size)
+            smoothed_points = self.cloud_smoother.voxel_downsample(
+                merged_points, self.voxel_size, fields=fields
+            )
         else:
             smoothed_points = merged_points
 

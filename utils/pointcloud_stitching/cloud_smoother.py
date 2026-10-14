@@ -15,7 +15,7 @@ Cung cấp các thuật toán làm mượt bề mặt và khử nhiễu mây đi
 
 import numpy as np
 from scipy.spatial import cKDTree
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 class PointCloudSmoother:
     def __init__(
@@ -34,7 +34,12 @@ class PointCloudSmoother:
         self.sor_nb_neighbors = sor_nb_neighbors
         self.std_ratio = sor_std_ratio
 
-    def voxel_downsample(self, points: np.ndarray, voxel_size: Optional[float] = None) -> np.ndarray:
+    def voxel_downsample(
+        self,
+        points: np.ndarray,
+        voxel_size: Optional[float] = None,
+        fields: Optional[List[str]] = None,
+    ) -> np.ndarray:
         """
         Làm mượt và giảm mật độ mây điểm bằng Voxel Grid Downsampling.
         Tính centroid (trung bình cộng) của các điểm rơi vào cùng một ô voxel.
@@ -42,6 +47,7 @@ class PointCloudSmoother:
         Args:
             points: (N, D) numpy array (D >= 3: x, y, z, ...)
             voxel_size: kích thước voxel (nếu None lấy theo cấu hình mặc định)
+            fields: danh sách tên trường (ví dụ ['x', 'y', 'z', 'rgb']) để bảo toàn kênh màu RGB đóng gói
         Returns:
             smoothed_points: (M, D) mảng điểm đã được làm phẳng và giảm tải
         """
@@ -80,17 +86,59 @@ class PointCloudSmoother:
 
         num_voxels = len(counts)
 
-        # 3. Tính trung bình các trường (x, y, z, intensity, ...) trong từng voxel bằng np.bincount
+        # 3. Tính trung bình các trường (x, y, z, intensity, rgb, ...) trong từng voxel bằng np.bincount
         num_features = points.shape[1]
         pts_f64 = points.astype(np.float64, copy=False)
-        inv_counts = (1.0 / counts)[:, np.newaxis]
+        inv_counts_1d = 1.0 / counts
 
-        sum_features = np.column_stack([
-            np.bincount(inverse_indices, weights=pts_f64[:, col], minlength=num_voxels)
-            for col in range(num_features)
-        ])
+        packed_rgb_cols = set()
+        if fields is not None:
+            for idx, f_name in enumerate(fields):
+                if idx < num_features and f_name.lower() in ('rgb', 'rgba'):
+                    packed_rgb_cols.add(idx)
+        elif num_features >= 4:
+            # Auto-detect PCL bit-packed 0x00RRGGBB float32 columns (subnormal floats < 1e-35)
+            for col in range(3, num_features):
+                col_abs = np.abs(points[:min(len(points), 256), col])
+                nonzero = col_abs[col_abs > 0]
+                if len(nonzero) > 0 and np.all(nonzero < 1e-34):
+                    packed_rgb_cols.add(col)
 
-        smoothed_points = (sum_features * inv_counts).astype(np.float32)
+        smoothed_cols = []
+        for col in range(num_features):
+            if col in packed_rgb_cols:
+                u32 = np.ascontiguousarray(points[:, col], dtype=np.float32).view(np.uint32)
+                r = ((u32 >> 16) & 0xFF).astype(np.float64)
+                g = ((u32 >> 8) & 0xFF).astype(np.float64)
+                b = (u32 & 0xFF).astype(np.float64)
+                a = ((u32 >> 24) & 0xFF).astype(np.float64)
+
+                avg_r = np.clip(
+                    np.rint(np.bincount(inverse_indices, weights=r, minlength=num_voxels) * inv_counts_1d),
+                    0, 255
+                ).astype(np.uint32)
+                avg_g = np.clip(
+                    np.rint(np.bincount(inverse_indices, weights=g, minlength=num_voxels) * inv_counts_1d),
+                    0, 255
+                ).astype(np.uint32)
+                avg_b = np.clip(
+                    np.rint(np.bincount(inverse_indices, weights=b, minlength=num_voxels) * inv_counts_1d),
+                    0, 255
+                ).astype(np.uint32)
+                avg_a = np.clip(
+                    np.rint(np.bincount(inverse_indices, weights=a, minlength=num_voxels) * inv_counts_1d),
+                    0, 255
+                ).astype(np.uint32)
+
+                packed = ((avg_a << 24) | (avg_r << 16) | (avg_g << 8) | avg_b).astype(np.uint32)
+                smoothed_cols.append(packed.view(np.float32))
+            else:
+                avg_col = (
+                    np.bincount(inverse_indices, weights=pts_f64[:, col], minlength=num_voxels) * inv_counts_1d
+                ).astype(np.float32)
+                smoothed_cols.append(avg_col)
+
+        smoothed_points = np.column_stack(smoothed_cols)
         return smoothed_points
 
     def remove_statistical_outliers(

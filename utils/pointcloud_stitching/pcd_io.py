@@ -58,17 +58,28 @@ def read_pcd(filepath: str) -> Tuple[np.ndarray, List[str], Dict[str, Any]]:
 
         if data_format == 'ascii':
             raw_text = f.read().decode('ascii', errors='ignore')
-            flat = np.fromstring(raw_text, dtype=np.float32, sep=' ')
+            flat = np.fromstring(raw_text, dtype=np.float64, sep=' ')
             if flat.size == 0:
                 return np.empty((0, total_cols), dtype=np.float32), fields, metadata
-            return flat.reshape(-1, total_cols), fields, metadata
+            mat_f64 = flat.reshape(-1, total_cols)
+            data = mat_f64.astype(np.float32)
+            col_idx = 0
+            for name, t, count in zip(fields, types, counts):
+                if count == 1 and name.lower() in ('rgb', 'rgba') and t.upper() in ('U', 'I'):
+                    u32 = np.rint(mat_f64[:, col_idx]).astype(np.uint32)
+                    data[:, col_idx] = u32.view(np.float32)
+                col_idx += count
+            return data, fields, metadata
         elif data_format == 'binary':
             raw_bytes = f.read()
             if num_points == 0 or not raw_bytes:
                 return np.empty((0, total_cols), dtype=np.float32), fields, metadata
 
-            # Fast path when all fields are standard 32-bit floats
-            if all(t.upper() == 'F' and s == 4 for t, s in zip(types, sizes)):
+            # Fast path when all fields are standard 4-byte fields (float32 or packed 4-byte rgb/rgba)
+            if all(
+                s == 4 and (t.upper() == 'F' or name.lower() in ('rgb', 'rgba'))
+                for name, t, s in zip(fields, types, sizes)
+            ):
                 expected_floats = num_points * total_cols
                 data = np.frombuffer(
                     raw_bytes, dtype=np.float32, count=expected_floats
@@ -91,13 +102,16 @@ def read_pcd(filepath: str) -> Tuple[np.ndarray, List[str], Dict[str, Any]]:
             # Convert structured array into preallocated float32 array
             data = np.empty((num_points, total_cols), dtype=np.float32)
             col_idx = 0
-            for name, count in zip(fields, counts):
+            for name, size, t, count in zip(fields, sizes, types, counts):
                 col = structured_data[name]
                 if count > 1:
                     data[:, col_idx:col_idx + count] = col
                     col_idx += count
                 else:
-                    data[:, col_idx] = col
+                    if name.lower() in ('rgb', 'rgba') and size == 4 and t.upper() in ('U', 'I'):
+                        data[:, col_idx] = np.ascontiguousarray(col, dtype=np.uint32).view(np.float32)
+                    else:
+                        data[:, col_idx] = col
                     col_idx += 1
             return data, fields, metadata
         else:
@@ -128,7 +142,10 @@ def write_pcd(
             fields.append(f'f_{len(fields)}')
 
     sizes = [4] * num_dims
-    types = ['F'] * num_dims
+    types = [
+        ('U' if (not binary and f_name.lower() in ('rgb', 'rgba')) else 'F')
+        for f_name in fields
+    ]
     counts = [1] * num_dims
 
     header = (
@@ -152,5 +169,18 @@ def write_pcd(
             f.write(points_f32.tobytes())
         else:
             f.write(header)
-            # Format float output cleanly
-            np.savetxt(f, points, fmt='%.4f')
+            rgb_cols = [idx for idx, f_name in enumerate(fields) if f_name.lower() in ('rgb', 'rgba')]
+            if not rgb_cols:
+                np.savetxt(f, points, fmt='%.4f')
+            else:
+                out_arr = np.empty((num_points, num_dims), dtype=np.float64)
+                fmt_list = []
+                for idx in range(num_dims):
+                    if idx in rgb_cols:
+                        u32 = np.ascontiguousarray(points[:, idx], dtype=np.float32).view(np.uint32)
+                        out_arr[:, idx] = u32.astype(np.float64)
+                        fmt_list.append('%d')
+                    else:
+                        out_arr[:, idx] = points[:, idx]
+                        fmt_list.append('%.4f')
+                np.savetxt(f, out_arr, fmt=' '.join(fmt_list))
