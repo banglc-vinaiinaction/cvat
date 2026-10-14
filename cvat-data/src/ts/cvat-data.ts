@@ -24,15 +24,24 @@ export enum DimensionType {
     DIMENSION_3D = '3d',
 }
 
+let sharedZipWorker: Worker | null = null;
+const sharedZipMutex = new Mutex();
+
+function getSharedZipWorker(): Worker {
+    if (!sharedZipWorker) {
+        sharedZipWorker = new Worker(
+            new URL('./unzip_imgs.worker', import.meta.url),
+        );
+    }
+    return sharedZipWorker;
+}
+
 export function decodeContextImages(
     block: any, start: number, end: number,
 ): Promise<Record<string, ImageBitmap>> {
-    const decodeZipWorker = (decodeContextImages as any).zipWorker || new Worker(
-        new URL('./unzip_imgs.worker', import.meta.url),
-    );
-    (decodeContextImages as any).zipWorker = decodeZipWorker;
+    const decodeZipWorker = getSharedZipWorker();
     return new Promise((resolve, reject) => {
-        decodeContextImages.mutex.acquire().then((release) => {
+        sharedZipMutex.acquire().then((release) => {
             const result: Record<string, ImageBitmap> = {};
             let decoded = 0;
 
@@ -43,7 +52,7 @@ export function decodeContextImages(
 
             decodeZipWorker.onmessage = async (event) => {
                 if (event.data.error) {
-                    this.zipWorker.onerror(new ErrorEvent('error', {
+                    decodeZipWorker.onerror(new ErrorEvent('error', {
                         error: event.data.error,
                     }));
                     return;
@@ -70,7 +79,7 @@ export function decodeContextImages(
     });
 }
 
-decodeContextImages.mutex = new Mutex();
+decodeContextImages.mutex = sharedZipMutex;
 
 interface BlockToDecode {
     chunkFrameNumbers: number[];
@@ -267,10 +276,16 @@ export class FrameDecoder {
     async startDecode(): Promise<void> {
         const blockToDecode = { ...this.requestedChunkToDecode };
         const releaseMutex = await this.mutex.acquire();
+        let releaseSharedZipMutex: (() => void) | null = null;
         const release = (): void => {
             if (this.videoWorker) {
                 this.videoWorker.terminate();
                 this.videoWorker = null;
+            }
+            if (releaseSharedZipMutex) {
+                const fn = releaseSharedZipMutex;
+                releaseSharedZipMutex = null;
+                fn();
             }
 
             releaseMutex();
@@ -367,9 +382,8 @@ export class FrameDecoder {
                     });
                 }
             } else {
-                this.zipWorker = this.zipWorker || new Worker(
-                    new URL('./unzip_imgs.worker', import.meta.url),
-                );
+                releaseSharedZipMutex = await sharedZipMutex.acquire();
+                this.zipWorker = getSharedZipWorker();
                 let decodedCount = 0;
 
                 this.zipWorker.onmessage = async (event) => {
@@ -416,7 +430,6 @@ export class FrameDecoder {
 
     public close(): void {
         if (this.zipWorker) {
-            this.zipWorker.terminate();
             this.zipWorker = null;
         }
 

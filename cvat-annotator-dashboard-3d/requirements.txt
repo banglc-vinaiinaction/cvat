@@ -1,4 +1,0 @@
-open3d
-pandas
-numpy
-git+https://github.com/scaleapi/pandaset-devkit.git#subdirectory=python

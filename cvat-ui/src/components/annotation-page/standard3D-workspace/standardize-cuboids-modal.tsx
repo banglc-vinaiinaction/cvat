@@ -212,6 +212,33 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
                 </div>
 
                 <div>
+                    <Text strong>Quick Vehicle Class Presets</Text>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                        {[
+                            { key: 'compact', label: 'Compact Car', dx: 4.2, dy: 1.8, dz: 1.45 },
+                            { key: 'sedan', label: 'Standard Sedan', dx: 4.65, dy: 1.85, dz: 1.50 },
+                            { key: 'suv', label: 'Full-size SUV', dx: 4.95, dy: 2.0, dz: 1.75 },
+                            { key: 'truck', label: 'Box Truck', dx: 8.5, dy: 2.5, dz: 3.20 },
+                            { key: 'bus', label: 'City Bus', dx: 12.0, dy: 2.55, dz: 3.40 },
+                            { key: 'moto', label: 'Motorcycle', dx: 2.1, dy: 0.85, dz: 1.25 },
+                            { key: 'ped', label: 'Pedestrian', dx: 0.6, dy: 0.6, dz: 1.75 },
+                        ].map((preset) => (
+                            <Button
+                                key={preset.key}
+                                size='small'
+                                onClick={() => {
+                                    setDx(preset.dx);
+                                    setDy(preset.dy);
+                                    setDz(preset.dz);
+                                }}
+                            >
+                                {`${preset.label} (${preset.dx}×${preset.dy}×${preset.dz}m)`}
+                            </Button>
+                        ))}
+                    </div>
+                </div>
+
+                <div>
                     <Text strong>Target Dimensions (meters)</Text>
                     <Row gutter={12} style={{ marginTop: 6 }}>
                         <Col span={8}>

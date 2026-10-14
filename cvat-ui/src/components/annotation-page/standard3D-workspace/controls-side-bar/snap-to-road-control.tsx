@@ -195,6 +195,25 @@ function SnapToRoadControl(props: Props): JSX.Element {
                 onClick: onOpenStandardizeModal,
             },
         ] : []),
+        {
+            type: 'divider' as const,
+        },
+        {
+            key: 'perf_hud',
+            label: 'Toggle 3D GPU & Performance HUD',
+            onClick: () => {
+                const enabled = (canvasInstance as any)?.togglePerformanceHud?.();
+                const stats = (canvasInstance as any)?.getPerformanceStats?.();
+                const gpuDesc = stats?.gpuTier ?
+                    ` (${String(stats.gpuTier).toUpperCase()} • ${stats.renderMethod || 'Dual-Worker Pipeline'})` :
+                    '';
+                notification.info({
+                    message: `3D GPU & Dual-Worker HUD: ${enabled === false ? 'HIDDEN' : 'VISIBLE'}`,
+                    description: `Live GPU tier, Dual-Worker status, and frame timing overlay${gpuDesc}.`,
+                    duration: 2.5,
+                });
+            },
+        },
     ];
 
     if (disabled) {

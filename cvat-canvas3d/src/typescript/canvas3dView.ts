@@ -24,8 +24,22 @@ import {
     alignEulerToRoadPlane, GroundElevationGrid,
     computeSceneGroundPlane, estimateLocalRoadPlane,
 } from './snapping';
-import { MainSceneWorker, OrthoViewsWorker } from './sceneWorkers';
+import { MainSceneWorker, OrthoViewsWorker, areSceneWorkersActive } from './sceneWorkers';
 import { detectGpuCapabilities, GpuCapabilities } from './gpuDetector';
+
+export interface Canvas3dPerformanceStats {
+    fps: number;
+    frameTimeMs: number;
+    renderTimeMs: number;
+    pointCount: number;
+    orthoRoiPoints: number;
+    cuboidCount: number;
+    gpuTier: string;
+    gpuRenderer: string;
+    renderingMethod: string;
+    mainWorkerActive: boolean;
+    orthoWorkerActive: boolean;
+}
 
 let sharedOrthoRenderer: THREE.WebGLRenderer | null = null;
 
@@ -83,6 +97,8 @@ export interface Canvas3dView {
         clientID?: number | null,
         onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }>;
+    getPerformanceStats(): Canvas3dPerformanceStats;
+    togglePerformanceHud(enabled?: boolean): boolean;
     destroy(): void;
 }
 
@@ -221,6 +237,109 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         [ViewType.SIDE]: null,
         [ViewType.FRONT]: null,
     };
+    private geometryCache: Map<number, {
+        geometry: THREE.BufferGeometry;
+        groundGrid: GroundElevationGrid;
+        globalGroundPlane: [number, number, number, number];
+    }> = new Map();
+    private perfFps: number = 60;
+    private perfFrameTimeMs: number = 16.7;
+    private perfRenderTimeMs: number = 0.5;
+    private perfPointCount: number = 0;
+    private perfOrthoRoiPoints: number = 0;
+    private perfHudEnabled: boolean = false;
+    private perfHudElement: HTMLDivElement | null = null;
+    private perfHudLastUpdate: number = 0;
+
+    public getPerformanceStats(): Canvas3dPerformanceStats {
+        const { mainWorkerActive, orthoWorkerActive } = areSceneWorkersActive();
+        let gpuTierLabel = 'iGPU';
+        let renderingMethodLabel = 'iGPU Balanced';
+        if (this.gpuCapabilities.tier === 'dgpu') {
+            gpuTierLabel = 'dGPU';
+            renderingMethodLabel = 'dGPU Hardware Offscreen + ImageBitmap';
+        } else if (this.gpuCapabilities.tier === 'software') {
+            gpuTierLabel = 'Software';
+            renderingMethodLabel = 'Software Low-Overhead';
+        }
+        const pointCount = this.perfPointCount ||
+            (this.pointCloudPoints?.geometry?.attributes?.position?.count ?? 0);
+        return {
+            fps: Math.round(this.perfFps),
+            frameTimeMs: Number(this.perfFrameTimeMs.toFixed(2)),
+            renderTimeMs: Number(this.perfRenderTimeMs.toFixed(2)),
+            pointCount,
+            orthoRoiPoints: this.perfOrthoRoiPoints,
+            cuboidCount: Object.keys(this.drawnObjects).length,
+            gpuTier: gpuTierLabel,
+            gpuRenderer: this.gpuCapabilities.renderer,
+            renderingMethod: renderingMethodLabel,
+            mainWorkerActive,
+            orthoWorkerActive,
+        };
+    }
+
+    public togglePerformanceHud(enabled?: boolean): boolean {
+        this.perfHudEnabled = typeof enabled === 'boolean' ? enabled : !this.perfHudEnabled;
+        if (!this.perfHudEnabled) {
+            if (this.perfHudElement) {
+                this.perfHudElement.style.display = 'none';
+            }
+            return false;
+        }
+        this.updatePerformanceHud();
+        return true;
+    }
+
+    private updatePerformanceHud(): void {
+        if (!this.perfHudEnabled || typeof window === 'undefined') return;
+        const container = this.views?.perspective?.renderer?.domElement?.parentElement;
+        if (!container) return;
+
+        if (!this.perfHudElement) {
+            const el = window.document.createElement('div');
+            el.className = 'cvat-3d-performance-hud';
+            el.style.cssText = [
+                'pointer-events: none',
+                'position: absolute',
+                'top: 10px',
+                'left: 10px',
+                'z-index: 20',
+                'background: rgba(15, 23, 42, 0.85)',
+                'color: #e2e8f0',
+                'border: 1px solid rgba(56, 189, 248, 0.35)',
+                'border-radius: 6px',
+                'padding: 8px 10px',
+                'font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                'font-size: 11px',
+                'line-height: 1.45',
+                'box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4)',
+                'white-space: pre',
+            ].join('; ');
+            this.perfHudElement = el;
+        }
+
+        if (this.perfHudElement.parentElement !== container) {
+            const computedPos = window.getComputedStyle(container).position;
+            if (!computedPos || computedPos === 'static') {
+                container.style.position = 'relative';
+            }
+            container.appendChild(this.perfHudElement);
+        }
+
+        this.perfHudElement.style.display = 'block';
+        const stats = this.getPerformanceStats();
+        const w1 = stats.mainWorkerActive ? 'Active (Singleton)' : 'Standby (Lazy)';
+        const w2 = stats.orthoWorkerActive ? 'Active (Singleton)' : 'Standby (Lazy)';
+        this.perfHudElement.textContent = [
+            `GPU Tier    : ${stats.gpuTier} (${stats.gpuRenderer})`,
+            `Render Mode : ${stats.renderingMethod}`,
+            `Worker 1    : MainSceneWorker  [${w1}]`,
+            `Worker 2    : OrthoViewsWorker [${w2}]`,
+            `FPS / Frame : ${stats.fps} FPS (${stats.frameTimeMs.toFixed(1)} ms | GPU draw: ${stats.renderTimeMs.toFixed(2)} ms)`,
+            `Points      : ${stats.pointCount.toLocaleString()} main | ${stats.orthoRoiPoints.toLocaleString()} ortho ROI | ${stats.cuboidCount} cuboids`,
+        ].join('\n');
+    }
 
     public requestRender(frameCount: number = 2): void {
         this.needsPerspectiveRenderCount = Math.max(this.needsPerspectiveRenderCount, frameCount);
@@ -1443,6 +1562,20 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 configurable: false,
                 writable: false,
             });
+
+            Object.defineProperty(view, 'getPerformanceStats', {
+                value: () => this.getPerformanceStats(),
+                enumerable: false,
+                configurable: false,
+                writable: false,
+            });
+
+            Object.defineProperty(view, 'togglePerformanceHud', {
+                value: (enabled?: boolean) => this.togglePerformanceHud(enabled),
+                enumerable: false,
+                configurable: false,
+                writable: false,
+            });
         });
 
         canvasPerspectiveView.addEventListener('contextmenu', (e: MouseEvent): void => {
@@ -2586,9 +2719,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.statesToBeGrouped = [];
             this.clearScene();
 
-            const onPCDLoadSuccess = (points: any): void => {
+            const onPCDLoadSuccess = (points: any, preInitialized: boolean = false): void => {
                 try {
-                    this.onSceneImageLoaded(points);
+                    this.onSceneImageLoaded(points, preInitialized);
                     model.updateCanvasObjects();
                 } finally {
                     model.unlockFrameUpdating();
@@ -2598,7 +2731,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
             try {
                 if (model.data.image) {
-                    const loader = new PCDLoader();
                     this.views.perspective.renderer.dispose();
                     if (this.controller.imageIsDeleted) {
                         try {
@@ -2629,142 +2761,124 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                             model.unlockFrameUpdating();
                         }
                     } else {
-                        model.data.image.imageData.arrayBuffer().then((data) => {
-                            const defaultImpl = console.error;
-                            // loader.parse will throw some errors to console when nan values are in PCD file
-                            // there is not way to prevent it, because three.js opinion is that nan values
-                            // in input data is incorrect
-                            let cloud = null;
-                            try {
-                                console.error = () => { };
-                                cloud = loader.parse(data) as THREE.Points;
-                            } finally {
-                                console.error = defaultImpl;
+                        const frameNumber = model.data.imageID;
+                        if (frameNumber !== null && this.geometryCache.has(frameNumber)) {
+                            const cached = this.geometryCache.get(frameNumber)!;
+                            this.geometryCache.delete(frameNumber);
+                            this.geometryCache.set(frameNumber, cached);
+                            this.groundGrid = cached.groundGrid;
+                            this.cachedGlobalGroundPlane = cached.globalGroundPlane;
+
+                            const material = new THREE.PointsMaterial({ size: 0.05, vertexColors: true });
+                            const cloud = new THREE.Points(cached.geometry, material);
+                            const [overlay] = window.document.getElementsByClassName('cvat_3d_canvas_deleted_overlay');
+                            if (overlay) {
+                                overlay.remove();
                             }
-
-                            const posAttr = cloud.geometry.attributes.position;
-                            const colorAttr = cloud.geometry.attributes.color;
-                            const normalAttr = cloud.geometry.attributes.normal;
-                            const intensityAttr = cloud.geometry.attributes.intensity;
-                            const labelAttr = cloud.geometry.attributes.label;
-                            cloud.material.vertexColors = true;
-
-                            if (posAttr && posAttr.array) {
-                                const posArray = posAttr.array;
-                                const len = posArray.length;
-                                const totalPoints = Math.floor(len / 3);
-
-                                // 1. Fast Scan for NaNs or non-finite values
-                                let hasInvalid = false;
-                                for (let i = 0; i < len; i += 3) {
-                                    if (
-                                        !Number.isFinite(posArray[i]) ||
-                                        !Number.isFinite(posArray[i + 1]) ||
-                                        !Number.isFinite(posArray[i + 2])
-                                    ) {
-                                        hasInvalid = true;
-                                        break;
-                                    }
-                                }
-
-                                const hasColor = Boolean(colorAttr && colorAttr.array);
-
-                                if (!hasInvalid && hasColor) {
-                                    // Fast path: Point coordinates are completely clean and colors exist.
-                                    // 0ms, zero allocations or dynamic array overhead.
-                                } else if (!hasInvalid && !hasColor) {
-                                    // Fast path: Point coordinates are clean, synthesize default white colors directly
-                                    const defaultColors = new Float32Array(len);
-                                    defaultColors.fill(255);
-                                    cloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(defaultColors, 3));
-                                } else {
-                                    // Filter in single pass using pre-allocated TypedArrays (zero heap garbage)
-                                    const validPositions = new Float32Array(len);
-                                    const validColors = new Float32Array(len);
-                                    const validNormals = normalAttr ? new Float32Array(len) : null;
-                                    const validIntensities = intensityAttr ? new Float32Array(totalPoints) : null;
-                                    const validLabels = labelAttr ? new Float32Array(totalPoints) : null;
-
-                                    const colArray = colorAttr?.array;
-                                    const normArray = normalAttr?.array;
-                                    const intArr = intensityAttr?.array;
-                                    const lblArr = labelAttr?.array;
-
-                                    let validCount = 0;
-
-                                    for (let i = 0, pt = 0; i < len; i += 3, pt++) {
-                                        const x = posArray[i];
-                                        const y = posArray[i + 1];
-                                        const z = posArray[i + 2];
-
-                                        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
-                                            const outIdx = validCount * 3;
-                                            validPositions[outIdx] = x;
-                                            validPositions[outIdx + 1] = y;
-                                            validPositions[outIdx + 2] = z;
-
-                                            if (
-                                                colArray &&
-                                                Number.isFinite(colArray[i]) &&
-                                                Number.isFinite(colArray[i + 1]) &&
-                                                Number.isFinite(colArray[i + 2])
-                                            ) {
-                                                validColors[outIdx] = colArray[i];
-                                                validColors[outIdx + 1] = colArray[i + 1];
-                                                validColors[outIdx + 2] = colArray[i + 2];
-                                            } else {
-                                                validColors[outIdx] = 255;
-                                                validColors[outIdx + 1] = 255;
-                                                validColors[outIdx + 2] = 255;
-                                            }
-
-                                            if (
-                                                validNormals && normArray &&
-                                                Number.isFinite(normArray[i]) &&
-                                                Number.isFinite(normArray[i + 1]) &&
-                                                Number.isFinite(normArray[i + 2])
-                                            ) {
-                                                validNormals[outIdx] = normArray[i];
-                                                validNormals[outIdx + 1] = normArray[i + 1];
-                                                validNormals[outIdx + 2] = normArray[i + 2];
-                                            }
-
-                                            if (validIntensities && intArr) {
-                                                validIntensities[validCount] = intArr[pt];
-                                            }
-
-                                            if (validLabels && lblArr) {
-                                                validLabels[validCount] = lblArr[pt];
-                                            }
-
-                                            validCount++;
+                            onPCDLoadSuccess(cloud, true);
+                        } else {
+                            model.data.image.imageData.arrayBuffer().then((data: ArrayBuffer) => {
+                                this.mainSceneWorker.parseAndInitScene(
+                                    data,
+                                    (result) => {
+                                        const geometry = new THREE.BufferGeometry();
+                                        geometry.setAttribute('position', new THREE.Float32BufferAttribute(result.positions, 3));
+                                        geometry.setAttribute('color', new THREE.Float32BufferAttribute(result.colors, 3));
+                                        if (result.normals) {
+                                            geometry.setAttribute('normal', new THREE.Float32BufferAttribute(result.normals, 3));
                                         }
-                                    }
 
-                                    const finalPos = validPositions.subarray(0, validCount * 3);
-                                    const finalCol = validColors.subarray(0, validCount * 3);
+                                        const [minX, minY, minZ, maxX, maxY, maxZ] = result.bbox;
+                                        geometry.boundingBox = new THREE.Box3(
+                                            new THREE.Vector3(minX, minY, minZ),
+                                            new THREE.Vector3(maxX, maxY, maxZ),
+                                        );
+                                        geometry.boundingSphere = geometry.boundingBox.getBoundingSphere(new THREE.Sphere());
 
-                                    cloud.geometry.setAttribute('position', new THREE.Float32BufferAttribute(finalPos, 3));
-                                    cloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(finalCol, 3));
+                                        const groundGrid = GroundElevationGrid.fromPrecomputed(result.groundGrid);
+                                        this.groundGrid = groundGrid;
+                                        this.cachedGlobalGroundPlane = result.globalGroundPlane;
 
-                                    if (validNormals) {
-                                        cloud.geometry.setAttribute('normal', new THREE.Float32BufferAttribute(validNormals.subarray(0, validCount * 3), 3));
-                                    }
-                                    if (validIntensities) {
-                                        cloud.geometry.setAttribute('intensity', new THREE.Float32BufferAttribute(validIntensities.subarray(0, validCount), 1));
-                                    }
-                                    if (validLabels) {
-                                        cloud.geometry.setAttribute('label', new THREE.Float32BufferAttribute(validLabels.subarray(0, validCount), 1));
-                                    }
-                                }
+                                        if (frameNumber !== null) {
+                                            if (this.geometryCache.size >= 16) {
+                                                const oldestKey = this.geometryCache.keys().next().value;
+                                                if (oldestKey !== undefined) {
+                                                    const evicted = this.geometryCache.get(oldestKey);
+                                                    this.geometryCache.delete(oldestKey);
+                                                    evicted?.geometry.dispose();
+                                                }
+                                            }
+                                            this.geometryCache.set(frameNumber, {
+                                                geometry,
+                                                groundGrid,
+                                                globalGroundPlane: result.globalGroundPlane,
+                                            });
+                                        }
+
+                                        const material = new THREE.PointsMaterial({ size: 0.05, vertexColors: true });
+                                        const cloud = new THREE.Points(geometry, material);
+                                        onPCDLoadSuccess(cloud, true);
+                                    },
+                                    0.5,
+                                    (buf: ArrayBuffer) => {
+                                        const loader = new PCDLoader();
+                                        const defaultImpl = console.error;
+                                        let parsedCloud: THREE.Points;
+                                        try {
+                                            console.error = () => { };
+                                            parsedCloud = loader.parse(buf) as THREE.Points;
+                                        } finally {
+                                            console.error = defaultImpl;
+                                        }
+                                        const posAttr = parsedCloud.geometry.attributes.position;
+                                        const colAttr = parsedCloud.geometry.attributes.color;
+                                        const normAttr = parsedCloud.geometry.attributes.normal;
+                                        const rawPos = posAttr ? (posAttr.array as Float32Array) : new Float32Array(0);
+                                        const rawCol = colAttr ? (colAttr.array as Float32Array) : null;
+                                        const rawNorm = normAttr ? (normAttr.array as Float32Array) : null;
+                                        const len = rawPos.length;
+                                        const validPositions = new Float32Array(len);
+                                        const validColors = new Float32Array(len);
+                                        const validNormals = rawNorm ? new Float32Array(len) : null;
+                                        let validCount = 0;
+                                        for (let i = 0; i < len; i += 3) {
+                                            const x = rawPos[i];
+                                            const y = rawPos[i + 1];
+                                            const z = rawPos[i + 2];
+                                            if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+                                                const outIdx = validCount * 3;
+                                                validPositions[outIdx] = x;
+                                                validPositions[outIdx + 1] = y;
+                                                validPositions[outIdx + 2] = z;
+                                                if (rawCol && Number.isFinite(rawCol[i])) {
+                                                    validColors[outIdx] = rawCol[i];
+                                                    validColors[outIdx + 1] = rawCol[i + 1];
+                                                    validColors[outIdx + 2] = rawCol[i + 2];
+                                                } else {
+                                                    validColors[outIdx] = 1;
+                                                    validColors[outIdx + 1] = 1;
+                                                    validColors[outIdx + 2] = 1;
+                                                }
+                                                if (validNormals && rawNorm) {
+                                                    validNormals[outIdx] = rawNorm[i];
+                                                    validNormals[outIdx + 1] = rawNorm[i + 1];
+                                                    validNormals[outIdx + 2] = rawNorm[i + 2];
+                                                }
+                                                validCount++;
+                                            }
+                                        }
+                                        return {
+                                            positions: validPositions.subarray(0, validCount * 3),
+                                            colors: validColors.subarray(0, validCount * 3),
+                                            normals: validNormals ? validNormals.subarray(0, validCount * 3) : null,
+                                        };
+                                    },
+                                );
+                            });
+                            const [overlay] = window.document.getElementsByClassName('cvat_3d_canvas_deleted_overlay');
+                            if (overlay) {
+                                overlay.remove();
                             }
-
-                            cloud.geometry.computeBoundingSphere();
-                            onPCDLoadSuccess(cloud);
-                        });
-                        const [overlay] = window.document.getElementsByClassName('cvat_3d_canvas_deleted_overlay');
-                        if (overlay) {
-                            overlay.remove();
                         }
                     }
                 }
@@ -2931,6 +3045,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     private clearScene(): void {
         this.pointCloudPoints = null;
+        this.perfPointCount = 0;
+        this.perfOrthoRoiPoints = 0;
         this.groundGrid = null;
         this.cachedGlobalGroundPlane = null;
         this.groundClippingPlane = null;
@@ -3072,6 +3188,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.pointCloudPoints = points;
         const positions = points?.geometry?.attributes?.position?.array;
         const colors = points?.geometry?.attributes?.color?.array;
+        this.perfPointCount = positions ? Math.floor(positions.length / 3) : 0;
         this.groundGrid = null;
         this.cachedGlobalGroundPlane = null;
         if (positions && positions.length >= 9) {
@@ -3440,6 +3557,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     };
 
     public render(): void {
+        const renderStart = typeof performance !== 'undefined' ? performance.now() : Date.now();
         const delta = this.clock.getDelta();
         const { clientID } = this.model.data.activeElement;
 
@@ -3491,6 +3609,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.needsOrthoRenderCount--;
         }
 
+        let didRenderAnyView = false;
         Object.keys(this.views).forEach((view: string): void => {
             const viewType = this.views[view as keyof Views];
             if (!(viewType.controls && viewType.camera && viewType.rayCaster)) return;
@@ -3522,8 +3641,28 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
             if (shouldRender) {
                 viewType.renderer.render(viewType.scene, viewType.camera);
+                didRenderAnyView = true;
             }
         });
+
+        const renderEnd = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const currentRenderMs = renderEnd - renderStart;
+        if (didRenderAnyView) {
+            this.perfRenderTimeMs = this.perfRenderTimeMs > 0 ?
+                this.perfRenderTimeMs * 0.8 + currentRenderMs * 0.2 :
+                currentRenderMs;
+        }
+        if (delta > 0.001 && delta < 0.5) {
+            const currentFrameMs = delta * 1000;
+            this.perfFrameTimeMs = this.perfFrameTimeMs > 0 ?
+                this.perfFrameTimeMs * 0.85 + currentFrameMs * 0.15 :
+                currentFrameMs;
+            this.perfFps = Math.min(240, Math.round(1000 / Math.max(1, this.perfFrameTimeMs)));
+        }
+        if (this.perfHudEnabled && renderEnd - this.perfHudLastUpdate >= 250) {
+            this.perfHudLastUpdate = renderEnd;
+            this.updatePerformanceHud();
+        }
     }
 
     private adjustPerspectiveCameras(): void {
@@ -3997,6 +4136,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         if (!this.orthoPointsGeometry || !this.pointCloudPoints) return;
         const activeClientID = this.getActiveElement();
         if (activeClientID === null || !(activeClientID in this.drawnObjects)) {
+            this.perfOrthoRoiPoints = 0;
             const posAttr = this.orthoPointsGeometry.getAttribute('position');
             if (posAttr && posAttr.count > 0) {
                 this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
@@ -4038,11 +4178,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 if (this.orthoPointsGeometry !== currentGeo) return;
                 const currentActiveID = this.getActiveElement();
                 if (currentActiveID === null || !(currentActiveID in this.drawnObjects)) {
+                    this.perfOrthoRoiPoints = 0;
                     this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
                     this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
                     this.requestOrthoRender();
                     return;
                 }
+                this.perfOrthoRoiPoints = Math.floor(roiPositions.length / 3);
                 this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(roiPositions, 3));
                 this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(roiColors, 3));
                 this.orthoPointsGeometry.computeBoundingSphere();
@@ -4189,6 +4331,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         if (this.onDocumentMouseUp) {
             window.document.removeEventListener('mouseup', this.onDocumentMouseUp);
             this.onDocumentMouseUp = null;
+        }
+        if (this.perfHudElement) {
+            this.perfHudElement.remove();
+            this.perfHudElement = null;
         }
         try {
             this.clearScene();

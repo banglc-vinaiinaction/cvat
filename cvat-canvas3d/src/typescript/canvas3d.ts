@@ -17,7 +17,7 @@ import {
     MergeData,
 } from './canvas3dModel';
 import {
-    Canvas3dView, Canvas3dViewImpl, ViewsDOM, CameraAction,
+    Canvas3dView, Canvas3dViewImpl, ViewsDOM, CameraAction, Canvas3dPerformanceStats,
 } from './canvas3dView';
 import { Master } from './master';
 
@@ -59,6 +59,8 @@ interface Canvas3d {
         clientID?: number | null,
         onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }>;
+    getPerformanceStats(): Canvas3dPerformanceStats;
+    togglePerformanceHud(enabled?: boolean): boolean;
     group(groupData: GroupData): void;
     merge(mergeData: MergeData): void;
     split(splitData: SplitData): void;
@@ -198,6 +200,14 @@ class Canvas3dImpl implements Canvas3d {
         return this.view.snapTrackToRoad(jobInstance, clientID, onProgress);
     }
 
+    public getPerformanceStats(): Canvas3dPerformanceStats {
+        return this.view.getPerformanceStats();
+    }
+
+    public togglePerformanceHud(enabled?: boolean): boolean {
+        return this.view.togglePerformanceHud(enabled);
+    }
+
     public fit(): void {
         this.model.fit();
     }
@@ -217,4 +227,4 @@ export {
     Canvas3dImpl as Canvas3d, ViewType, MouseInteraction, CameraAction, Mode as CanvasMode,
 };
 
-export type { ViewsDOM };
+export type { ViewsDOM, Canvas3dPerformanceStats };
