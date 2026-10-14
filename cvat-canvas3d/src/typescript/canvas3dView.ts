@@ -24,7 +24,7 @@ import {
     alignEulerToRoadPlane, GroundElevationGrid,
     computeSceneGroundPlane, estimateLocalRoadPlane,
 } from './snapping';
-import { MainSceneWorker, OrthoViewsWorker, areSceneWorkersActive } from './sceneWorkers';
+import { MainSceneWorker, areSceneWorkersActive } from './sceneWorkers';
 import { detectGpuCapabilities, GpuCapabilities } from './gpuDetector';
 
 export interface Canvas3dPerformanceStats {
@@ -39,34 +39,6 @@ export interface Canvas3dPerformanceStats {
     renderingMethod: string;
     mainWorkerActive: boolean;
     orthoWorkerActive: boolean;
-}
-
-let sharedOrthoRenderer: THREE.WebGLRenderer | null = null;
-
-function getSharedOrthoRenderer(gpu: GpuCapabilities): THREE.WebGLRenderer {
-    if (sharedOrthoRenderer) {
-        return sharedOrthoRenderer;
-    }
-
-    let offscreenCanvas: HTMLCanvasElement | OffscreenCanvas | undefined;
-    if (gpu.isDedicatedGpu && gpu.supportsOffscreenCanvas && typeof OffscreenCanvas !== 'undefined') {
-        try {
-            const osc = new OffscreenCanvas(300, 150);
-            (osc as any).style = { width: '', height: '' };
-            offscreenCanvas = osc;
-        } catch {
-            offscreenCanvas = undefined;
-        }
-    }
-
-    sharedOrthoRenderer = new THREE.WebGLRenderer({
-        ...(offscreenCanvas ? { canvas: offscreenCanvas as unknown as HTMLCanvasElement } : {}),
-        antialias: gpu.antialias,
-        powerPreference: 'high-performance',
-        preserveDrawingBuffer: true,
-    });
-    sharedOrthoRenderer.localClippingEnabled = true;
-    return sharedOrthoRenderer;
 }
 
 export interface Canvas3dView {
@@ -189,9 +161,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private controller: Canvas3dController;
     private gpuCapabilities: GpuCapabilities;
     private mainRenderer: THREE.WebGLRenderer;
-    private orthoRenderer: THREE.WebGLRenderer;
     private mainSceneWorker: MainSceneWorker;
-    private orthoViewsWorker: OrthoViewsWorker;
     private onDocumentMouseUp: () => void;
     private views: Views;
     private clock: THREE.Clock;
@@ -231,6 +201,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private pointCloudMeshes: THREE.Points[] = [];
     private hiddenByIsolation: Set<number> = new Set();
     private orthoPointsGeometry: THREE.BufferGeometry | null = null;
+    private orthoRoiSphereUniform: { value: THREE.Vector4 } = { value: new THREE.Vector4(0, 0, 0, 0) };
     private lastRoiCenter: THREE.Vector3 | null = null;
     private scenePlanes: Record<string, THREE.Mesh | null> = {
         [ViewType.TOP]: null,
@@ -254,10 +225,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     public getPerformanceStats(): Canvas3dPerformanceStats {
         const { mainWorkerActive, orthoWorkerActive } = areSceneWorkersActive();
         let gpuTierLabel = 'iGPU';
-        let renderingMethodLabel = 'iGPU Balanced';
+        let renderingMethodLabel = 'iGPU Balanced (4-View WebGL2 + Shader ROI)';
         if (this.gpuCapabilities.tier === 'dgpu') {
             gpuTierLabel = 'dGPU';
-            renderingMethodLabel = 'dGPU Hardware Offscreen + ImageBitmap';
+            renderingMethodLabel = 'dGPU 4-View Direct WebGL2 + Shader ROI';
         } else if (this.gpuCapabilities.tier === 'software') {
             gpuTierLabel = 'Software';
             renderingMethodLabel = 'Software Low-Overhead';
@@ -330,12 +301,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.perfHudElement.style.display = 'block';
         const stats = this.getPerformanceStats();
         const w1 = stats.mainWorkerActive ? 'Active (Singleton)' : 'Standby (Lazy)';
-        const w2 = stats.orthoWorkerActive ? 'Active (Singleton)' : 'Standby (Lazy)';
         this.perfHudElement.textContent = [
             `GPU Tier    : ${stats.gpuTier} (${stats.gpuRenderer})`,
             `Render Mode : ${stats.renderingMethod}`,
-            `Worker 1    : MainSceneWorker  [${w1}]`,
-            `Worker 2    : OrthoViewsWorker [${w2}]`,
+            `Scene Worker: MainSceneWorker [${w1}] | VRAM Cache: ${this.geometryCache.size}/16 frames`,
             `FPS / Frame : ${stats.fps} FPS (${stats.frameTimeMs.toFixed(1)} ms | GPU draw: ${stats.renderTimeMs.toFixed(2)} ms)`,
             `Points      : ${stats.pointCount.toLocaleString()} main | ${stats.orthoRoiPoints.toLocaleString()} ortho ROI | ${stats.cuboidCount} cuboids`,
         ].join('\n');
@@ -1186,6 +1155,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             let positions: ArrayLike<number> | null = null;
             if (f === this.model.data.imageID && this.pointCloudPoints?.geometry?.attributes?.position?.array) {
                 positions = this.pointCloudPoints.geometry.attributes.position.array;
+            } else if (this.geometryCache.has(f)) {
+                positions = this.geometryCache.get(f)!.geometry.attributes.position?.array ?? null;
             } else {
                 try {
                     const frameData = await jobInstance.frames.get(f);
@@ -1393,7 +1364,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         this.gpuCapabilities = detectGpuCapabilities();
         this.mainSceneWorker = new MainSceneWorker();
-        this.orthoViewsWorker = new OrthoViewsWorker();
 
         const perspectiveCanvas = window.document.createElement('canvas');
         perspectiveCanvas.style.width = '100%';
@@ -1415,67 +1385,26 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.mainRenderer.clear();
         };
 
-        this.orthoRenderer = getSharedOrthoRenderer(this.gpuCapabilities);
-
         const createOrthoViewRenderer = (): THREE.WebGLRenderer => {
             const canvas = window.document.createElement('canvas');
             canvas.style.width = '100%';
             canvas.style.height = '100%';
-            const ctx = (
-                this.gpuCapabilities.isDedicatedGpu ?
-                    canvas.getContext('2d', { alpha: false, desynchronized: true }) :
-                    canvas.getContext('2d', { alpha: false })
-            ) || canvas.getContext('2d');
-
-            return {
-                domElement: canvas,
-                setSize: (w: number, h: number, updateStyle: boolean = false) => {
-                    canvas.width = w;
-                    canvas.height = h;
-                    if (updateStyle) {
-                        canvas.style.width = `${w}px`;
-                        canvas.style.height = `${h}px`;
-                    }
-                },
-                render: (scene: THREE.Scene, camera: THREE.Camera) => {
-                    if (!ctx) return;
-                    const w = canvas.width || 300;
-                    const h = canvas.height || 150;
-                    if (w <= 0 || h <= 0) return;
-
-                    const curW = this.orthoRenderer.domElement.width;
-                    const curH = this.orthoRenderer.domElement.height;
-                    const targetW = Math.max(curW, w);
-                    const targetH = Math.max(curH, h);
-
-                    if (curW < targetW || curH < targetH) {
-                        this.orthoRenderer.setSize(targetW, targetH, false);
-                    }
-
-                    this.orthoRenderer.setViewport(0, 0, w, h);
-                    this.orthoRenderer.setScissor(0, 0, w, h);
-                    this.orthoRenderer.setScissorTest(true);
-
-                    this.orthoRenderer.render(scene, camera);
-
-                    ctx.drawImage(
-                        this.orthoRenderer.domElement as unknown as CanvasImageSource,
-                        0,
-                        this.orthoRenderer.domElement.height - h,
-                        w,
-                        h,
-                        0,
-                        0,
-                        w,
-                        h,
-                    );
-                },
-                dispose: () => {
-                    if (ctx) {
-                        ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    }
-                },
-            } as unknown as THREE.WebGLRenderer;
+            const renderer = new THREE.WebGLRenderer({
+                canvas,
+                antialias: this.gpuCapabilities.antialias,
+                powerPreference: 'high-performance',
+            });
+            renderer.localClippingEnabled = true;
+            renderer.setPixelRatio(this.gpuCapabilities.pixelRatio);
+            const origSetSize = renderer.setSize.bind(renderer);
+            renderer.setSize = (w: number, h: number, updateStyle: boolean = false) => {
+                origSetSize(w, h, updateStyle);
+            };
+            renderer.dispose = () => {
+                renderer.renderLists.dispose();
+                renderer.clear();
+            };
+            return renderer;
         };
 
         this.views = {
@@ -2085,6 +2014,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     camera.far = 1000;
                 }
             }
+            camera.updateProjectionMatrix();
         };
 
         const { selectedCuboid } = this;
@@ -2545,6 +2475,27 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return cuboid;
     }
 
+    private resetBottomViewsCamera(targetX?: number, targetY?: number, targetZ?: number): void {
+        const [lx, ly, lz] = this.cameraSettings.perspective.lookAt;
+        const x = typeof targetX === 'number' ? targetX : lx;
+        const y = typeof targetY === 'number' ? targetY : ly;
+        const z = typeof targetZ === 'number' ? targetZ : lz;
+        for (const cameraType of BOTTOM_VIEWS) {
+            const { camera } = this.views[cameraType];
+            if (!camera) continue;
+            camera.position.set(
+                x + this.cameraSettings[cameraType].position[0],
+                y + this.cameraSettings[cameraType].position[1],
+                z + this.cameraSettings[cameraType].position[2],
+            );
+            camera.up.set(...this.cameraSettings[cameraType].up);
+            camera.lookAt(x, y, z);
+            camera.zoom = consts.FOV_DEFAULT;
+            camera.updateProjectionMatrix();
+        }
+        this.updateCameraFrustumPlane();
+    }
+
     private deactivateObject(): void {
         const { shapeOpacity } = this.model.data.configuration;
         if (this.activatedElementID !== null) {
@@ -2557,7 +2508,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 removeRotationHelper(cuboid[view]);
             }
             this.activatedElementID = null;
+            this.resetBottomViewsCamera();
             this.updateOrthoPointCloudROI(true);
+            this.requestOrthoRender(2);
         }
     }
 
@@ -2607,6 +2560,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         states.forEach((state: ObjectState) => {
             const cuboid = this.addCuboid(state);
             this.addSceneChildren(cuboid);
+            ALL_VIEWS.forEach((v: ViewType) => cuboid[v].updateMatrixWorld(true));
             this.drawnObjects[state.clientID] = {
                 cuboid,
                 data: drawnDataFromState(state),
@@ -2627,6 +2581,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 cuboid.setPosition(state.points[0], state.points[1], state.points[2]);
                 cuboid.setScale(state.points[6], state.points[7], state.points[8]);
                 cuboid.setRotation(state.points[3], state.points[4], state.points[5]);
+                ALL_VIEWS.forEach((v: ViewType) => cuboid[v].updateMatrixWorld(true));
             }
 
             if (
@@ -2644,9 +2599,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
             if (outside !== data.outside || hidden !== data.hidden) {
                 cuboid.perspective.visible = !(outside || hidden);
-                cuboid.top.visible = !(outside || hidden);
-                cuboid.side.visible = !(outside || hidden);
-                cuboid.front.visible = !(outside || hidden);
+                if (outside || hidden) {
+                    cuboid.top.visible = false;
+                    cuboid.side.visible = false;
+                    cuboid.front.visible = false;
+                }
             }
 
             if (occluded !== data.occluded) {
@@ -2668,9 +2625,22 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     private setupObjectsIncremental(states: ObjectState[]): void {
         const created = states.filter((state: ObjectState): boolean => !(state.clientID in this.drawnObjects));
-        const updated = states.filter((state: ObjectState): boolean => (
-            state.clientID in this.drawnObjects && this.drawnObjects[state.clientID].data.updated !== state.updated
-        ));
+        const updated = states.filter((state: ObjectState): boolean => {
+            if (!(state.clientID in this.drawnObjects)) return false;
+            const prev = this.drawnObjects[state.clientID].data;
+            return (
+                prev.updated !== state.updated ||
+                prev.outside !== state.outside ||
+                prev.hidden !== state.hidden ||
+                prev.occluded !== state.occluded ||
+                prev.color !== state.color ||
+                prev.labelID !== state.label.id ||
+                prev.groupID !== (state.group?.id || null) ||
+                prev.groupColor !== (state.group?.color || '#ffffff') ||
+                prev.points.length !== state.points.length ||
+                state.points.some((p: number, idx: number) => p !== prev.points[idx])
+            );
+        });
         const deleted = Object.keys(this.drawnObjects).map((key: string): number => +key)
             .filter((clientID: number): boolean => (
                 states.findIndex((state: ObjectState) => state.clientID === clientID) === -1
@@ -2681,6 +2651,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.updateObjects(updated);
         this.deleteObjects(deleted);
         this.activateObject();
+        this.updateSideViewsZoom();
     }
 
     private addSceneChildren(shapeObject: CuboidModel): void {
@@ -2717,7 +2688,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         if (reason === UpdateReasons.IMAGE_CHANGED) {
             this.statesToBeGrouped = [];
-            this.clearScene();
 
             const onPCDLoadSuccess = (points: any, preInitialized: boolean = false): void => {
                 try {
@@ -2731,8 +2701,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
             try {
                 if (model.data.image) {
-                    this.views.perspective.renderer.dispose();
                     if (this.controller.imageIsDeleted) {
+                        this.clearScene();
+                        this.views.perspective.renderer.dispose();
                         try {
                             this.render();
                             const [container] = window.document.getElementsByClassName('cvat-canvas-container');
@@ -2761,6 +2732,20 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                             model.unlockFrameUpdating();
                         }
                     } else {
+                        this.mainSceneWorker.clear();
+                        this.previousCuboids.clear();
+                        if (this.isObjectIsolated) {
+                            this.isObjectIsolated = false;
+                            this.isolatedClientID = null;
+                            this.hiddenByIsolation.forEach((id: number) => {
+                                const obj = this.drawnObjects[id];
+                                if (obj?.cuboid?.perspective && !obj.data.outside && !obj.data.hidden) {
+                                    obj.cuboid.perspective.visible = true;
+                                }
+                            });
+                            this.hiddenByIsolation.clear();
+                        }
+
                         const frameNumber = model.data.imageID;
                         if (frameNumber !== null && this.geometryCache.has(frameNumber)) {
                             const cached = this.geometryCache.get(frameNumber)!;
@@ -2769,7 +2754,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                             this.groundGrid = cached.groundGrid;
                             this.cachedGlobalGroundPlane = cached.globalGroundPlane;
 
-                            const material = new THREE.PointsMaterial({ size: 0.05, vertexColors: true });
+                            const hasColors = Boolean(cached.geometry.getAttribute('color'));
+                            const material = new THREE.PointsMaterial({ size: 0.05, vertexColors: hasColors });
                             const cloud = new THREE.Points(cached.geometry, material);
                             const [overlay] = window.document.getElementsByClassName('cvat_3d_canvas_deleted_overlay');
                             if (overlay) {
@@ -2783,7 +2769,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                     (result) => {
                                         const geometry = new THREE.BufferGeometry();
                                         geometry.setAttribute('position', new THREE.Float32BufferAttribute(result.positions, 3));
-                                        geometry.setAttribute('color', new THREE.Float32BufferAttribute(result.colors, 3));
+                                        if (result.colors) {
+                                            geometry.setAttribute('color', new THREE.Float32BufferAttribute(result.colors, 3));
+                                        }
                                         if (result.normals) {
                                             geometry.setAttribute('normal', new THREE.Float32BufferAttribute(result.normals, 3));
                                         }
@@ -2815,7 +2803,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                             });
                                         }
 
-                                        const material = new THREE.PointsMaterial({ size: 0.05, vertexColors: true });
+                                        const material = new THREE.PointsMaterial({
+                                            size: 0.05,
+                                            vertexColors: Boolean(result.colors),
+                                        });
                                         const cloud = new THREE.Points(geometry, material);
                                         onPCDLoadSuccess(cloud, true);
                                     },
@@ -2838,7 +2829,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                         const rawNorm = normAttr ? (normAttr.array as Float32Array) : null;
                                         const len = rawPos.length;
                                         const validPositions = new Float32Array(len);
-                                        const validColors = new Float32Array(len);
+                                        const validColors = rawCol ? new Float32Array(len) : null;
                                         const validNormals = rawNorm ? new Float32Array(len) : null;
                                         let validCount = 0;
                                         for (let i = 0; i < len; i += 3) {
@@ -2850,14 +2841,16 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                                 validPositions[outIdx] = x;
                                                 validPositions[outIdx + 1] = y;
                                                 validPositions[outIdx + 2] = z;
-                                                if (rawCol && Number.isFinite(rawCol[i])) {
-                                                    validColors[outIdx] = rawCol[i];
-                                                    validColors[outIdx + 1] = rawCol[i + 1];
-                                                    validColors[outIdx + 2] = rawCol[i + 2];
-                                                } else {
-                                                    validColors[outIdx] = 1;
-                                                    validColors[outIdx + 1] = 1;
-                                                    validColors[outIdx + 2] = 1;
+                                                if (validColors && rawCol) {
+                                                    if (Number.isFinite(rawCol[i])) {
+                                                        validColors[outIdx] = rawCol[i];
+                                                        validColors[outIdx + 1] = rawCol[i + 1];
+                                                        validColors[outIdx + 2] = rawCol[i + 2];
+                                                    } else {
+                                                        validColors[outIdx] = 1;
+                                                        validColors[outIdx + 1] = 1;
+                                                        validColors[outIdx + 2] = 1;
+                                                    }
                                                 }
                                                 if (validNormals && rawNorm) {
                                                     validNormals[outIdx] = rawNorm[i];
@@ -2869,7 +2862,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                         }
                                         return {
                                             positions: validPositions.subarray(0, validCount * 3),
-                                            colors: validColors.subarray(0, validCount * 3),
+                                            colors: validColors ? validColors.subarray(0, validCount * 3) : null,
                                             normals: validNormals ? validNormals.subarray(0, validCount * 3) : null,
                                         };
                                     },
@@ -2881,6 +2874,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                             }
                         }
                     }
+                } else {
+                    this.clearScene();
                 }
             } catch (error: any) {
                 model.unlockFrameUpdating();
@@ -3044,6 +3039,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     private clearScene(): void {
+        const previousPoints = this.pointCloudPoints;
+        const previousMeshes = this.pointCloudMeshes;
+        const previousOrthoGeo = this.orthoPointsGeometry;
         this.pointCloudPoints = null;
         this.perfPointCount = 0;
         this.perfOrthoRoiPoints = 0;
@@ -3051,13 +3049,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.cachedGlobalGroundPlane = null;
         this.groundClippingPlane = null;
         this.mainSceneWorker.clear();
-        this.orthoViewsWorker.clear();
         this.previousCuboids.clear();
         this.isObjectIsolated = false;
         this.isolatedClientID = null;
         this.hiddenByIsolation.clear();
         this.pointCloudMeshes = [];
         this.orthoPointsGeometry = null;
+        this.orthoRoiSphereUniform.value.set(0, 0, 0, 0);
         this.lastRoiCenter = null;
         this.scenePlanes = {
             [ViewType.TOP]: null,
@@ -3070,6 +3068,30 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         this.drawnObjects = {};
         this.activatedElementID = null;
+
+        // Detach pointCloudMeshes before disposeScene so cached BufferGeometry
+        // in this.geometryCache stays resident in GPU VRAM across frame navigation.
+        if (previousPoints) {
+            while (previousPoints.children.length > 0) {
+                const child = previousPoints.children[0];
+                previousPoints.remove(child);
+            }
+            this.views.perspective.scene.remove(previousPoints);
+            if (previousPoints.material instanceof THREE.Material) {
+                previousPoints.material.dispose();
+            }
+        }
+        for (const mesh of previousMeshes) {
+            if (mesh && mesh !== previousPoints) {
+                mesh.parent?.remove(mesh);
+                if (mesh.material instanceof THREE.Material) {
+                    mesh.material.dispose();
+                }
+            }
+        }
+        if (previousOrthoGeo && previousOrthoGeo !== previousPoints?.geometry) {
+            previousOrthoGeo.dispose();
+        }
 
         Object.keys(this.views).forEach((view: string): void => {
             const viewData = this.views[view as keyof Views];
@@ -3184,17 +3206,18 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return this.groundGrid;
     }
 
-    private onSceneImageLoaded(points: any): void {
-        this.pointCloudPoints = points;
-        const positions = points?.geometry?.attributes?.position?.array;
-        const colors = points?.geometry?.attributes?.color?.array;
+    private onSceneImageLoaded(points: any, preInitialized: boolean = false): void {
+        const newGeo: THREE.BufferGeometry = points.geometry;
+        const positions = newGeo?.attributes?.position?.array;
         this.perfPointCount = positions ? Math.floor(positions.length / 3) : 0;
-        this.groundGrid = null;
-        this.cachedGlobalGroundPlane = null;
-        if (positions && positions.length >= 9) {
-            this.orthoViewsWorker.initPoints(positions, colors);
+        if (!preInitialized) {
+            this.groundGrid = null;
+            this.cachedGlobalGroundPlane = null;
+        }
+        if (positions && positions.length >= 9 && !preInitialized) {
+            const expectedGeo = newGeo;
             this.mainSceneWorker.initScene(positions, (res) => {
-                if (this.pointCloudPoints !== points) return;
+                if (this.pointCloudPoints?.geometry !== expectedGeo) return;
                 this.groundGrid = GroundElevationGrid.fromPrecomputed(res.groundGrid);
                 this.cachedGlobalGroundPlane = res.globalGroundPlane;
             });
@@ -3237,124 +3260,180 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             };
         };
 
-        // eslint-disable-next-line no-param-reassign
-        points.material.size = 0.05;
-        points.material.color.set(new THREE.Color(0xffffff));
-
         const { controls } = this.views.perspective;
         controls.mouseButtons.wheel = CameraControls.ACTION.DOLLY;
-
-        const material = points.material.clone();
         if (!this.views.perspective.camera) return;
 
-        // updating correct camera settings
-        points.geometry.computeBoundingBox();
+        if (!newGeo.boundingBox) {
+            newGeo.computeBoundingBox();
+        }
         const { position, lookAt } = getCameraSettingsToFitScene(
-            this.views.perspective.camera as THREE.PerspectiveCamera, points.geometry.boundingBox,
+            this.views.perspective.camera as THREE.PerspectiveCamera, newGeo.boundingBox,
         );
 
         this.cameraSettings.perspective.position = position;
-        this.sceneBBox = points.geometry.boundingBox ?
-            points.geometry.boundingBox.clone() :
+        this.sceneBBox = newGeo.boundingBox ?
+            newGeo.boundingBox.clone() :
             new THREE.Box3().setFromObject(points);
-        this.views.perspective.scene.add(points);
 
         const origin = new THREE.Vector3(0, 0, 0);
         const isOriginInScene = this.sceneBBox.containsPoint(origin);
-        const axesHelper = new THREE.AxesHelper(5);
         if (isOriginInScene) {
             this.cameraSettings.perspective.lookAt = [0, 0, 0];
-            axesHelper.position.set(0, 0, 0);
         } else {
             this.cameraSettings.perspective.lookAt = lookAt;
-            axesHelper.position.set(lookAt[0], lookAt[1], lookAt[2]);
         }
 
-        this.views.perspective.scene.add(axesHelper);
-        // Setup TopView
-        const canvasTopView = this.views.top.renderer.domElement;
-        const topScenePlane = new THREE.Mesh(
-            new THREE.PlaneGeometry(
-                Math.max(canvasTopView.offsetHeight, 1000),
-                Math.max(canvasTopView.offsetWidth, 1000),
-                1,
-                1,
-            ),
-            new THREE.MeshBasicMaterial({
-                color: 0xffffff,
-                visible: false,
-            }),
-        );
-        topScenePlane.position.set(0, 0, 0);
-        topScenePlane.name = Planes.TOP;
-        (topScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
-        (topScenePlane as any).verticesNeedUpdate = true;
-        this.scenePlanes[ViewType.TOP] = topScenePlane;
+        const hasColors = Boolean(newGeo.getAttribute('color'));
+        if (this.pointCloudMeshes.length === 4 && this.views.perspective.scene.children.length > 0) {
+            const mainPoints = this.pointCloudMeshes[0];
+            if (points !== mainPoints && points.material instanceof THREE.Material) {
+                points.material.dispose();
+            }
+            this.pointCloudPoints = mainPoints;
+            this.orthoPointsGeometry = newGeo;
+            this.lastRoiCenter = null;
+            this.orthoRoiSphereUniform.value.set(0, 0, 0, 0);
 
-        // Dedicated compact geometry for orthographic views (populated with ROI points by OrthoViewsWorker)
-        const orthoGeo = new THREE.BufferGeometry();
-        orthoGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
-        orthoGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
-        this.orthoPointsGeometry = orthoGeo;
-        this.lastRoiCenter = null;
+            for (const mesh of this.pointCloudMeshes) {
+                mesh.geometry = newGeo;
+                const mat = mesh.material as THREE.PointsMaterial;
+                if (mat && mat.vertexColors !== hasColors) {
+                    mat.vertexColors = hasColors;
+                    mat.needsUpdate = true;
+                }
+            }
 
-        material.size = 0.5;
-        const topCloud = new THREE.Points(orthoGeo, material);
-        this.views.top.scene.add(topCloud);
-        this.views.top.scene.add(topScenePlane);
+            const existingAxes = this.views.perspective.scene.children.find(
+                (child: THREE.Object3D) => child instanceof THREE.AxesHelper,
+            );
+            if (existingAxes) {
+                if (isOriginInScene) {
+                    existingAxes.position.set(0, 0, 0);
+                } else {
+                    existingAxes.position.set(lookAt[0], lookAt[1], lookAt[2]);
+                }
+            }
+        } else {
+            this.pointCloudPoints = points;
+            // eslint-disable-next-line no-param-reassign
+            points.material.size = 0.05;
+            // eslint-disable-next-line no-param-reassign
+            points.material.vertexColors = hasColors;
+            points.material.color.set(new THREE.Color(0xffffff));
 
-        // Setup Side View
-        const canvasSideView = this.views.side.renderer.domElement;
-        const sideScenePlane = new THREE.Mesh(
-            new THREE.PlaneGeometry(
-                Math.max(canvasSideView.offsetHeight, 1000),
-                Math.max(canvasSideView.offsetWidth, 1000),
-                1,
-                1,
-            ),
-            new THREE.MeshBasicMaterial({
-                color: 0x00ff00,
-                visible: false,
-                opacity: 0.5,
-            }),
-        );
-        sideScenePlane.position.set(0, 0, 0);
-        sideScenePlane.rotation.set(0, 0, 0);
-        sideScenePlane.name = Planes.SIDE;
-        (sideScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
-        (sideScenePlane as any).verticesNeedUpdate = true;
-        this.scenePlanes[ViewType.SIDE] = sideScenePlane;
+            const material = points.material.clone();
+            this.views.perspective.scene.add(points);
 
-        const sideCloud = new THREE.Points(orthoGeo, material);
-        this.views.side.scene.add(sideCloud);
-        this.views.side.scene.add(sideScenePlane);
+            const axesHelper = new THREE.AxesHelper(5);
+            if (isOriginInScene) {
+                axesHelper.position.set(0, 0, 0);
+            } else {
+                axesHelper.position.set(lookAt[0], lookAt[1], lookAt[2]);
+            }
+            this.views.perspective.scene.add(axesHelper);
 
-        // Setup front View
-        const canvasFrontView = this.views.front.renderer.domElement;
-        const frontScenePlane = new THREE.Mesh(
-            new THREE.PlaneGeometry(
-                Math.max(canvasFrontView.offsetHeight, 1000),
-                Math.max(canvasFrontView.offsetWidth, 1000),
-                1,
-                1,
-            ),
-            new THREE.MeshBasicMaterial({
-                color: 0xffffff,
-                visible: false,
-            }),
-        );
-        frontScenePlane.position.set(0, 0, 0);
-        frontScenePlane.rotation.set(0, 0, 0);
-        frontScenePlane.name = Planes.FRONT;
-        (frontScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
-        (frontScenePlane as any).verticesNeedUpdate = true;
-        this.scenePlanes[ViewType.FRONT] = frontScenePlane;
+            // Setup TopView
+            const canvasTopView = this.views.top.renderer.domElement;
+            const topScenePlane = new THREE.Mesh(
+                new THREE.PlaneGeometry(
+                    Math.max(canvasTopView.offsetHeight, 1000),
+                    Math.max(canvasTopView.offsetWidth, 1000),
+                    1,
+                    1,
+                ),
+                new THREE.MeshBasicMaterial({
+                    color: 0xffffff,
+                    visible: false,
+                }),
+            );
+            topScenePlane.position.set(0, 0, 0);
+            topScenePlane.name = Planes.TOP;
+            (topScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
+            (topScenePlane as any).verticesNeedUpdate = true;
+            this.scenePlanes[ViewType.TOP] = topScenePlane;
 
-        const frontCloud = new THREE.Points(orthoGeo, material);
-        this.views.front.scene.add(frontCloud);
-        this.views.front.scene.add(frontScenePlane);
+            const orthoGeo: THREE.BufferGeometry = newGeo;
+            this.orthoRoiSphereUniform.value.set(0, 0, 0, 0);
+            const createOrthoMaterial = (): THREE.PointsMaterial => {
+                const mat = material.clone();
+                mat.size = 0.5;
+                mat.onBeforeCompile = (shader: any) => {
+                    // eslint-disable-next-line no-param-reassign
+                    shader.uniforms.uOrthoRoiSphere = this.orthoRoiSphereUniform;
+                    // eslint-disable-next-line no-param-reassign
+                    shader.vertexShader = `uniform vec4 uOrthoRoiSphere;\n${shader.vertexShader}`.replace(
+                        '#include <project_vertex>',
+                        `#include <project_vertex>
+                        if (uOrthoRoiSphere.w > 0.0 && distance(transformed, uOrthoRoiSphere.xyz) > uOrthoRoiSphere.w) {
+                            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                            gl_PointSize = 0.0;
+                        }`,
+                    );
+                };
+                return mat;
+            };
+            this.orthoPointsGeometry = orthoGeo;
+            this.lastRoiCenter = null;
 
-        this.pointCloudMeshes = [points, topCloud, sideCloud, frontCloud];
+            const topCloud = new THREE.Points(orthoGeo, createOrthoMaterial());
+            this.views.top.scene.add(topCloud);
+            this.views.top.scene.add(topScenePlane);
+
+            // Setup Side View
+            const canvasSideView = this.views.side.renderer.domElement;
+            const sideScenePlane = new THREE.Mesh(
+                new THREE.PlaneGeometry(
+                    Math.max(canvasSideView.offsetHeight, 1000),
+                    Math.max(canvasSideView.offsetWidth, 1000),
+                    1,
+                    1,
+                ),
+                new THREE.MeshBasicMaterial({
+                    color: 0x00ff00,
+                    visible: false,
+                    opacity: 0.5,
+                }),
+            );
+            sideScenePlane.position.set(0, 0, 0);
+            sideScenePlane.rotation.set(0, 0, 0);
+            sideScenePlane.name = Planes.SIDE;
+            (sideScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
+            (sideScenePlane as any).verticesNeedUpdate = true;
+            this.scenePlanes[ViewType.SIDE] = sideScenePlane;
+
+            const sideCloud = new THREE.Points(orthoGeo, createOrthoMaterial());
+            this.views.side.scene.add(sideCloud);
+            this.views.side.scene.add(sideScenePlane);
+
+            // Setup front View
+            const canvasFrontView = this.views.front.renderer.domElement;
+            const frontScenePlane = new THREE.Mesh(
+                new THREE.PlaneGeometry(
+                    Math.max(canvasFrontView.offsetHeight, 1000),
+                    Math.max(canvasFrontView.offsetWidth, 1000),
+                    1,
+                    1,
+                ),
+                new THREE.MeshBasicMaterial({
+                    color: 0xffffff,
+                    visible: false,
+                }),
+            );
+            frontScenePlane.position.set(0, 0, 0);
+            frontScenePlane.rotation.set(0, 0, 0);
+            frontScenePlane.name = Planes.FRONT;
+            (frontScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
+            (frontScenePlane as any).verticesNeedUpdate = true;
+            this.scenePlanes[ViewType.FRONT] = frontScenePlane;
+
+            const frontCloud = new THREE.Points(orthoGeo, createOrthoMaterial());
+            this.views.front.scene.add(frontCloud);
+            this.views.front.scene.add(frontScenePlane);
+
+            this.pointCloudMeshes = [points, topCloud, sideCloud, frontCloud];
+        }
+
         if (this.isGroundStripped) {
             const planeEq = this.getGroundPlane();
             let [A, B, C, D] = planeEq;
@@ -3378,10 +3457,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
             this.groundClippingPlane = new THREE.Plane(new THREE.Vector3(A, B, C), D - this.groundStrippingOffset);
         }
+        if (this.getActiveElement() === null) {
+            this.resetBottomViewsCamera();
+        }
         this.updateClippingPlanes();
         this.updateOrthoPointCloudROI(true);
 
-        if (this.mode === Mode.DRAW) {
+        if (this.mode === Mode.DRAW && !this.views[ViewType.PERSPECTIVE].scene.children[0].children.includes(this.cube.perspective)) {
             this.views[ViewType.PERSPECTIVE].scene.children[0].add(this.cube.perspective);
         }
         this.requestRender();
@@ -3401,16 +3483,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 x, y, z, animation,
             );
 
-            for (const cameraType of BOTTOM_VIEWS) {
-                const { camera } = this.views[cameraType];
-                camera.position.set(
-                    x + this.cameraSettings[cameraType].position[0],
-                    y + this.cameraSettings[cameraType].position[1],
-                    z + this.cameraSettings[cameraType].position[2],
-                );
-                camera.lookAt(x, y, z);
-                camera.zoom = consts.FOV_DEFAULT;
-            }
+            this.resetBottomViewsCamera(x, y, z);
         }
     }
 
@@ -3604,7 +3677,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.needsPerspectiveRenderCount--;
         }
 
-        const forceRenderOrtho = this.needsOrthoRenderCount > 0;
+        const initialForceOrtho = this.needsOrthoRenderCount > 0;
         if (this.needsOrthoRenderCount > 0) {
             this.needsOrthoRenderCount--;
         }
@@ -3618,6 +3691,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             let controlsUpdated = false;
             if (viewType.controls.enabled) {
                 controlsUpdated = viewType.controls.update(delta);
+            } else {
+                viewType.camera.updateProjectionMatrix();
             }
 
             const isPerspective = view === ViewType.PERSPECTIVE;
@@ -3628,7 +3703,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
             let shouldRender = isPerspective ?
                 (forceRenderPerspective || resized || controlsUpdated || needsPerspectiveInteraction) :
-                (forceRenderOrtho || resized || controlsUpdated || isScanningView);
+                (initialForceOrtho || this.needsOrthoRenderCount > 0 || resized || controlsUpdated || isScanningView);
 
             if (isPerspective && viewType.scene.children.length !== 0) {
                 if (!this.isPerspectiveBeingDragged && (this.hoverNeedsUpdate || (this.mode === Mode.DRAW && shouldRender))) {
@@ -4136,11 +4211,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         if (!this.orthoPointsGeometry || !this.pointCloudPoints) return;
         const activeClientID = this.getActiveElement();
         if (activeClientID === null || !(activeClientID in this.drawnObjects)) {
-            this.perfOrthoRoiPoints = 0;
-            const posAttr = this.orthoPointsGeometry.getAttribute('position');
-            if (posAttr && posAttr.count > 0) {
-                this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
-                this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
+            this.perfOrthoRoiPoints = this.perfPointCount;
+            if (this.orthoRoiSphereUniform.value.w !== 0) {
+                this.orthoRoiSphereUniform.value.set(0, 0, 0, 0);
                 this.lastRoiCenter = null;
                 this.requestOrthoRender();
             }
@@ -4155,11 +4228,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         if (!force && this.lastRoiCenter) {
             const distSq = pos.distanceToSquared(this.lastRoiCenter);
-            if (distSq < 0.64) return;
+            if (distSq < 0.04) return;
         }
-
-        const positions = this.pointCloudPoints.geometry?.attributes?.position?.array;
-        if (!positions || positions.length === 0) return;
 
         const cx = pos.x;
         const cy = pos.y;
@@ -4168,30 +4238,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const radius = maxDim / 2 + this.gpuCapabilities.orthoRoiRadiusPadding;
 
         this.lastRoiCenter = pos.clone();
-        const currentGeo = this.orthoPointsGeometry;
-        this.orthoViewsWorker.computeROI(
-            cx,
-            cy,
-            cz,
-            radius,
-            ({ positions: roiPositions, colors: roiColors }) => {
-                if (this.orthoPointsGeometry !== currentGeo) return;
-                const currentActiveID = this.getActiveElement();
-                if (currentActiveID === null || !(currentActiveID in this.drawnObjects)) {
-                    this.perfOrthoRoiPoints = 0;
-                    this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
-                    this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
-                    this.requestOrthoRender();
-                    return;
-                }
-                this.perfOrthoRoiPoints = Math.floor(roiPositions.length / 3);
-                this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(roiPositions, 3));
-                this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(roiColors, 3));
-                this.orthoPointsGeometry.computeBoundingSphere();
-                this.requestOrthoRender();
-            },
-            this.gpuCapabilities.orthoMaxPoints,
-        );
+        this.orthoRoiSphereUniform.value.set(cx, cy, cz, radius);
+        this.perfOrthoRoiPoints = this.perfPointCount;
+        this.requestOrthoRender();
     }
 
     public keyControls(key: any): void {
@@ -4341,6 +4390,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         } catch (_) {
             // ignore
         }
+        this.geometryCache.forEach((entry) => {
+            entry.geometry.dispose();
+        });
+        this.geometryCache.clear();
         Object.values(this.views).forEach((view) => {
             view.controls?.dispose();
         });
