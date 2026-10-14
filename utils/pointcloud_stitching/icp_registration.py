@@ -78,24 +78,25 @@ class FastICPRegistration:
             refined_transform: (4, 4) ma trận SE(3) đã được vi chỉnh
             rmse: sai số Root-Mean-Square Error cuối cùng
         """
-        src_xyz = source_points[:, :3].astype(np.float64)
-        tgt_xyz = target_points[:, :3].astype(np.float64)
+        src_xyz = np.ascontiguousarray(source_points[:, :3], dtype=np.float64)
+        tgt_xyz = np.ascontiguousarray(target_points[:, :3], dtype=np.float64)
 
-        # Lấy mẫu ngẫu nhiên nếu số điểm quá lớn để đạt hiệu năng cao
+        # Lấy mẫu đều bảo toàn tính cục bộ không gian (spatial locality) để tăng tốc KDTree
         if len(src_xyz) > self.subsample_size:
-            idx = np.random.choice(len(src_xyz), self.subsample_size, replace=False)
-            src_sample = src_xyz[idx]
+            idx = np.linspace(0, len(src_xyz) - 1, self.subsample_size, dtype=np.intp)
+            src_sample = np.ascontiguousarray(src_xyz[idx])
         else:
             src_sample = src_xyz
 
-        if len(tgt_xyz) > self.subsample_size * 2:
-            idx_tgt = np.random.choice(len(tgt_xyz), self.subsample_size * 2, replace=False)
-            tgt_sample = tgt_xyz[idx_tgt]
+        max_tgt = self.subsample_size * 2
+        if len(tgt_xyz) > max_tgt:
+            idx_tgt = np.linspace(0, len(tgt_xyz) - 1, max_tgt, dtype=np.intp)
+            tgt_sample = np.ascontiguousarray(tgt_xyz[idx_tgt])
         else:
             tgt_sample = tgt_xyz
 
         # Xây dựng KD-Tree trên điểm target
-        target_kdtree = cKDTree(tgt_sample)
+        target_kdtree = cKDTree(tgt_sample, leafsize=32, compact_nodes=True, balanced_tree=False)
 
         # Khởi tạo ma trận biến đổi tích lũy
         current_transform = np.copy(init_transform) if init_transform is not None else np.eye(4, dtype=np.float64)
@@ -104,9 +105,8 @@ class FastICPRegistration:
         rmse = float('inf')
 
         for it in range(self.max_iterations):
-            # Biến đổi source theo ma trận hiện tại
-            homo = np.hstack([src_sample, np.ones((len(src_sample), 1))])
-            transformed_src = (current_transform @ homo.T).T[:, :3]
+            # Biến đổi source theo ma trận hiện tại (không cần cấp phát mảng homogeneous mỗi vòng lặp)
+            transformed_src = src_sample @ current_transform[:3, :3].T + current_transform[:3, 3]
 
             # Tìm điểm gần nhất trong target KD-Tree
             distances, indices = target_kdtree.query(transformed_src, k=1, workers=-1)

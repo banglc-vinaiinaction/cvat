@@ -230,6 +230,11 @@ function srgbToLinear(c) {
     return (c < 0.04045) ? c * 0.0773993808 : Math.pow(c * 0.9478672986 + 0.0521327014, 2.4);
 }
 
+const SRGB_TO_LINEAR_LUT = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+    SRGB_TO_LINEAR_LUT[i] = srgbToLinear(i / 255.0);
+}
+
 function decompressLZF(inData, outLength) {
     const inLength = inData.length;
     const outData = new Uint8Array(outLength);
@@ -439,12 +444,9 @@ function parsePCDInWorker(buffer) {
                     farr[0] = flt;
                     rgb = iarr[0];
                 }
-                const r = ((rgb >> 16) & 0x0000ff) / 255.0;
-                const g = ((rgb >> 8) & 0x0000ff) / 255.0;
-                const b = (rgb & 0x0000ff) / 255.0;
-                rawColors[outIdx] = srgbToLinear(r);
-                rawColors[outIdx + 1] = srgbToLinear(g);
-                rawColors[outIdx + 2] = srgbToLinear(b);
+                rawColors[outIdx] = SRGB_TO_LINEAR_LUT[(rgb >> 16) & 0xff];
+                rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[(rgb >> 8) & 0xff];
+                rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[rgb & 0xff];
             }
 
             if (hasNormal && rawNormals) {
@@ -506,12 +508,9 @@ function parsePCDInWorker(buffer) {
 
             if (hasRGB) {
                 const rgbOff = rgbBase + rgbSize * i;
-                const r = dataview.getUint8(rgbOff + 2) / 255.0;
-                const g = dataview.getUint8(rgbOff + 1) / 255.0;
-                const b = dataview.getUint8(rgbOff + 0) / 255.0;
-                rawColors[outIdx] = srgbToLinear(r);
-                rawColors[outIdx + 1] = srgbToLinear(g);
-                rawColors[outIdx + 2] = srgbToLinear(b);
+                rawColors[outIdx] = SRGB_TO_LINEAR_LUT[dataview.getUint8(rgbOff + 2)];
+                rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[dataview.getUint8(rgbOff + 1)];
+                rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[dataview.getUint8(rgbOff + 0)];
             }
 
             if (hasNormal && rawNormals) {
@@ -564,12 +563,9 @@ function parsePCDInWorker(buffer) {
             if (pz > maxZ) maxZ = pz;
 
             if (hasRGB) {
-                const r = dataview.getUint8(row + offRGB + 2) / 255.0;
-                const g = dataview.getUint8(row + offRGB + 1) / 255.0;
-                const b = dataview.getUint8(row + offRGB + 0) / 255.0;
-                rawColors[outIdx] = srgbToLinear(r);
-                rawColors[outIdx + 1] = srgbToLinear(g);
-                rawColors[outIdx + 2] = srgbToLinear(b);
+                rawColors[outIdx] = SRGB_TO_LINEAR_LUT[dataview.getUint8(row + offRGB + 2)];
+                rawColors[outIdx + 1] = SRGB_TO_LINEAR_LUT[dataview.getUint8(row + offRGB + 1)];
+                rawColors[outIdx + 2] = SRGB_TO_LINEAR_LUT[dataview.getUint8(row + offRGB + 0)];
             }
 
             if (hasNormal && rawNormals) {
@@ -678,17 +674,19 @@ function buildSceneDataFromPositions(positions, requestedCellSize, preBBox) {
         rows = Math.ceil(height / effectiveCellSize) + 1;
     }
 
+    const invCellSize = 1.0 / effectiveCellSize;
     const grid = new Float32Array(cols * rows);
     grid.fill(Infinity);
 
     for (let i = 0; i < totalPoints; i++) {
-        const px = positions[i * 3];
-        const py = positions[i * 3 + 1];
-        const pz = positions[i * 3 + 2];
-        if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) continue;
+        const i3 = i * 3;
+        const px = positions[i3];
+        const py = positions[i3 + 1];
+        const pz = positions[i3 + 2];
+        if (!preBBox && (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz))) continue;
 
-        const col = Math.floor((px - minX) / effectiveCellSize);
-        const row = Math.floor((py - minY) / effectiveCellSize);
+        const col = Math.floor((px - minX) * invCellSize);
+        const row = Math.floor((py - minY) * invCellSize);
         if (col >= 0 && col < cols && row >= 0 && row < rows) {
             const idx = row * cols + col;
             if (pz < grid[idx]) {

@@ -366,16 +366,12 @@ export function alignYawWithPoints(
     let meanU = 0;
     let meanV = 0;
     const N = pts2D.length;
-    const localPts: [number, number][] = new Array(N);
 
     for (let i = 0; i < N; i++) {
         const px = pts2D[i][0];
         const py = pts2D[i][1];
-        const u = px * cosY + py * sinY;
-        const v = -px * sinY + py * cosY;
-        meanU += u;
-        meanV += v;
-        localPts[i] = [u, v];
+        meanU += px * cosY + py * sinY;
+        meanV += -px * sinY + py * cosY;
     }
     meanU /= N;
     meanV /= N;
@@ -384,11 +380,13 @@ export function alignYawWithPoints(
     let cuv = 0;
     let cvv = 0;
     for (let i = 0; i < N; i++) {
-        const du = localPts[i][0] - meanU;
-        const dv = localPts[i][1] - meanV;
+        const px = pts2D[i][0];
+        const py = pts2D[i][1];
+        const du = (px * cosY + py * sinY) - meanU;
+        const dv = (-px * sinY + py * cosY) - meanV;
         cuu += du * du;
         cuv += du * dv;
-        cvv += du * dv;
+        cvv += dv * dv;
     }
 
     // Guard against partial returns: If variance along length (cuu) is not significantly
@@ -450,6 +448,7 @@ export function snapCuboidToRoadAndOrient(
     const bottomZ = cz - dz / 2;
     const totalPoints = Math.floor(pointCloudPositions.length / 3);
     const radius = Math.max(3.0, Math.sqrt((dx / 2) ** 2 + (dy / 2) ** 2) + 2.5);
+    const r2 = radius * radius;
 
     const cosRz = Math.cos(rz);
     const sinRz = Math.sin(rz);
@@ -461,26 +460,28 @@ export function snapCuboidToRoadAndOrient(
     const zMin = Math.min(bottomZ - 5.0, cz - 6.0);
     const zMax = Math.max(cz + dz / 2 + 2.0, bottomZ + dz + 2.0);
     const zMaxGround = Math.max(bottomZ + 0.60, cz + dz * 0.25);
+    const halfDxPad = dx / 2 + 0.10;
+    const halfDyPad = dy / 2 + 0.10;
 
     for (let i = 0; i < totalPoints; i++) {
-        const px = pointCloudPositions[i * 3];
-        const py = pointCloudPositions[i * 3 + 1];
-        const pz = pointCloudPositions[i * 3 + 2];
+        const i3 = i * 3;
+        const distX = pointCloudPositions[i3] - cx;
+        if (distX > radius || distX < -radius) continue;
+        const distY = pointCloudPositions[i3 + 1] - cy;
+        if (distY > radius || distY < -radius) continue;
+        const pz = pointCloudPositions[i3 + 2];
+        if (pz < zMin || pz > zMax) continue;
 
-        const distX = px - cx;
-        const distY = py - cy;
-        if (distX * distX + distY * distY <= radius * radius) {
-            if (pz >= zMin && pz <= zMax) {
-                localIndices.push(i);
+        if (distX * distX + distY * distY <= r2) {
+            localIndices.push(i);
 
-                // Check distance outside vehicle footprint to exclude wheels/body
-                const u = distX * cosRz + distY * sinRz;
-                const v = -distX * sinRz + distY * cosRz;
-                const isOutsideVehicle = Math.abs(u) > dx / 2 + 0.10 || Math.abs(v) > dy / 2 + 0.10;
+            // Check distance outside vehicle footprint to exclude wheels/body
+            const u = distX * cosRz + distY * sinRz;
+            const v = -distX * sinRz + distY * cosRz;
+            const isOutsideVehicle = Math.abs(u) > halfDxPad || Math.abs(v) > halfDyPad;
 
-                if (isOutsideVehicle && pz <= zMaxGround) {
-                    groundCandidateIndices.push(i);
-                }
+            if (isOutsideVehicle && pz <= zMaxGround) {
+                groundCandidateIndices.push(i);
             }
         }
     }
@@ -721,12 +722,18 @@ export function snapCuboidToRoadAndOrient(
             for (let b = 0; b < numBinsX; b++) {
                 const xMin = -halfL + b * stepX - 0.10;
                 const xMax = -halfL + (b + 1) * stepX + 0.10;
-                const ptsInBin = surfacePts.filter((pt) => pt.u >= xMin && pt.u <= xMax);
-                if (ptsInBin.length >= 2) {
-                    let sumZ = 0;
-                    for (let i = 0; i < ptsInBin.length; i++) sumZ += ptsInBin[i].z;
+                let sumZ = 0;
+                let count = 0;
+                for (let i = 0; i < surfacePts.length; i++) {
+                    const pt = surfacePts[i];
+                    if (pt.u >= xMin && pt.u <= xMax) {
+                        sumZ += pt.z;
+                        count++;
+                    }
+                }
+                if (count >= 2) {
                     binCentersX.push(-halfL + (b + 0.5) * stepX);
-                    binAvgZX.push(sumZ / ptsInBin.length);
+                    binAvgZX.push(sumZ / count);
                 }
             }
 
@@ -739,12 +746,18 @@ export function snapCuboidToRoadAndOrient(
             for (let b = 0; b < numBinsY; b++) {
                 const yMin = -halfW + b * stepY - 0.10;
                 const yMax = -halfW + (b + 1) * stepY + 0.10;
-                const ptsInBin = surfacePts.filter((pt) => pt.v >= yMin && pt.v <= yMax);
-                if (ptsInBin.length >= 2) {
-                    let sumZ = 0;
-                    for (let i = 0; i < ptsInBin.length; i++) sumZ += ptsInBin[i].z;
+                let sumZ = 0;
+                let count = 0;
+                for (let i = 0; i < surfacePts.length; i++) {
+                    const pt = surfacePts[i];
+                    if (pt.v >= yMin && pt.v <= yMax) {
+                        sumZ += pt.z;
+                        count++;
+                    }
+                }
+                if (count >= 2) {
                     binCentersY.push(-halfW + (b + 0.5) * stepY);
-                    binAvgZY.push(sumZ / ptsInBin.length);
+                    binAvgZY.push(sumZ / count);
                 }
             }
 
@@ -1180,17 +1193,19 @@ export class GroundElevationGrid {
         this.cols = c;
         this.rows = r;
 
+        const invCellSize = 1.0 / effectiveCellSize;
         const grid = new Float32Array(c * r);
         grid.fill(Infinity);
 
         for (let i = 0; i < totalPoints; i++) {
-            const px = positions[i * 3];
-            const py = positions[i * 3 + 1];
-            const pz = positions[i * 3 + 2];
+            const i3 = i * 3;
+            const px = positions[i3];
+            const py = positions[i3 + 1];
+            const pz = positions[i3 + 2];
             if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) continue;
 
-            const col = Math.floor((px - minX) / effectiveCellSize);
-            const row = Math.floor((py - minY) / effectiveCellSize);
+            const col = Math.floor((px - minX) * invCellSize);
+            const row = Math.floor((py - minY) * invCellSize);
             if (col >= 0 && col < c && row >= 0 && row < r) {
                 const idx = row * c + col;
                 if (pz < grid[idx]) {
@@ -1282,6 +1297,8 @@ export class GroundElevationGrid {
         return [normX, normY, normZ, d];
     }
 
+    private static readonly scratchPlane = new THREE.Plane();
+
     /**
      * Intersects a 3D camera ray with the ground elevation heightmap / road plane in O(1) time,
      * eliminating O(N) brute-force raycasting against 150,000 point cloud vertices during Mode.DRAW.
@@ -1305,7 +1322,9 @@ export class GroundElevationGrid {
             D = 1.65;
         }
 
-        const plane = new THREE.Plane(new THREE.Vector3(A, B, C), D);
+        const plane = GroundElevationGrid.scratchPlane;
+        plane.normal.set(A, B, C);
+        plane.constant = D;
         const hit = ray.intersectPlane(plane, new THREE.Vector3());
 
         if (hit && ray.origin.distanceTo(hit) <= maxDistance) {

@@ -48,11 +48,20 @@ function SnapToRoadControl(props: Props): JSX.Element {
         return (saved === 'full' || saved === 'ground') ? saved : 'ground';
     });
 
+    const isMountedRef = React.useRef<boolean>(true);
+    React.useEffect(() => {
+        isMountedRef.current = true;
+        return () => {
+            isMountedRef.current = false;
+            notification.destroy('track_snap_progress');
+        };
+    }, []);
+
     React.useEffect(() => {
         if (canvasInstance && typeof (canvasInstance as any).configure === 'function') {
             (canvasInstance as any).configure({ snapMode, autoRoadSnap: autoSnap });
         }
-    }, [canvasInstance]);
+    }, [canvasInstance, snapMode, autoSnap]);
 
     const setMode = (mode: 'ground' | 'full'): void => {
         setSnapMode(mode);
@@ -120,7 +129,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
             key: 'snap_track',
             label: 'Snap Track to Road (Alt+T)',
             onClick: async () => {
-                if (!targetID || !jobInstance) return;
+                if (targetID === null || !jobInstance) return;
                 try {
                     notification.open({
                         key: 'track_snap_progress',
@@ -132,6 +141,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
                         jobInstance,
                         targetID,
                         (msg: string, pct: number) => {
+                            if (!isMountedRef.current) return;
                             notification.open({
                                 key: 'track_snap_progress',
                                 message: `Snapping Track #${targetID} (${pct}%)`,
@@ -141,6 +151,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
                         },
                     );
                     notification.destroy('track_snap_progress');
+                    if (!isMountedRef.current) return;
                     notification.success({
                         key: `track_snap_success_${Date.now()}`,
                         message: `Track #${targetID} Snapped`,
@@ -149,6 +160,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
                     });
                 } catch (err: any) {
                     notification.destroy('track_snap_progress');
+                    if (!isMountedRef.current) return;
                     notification.error({
                         key: `track_snap_error_${Date.now()}`,
                         message: 'Track Snap Failed',

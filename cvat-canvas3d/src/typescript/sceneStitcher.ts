@@ -18,10 +18,19 @@ export interface StitchingOptions {
     sorMinNeighbors?: number; // Minimum neighbor count to retain point
 }
 
+function nextPowerOfTwo(n: number): number {
+    let p = 1024;
+    while (p < n) {
+        p *= 2;
+    }
+    return p;
+}
+
 /**
  * Fast Voxel Grid Centroid Downsampling & Smoothing in TypeScript/WebGL
  * Groups points falling into the same 3D voxel cell and computes their arithmetic centroid.
  * Flattens planar road surfaces, removes duplicate sensor hits, and bounds memory for 60 FPS Three.js rendering.
+ * Uses a flat TypedArray open-addressed spatial hash table with zero string or object allocations.
  */
 export function voxelDownsampleAndSmooth(
     positions: Float32Array,
@@ -40,79 +49,95 @@ export function voxelDownsampleAndSmooth(
     let minY = Infinity;
     let minZ = Infinity;
     for (let i = 0; i < positions.length; i += 3) {
-        if (positions[i] < minX) minX = positions[i];
-        if (positions[i + 1] < minY) minY = positions[i + 1];
-        if (positions[i + 2] < minZ) minZ = positions[i + 2];
+        const x = positions[i];
+        const y = positions[i + 1];
+        const z = positions[i + 2];
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (z < minZ) minZ = z;
+    }
+
+    if (!Number.isFinite(minX)) {
+        return { positions, colors };
     }
 
     const invV = 1.0 / voxelSize;
-    // Map voxel string key -> accumulator
-    // Key format: `${vx}_${vy}_${vz}`
-    const voxelMap = new Map<string, {
-        count: number;
-        sumX: number;
-        sumY: number;
-        sumZ: number;
-        sumR: number;
-        sumG: number;
-        sumB: number;
-    }>();
+    const capacity = nextPowerOfTwo(numPoints * 2);
+    const mask = capacity - 1;
+
+    const slotMap = new Int32Array(capacity);
+    slotMap.fill(-1);
+
+    const voxelVx = new Int32Array(numPoints);
+    const voxelVy = new Int32Array(numPoints);
+    const voxelVz = new Int32Array(numPoints);
+    const counts = new Uint32Array(numPoints);
+    const sumX = new Float64Array(numPoints);
+    const sumY = new Float64Array(numPoints);
+    const sumZ = new Float64Array(numPoints);
+    const sumR = hasColors ? new Float32Array(numPoints) : null;
+    const sumG = hasColors ? new Float32Array(numPoints) : null;
+    const sumB = hasColors ? new Float32Array(numPoints) : null;
+
+    let uniqueCount = 0;
 
     for (let i = 0; i < numPoints; i++) {
         const i3 = i * 3;
         const x = positions[i3];
         const y = positions[i3 + 1];
         const z = positions[i3 + 2];
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
 
-        const vx = Math.floor((x - minX) * invV);
-        const vy = Math.floor((y - minY) * invV);
-        const vz = Math.floor((z - minZ) * invV);
-        const key = `${vx}_${vy}_${vz}`;
+        const vx = Math.floor((x - minX) * invV) | 0;
+        const vy = Math.floor((y - minY) * invV) | 0;
+        const vz = Math.floor((z - minZ) * invV) | 0;
 
-        let entry = voxelMap.get(key);
-        if (!entry) {
-            entry = {
-                count: 0,
-                sumX: 0,
-                sumY: 0,
-                sumZ: 0,
-                sumR: 0,
-                sumG: 0,
-                sumB: 0,
-            };
-            voxelMap.set(key, entry);
+        let slot = ((vx * 73856093) ^ (vy * 19349663) ^ (vz * 83492791)) & mask;
+        let vIdx = slotMap[slot];
+        while (vIdx !== -1) {
+            if (voxelVx[vIdx] === vx && voxelVy[vIdx] === vy && voxelVz[vIdx] === vz) {
+                break;
+            }
+            slot = (slot + 1) & mask;
+            vIdx = slotMap[slot];
         }
 
-        entry.count++;
-        entry.sumX += x;
-        entry.sumY += y;
-        entry.sumZ += z;
+        if (vIdx === -1) {
+            vIdx = uniqueCount++;
+            slotMap[slot] = vIdx;
+            voxelVx[vIdx] = vx;
+            voxelVy[vIdx] = vy;
+            voxelVz[vIdx] = vz;
+        }
 
-        if (hasColors && colors) {
-            entry.sumR += colors[i3];
-            entry.sumG += colors[i3 + 1];
-            entry.sumB += colors[i3 + 2];
+        counts[vIdx]++;
+        sumX[vIdx] += x;
+        sumY[vIdx] += y;
+        sumZ[vIdx] += z;
+
+        if (hasColors && colors && sumR && sumG && sumB) {
+            sumR[vIdx] += colors[i3];
+            sumG[vIdx] += colors[i3 + 1];
+            sumB[vIdx] += colors[i3 + 2];
         }
     }
 
-    const outCount = voxelMap.size;
-    const outPositions = new Float32Array(outCount * 3);
-    const outColors = hasColors ? new Float32Array(outCount * 3) : null;
+    const outPositions = new Float32Array(uniqueCount * 3);
+    const outColors = hasColors ? new Float32Array(uniqueCount * 3) : null;
 
-    let idx = 0;
-    for (const entry of voxelMap.values()) {
-        const invC = 1.0 / entry.count;
+    for (let idx = 0; idx < uniqueCount; idx++) {
+        const invC = 1.0 / counts[idx];
         const i3 = idx * 3;
-        outPositions[i3] = entry.sumX * invC;
-        outPositions[i3 + 1] = entry.sumY * invC;
-        outPositions[i3 + 2] = entry.sumZ * invC;
+        outPositions[i3] = sumX[idx] * invC;
+        outPositions[i3 + 1] = sumY[idx] * invC;
+        outPositions[i3 + 2] = sumZ[idx] * invC;
 
-        if (outColors) {
-            outColors[i3] = entry.sumR * invC;
-            outColors[i3 + 1] = entry.sumG * invC;
-            outColors[i3 + 2] = entry.sumB * invC;
+        if (outColors && sumR && sumG && sumB) {
+            outColors[i3] = sumR[idx] * invC;
+            outColors[i3 + 1] = sumG[idx] * invC;
+            outColors[i3 + 2] = sumB[idx] * invC;
         }
-        idx++;
     }
 
     return { positions: outPositions, colors: outColors };
@@ -121,6 +146,7 @@ export function voxelDownsampleAndSmooth(
 /**
  * Fast Statistical Outlier Removal (SOR) / Density Filter
  * Removes isolated noise points that have fewer than minNeighbors within neighborRadius.
+ * Uses a flat TypedArray open-addressed spatial hash grid and intrusive index linked list.
  */
 export function filterStatisticalOutliers(
     positions: Float32Array,
@@ -128,85 +154,152 @@ export function filterStatisticalOutliers(
     neighborRadius: number = 0.35,
     minNeighbors: number = 3,
 ): { positions: Float32Array; colors: Float32Array | null } {
-    if (!positions || positions.length < 30) {
+    if (!positions || positions.length < 30 || neighborRadius <= 0) {
         return { positions, colors };
     }
 
     const numPoints = Math.floor(positions.length / 3);
     const hasColors = Boolean(colors && colors.length >= positions.length);
-    const cellSize = neighborRadius;
-    const invCell = 1.0 / cellSize;
+    const invCell = 1.0 / neighborRadius;
 
-    // Coarse spatial hash
-    const grid = new Map<string, number[]>();
-    for (let i = 0; i < numPoints; i++) {
-        const i3 = i * 3;
-        const cx = Math.floor(positions[i3] * invCell);
-        const cy = Math.floor(positions[i3 + 1] * invCell);
-        const cz = Math.floor(positions[i3 + 2] * invCell);
-        const key = `${cx}_${cy}_${cz}`;
+    const capacity = nextPowerOfTwo(numPoints * 2);
+    const mask = capacity - 1;
 
-        let list = grid.get(key);
-        if (!list) {
-            list = [];
-            grid.set(key, list);
-        }
-        list.push(i);
-    }
+    const cellCx = new Int32Array(capacity);
+    const cellCy = new Int32Array(capacity);
+    const cellCz = new Int32Array(capacity);
+    const cellHead = new Int32Array(capacity);
+    cellHead.fill(-1);
 
-    const validIndices: number[] = [];
-    const r2 = neighborRadius * neighborRadius;
+    const pointNext = new Int32Array(numPoints);
+    const pointCellSlot = new Int32Array(numPoints);
+    const pointCx = new Int32Array(numPoints);
+    const pointCy = new Int32Array(numPoints);
+    const pointCz = new Int32Array(numPoints);
 
     for (let i = 0; i < numPoints; i++) {
         const i3 = i * 3;
         const x = positions[i3];
         const y = positions[i3 + 1];
         const z = positions[i3 + 2];
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+            pointCellSlot[i] = -1;
+            pointNext[i] = -1;
+            continue;
+        }
 
-        const cx = Math.floor(x * invCell);
-        const cy = Math.floor(y * invCell);
-        const cz = Math.floor(z * invCell);
+        const cx = Math.floor(x * invCell) | 0;
+        const cy = Math.floor(y * invCell) | 0;
+        const cz = Math.floor(z * invCell) | 0;
+        pointCx[i] = cx;
+        pointCy[i] = cy;
+        pointCz[i] = cz;
+
+        let slot = ((cx * 73856093) ^ (cy * 19349663) ^ (cz * 83492791)) & mask;
+        let head = cellHead[slot];
+        while (head !== -1) {
+            if (cellCx[slot] === cx && cellCy[slot] === cy && cellCz[slot] === cz) {
+                break;
+            }
+            slot = (slot + 1) & mask;
+            head = cellHead[slot];
+        }
+
+        if (head === -1) {
+            cellCx[slot] = cx;
+            cellCy[slot] = cy;
+            cellCz[slot] = cz;
+        }
+
+        pointNext[i] = head;
+        cellHead[slot] = i;
+        pointCellSlot[i] = slot;
+    }
+
+    const validIndices = new Int32Array(numPoints);
+    let validCount = 0;
+    const r2 = neighborRadius * neighborRadius;
+
+    for (let i = 0; i < numPoints; i++) {
+        const selfSlot = pointCellSlot[i];
+        if (selfSlot === -1) continue;
+
+        const i3 = i * 3;
+        const x = positions[i3];
+        const y = positions[i3 + 1];
+        const z = positions[i3 + 2];
 
         let neighborCount = 0;
 
-        // Search adjacent 3x3x3 cells
-        for (let dx = -1; dx <= 1; dx++) {
-            for (let dy = -1; dy <= 1; dy++) {
-                for (let dz = -1; dz <= 1; dz++) {
-                    const cellKey = `${cx + dx}_${cy + dy}_${cz + dz}`;
-                    const cellPoints = grid.get(cellKey);
-                    if (cellPoints) {
-                        for (const pIdx of cellPoints) {
-                            if (pIdx === i) continue;
-                            const p3 = pIdx * 3;
-                            const dX = positions[p3] - x;
-                            const dY = positions[p3 + 1] - y;
-                            const dZ = positions[p3 + 2] - z;
-                            if (dX * dX + dY * dY + dZ * dZ <= r2) {
-                                neighborCount++;
-                                if (neighborCount >= minNeighbors) break;
+        // 1. Check points in the point's own cell first (O(1) slot access, >95% early exit)
+        let pIdx = cellHead[selfSlot];
+        while (pIdx !== -1) {
+            if (pIdx !== i) {
+                const p3 = pIdx * 3;
+                const dX = positions[p3] - x;
+                const dY = positions[p3 + 1] - y;
+                const dZ = positions[p3 + 2] - z;
+                if (dX * dX + dY * dY + dZ * dZ <= r2) {
+                    neighborCount++;
+                    if (neighborCount >= minNeighbors) break;
+                }
+            }
+            pIdx = pointNext[pIdx];
+        }
+
+        // 2. Only if needed, search the 26 adjacent cells in the 3x3x3 neighborhood
+        if (neighborCount < minNeighbors) {
+            const cx = pointCx[i];
+            const cy = pointCy[i];
+            const cz = pointCz[i];
+
+            for (let dx = -1; dx <= 1; dx++) {
+                const tx = (cx + dx) | 0;
+                const hX = tx * 73856093;
+                for (let dy = -1; dy <= 1; dy++) {
+                    const ty = (cy + dy) | 0;
+                    const hXY = hX ^ (ty * 19349663);
+                    for (let dz = -1; dz <= 1; dz++) {
+                        if (dx === 0 && dy === 0 && dz === 0) continue;
+                        const tz = (cz + dz) | 0;
+                        let slot = (hXY ^ (tz * 83492791)) & mask;
+                        let cellPt = cellHead[slot];
+                        while (cellPt !== -1) {
+                            if (cellCx[slot] === tx && cellCy[slot] === ty && cellCz[slot] === tz) {
+                                while (cellPt !== -1) {
+                                    const p3 = cellPt * 3;
+                                    const dX = positions[p3] - x;
+                                    const dY = positions[p3 + 1] - y;
+                                    const dZ = positions[p3 + 2] - z;
+                                    if (dX * dX + dY * dY + dZ * dZ <= r2) {
+                                        neighborCount++;
+                                        if (neighborCount >= minNeighbors) break;
+                                    }
+                                    cellPt = pointNext[cellPt];
+                                }
+                                break;
                             }
+                            slot = (slot + 1) & mask;
+                            cellPt = cellHead[slot];
                         }
+                        if (neighborCount >= minNeighbors) break;
                     }
                     if (neighborCount >= minNeighbors) break;
                 }
                 if (neighborCount >= minNeighbors) break;
             }
-            if (neighborCount >= minNeighbors) break;
         }
 
         if (neighborCount >= minNeighbors) {
-            validIndices.push(i);
+            validIndices[validCount++] = i;
         }
     }
 
-    const outCount = validIndices.length;
-    const outPositions = new Float32Array(outCount * 3);
-    const outColors = hasColors ? new Float32Array(outCount * 3) : null;
+    const outPositions = new Float32Array(validCount * 3);
+    const outColors = hasColors ? new Float32Array(validCount * 3) : null;
 
-    for (let idx = 0; idx < outCount; idx++) {
-        const srcI = validIndices[idx];
-        const src3 = srcI * 3;
+    for (let idx = 0; idx < validCount; idx++) {
+        const src3 = validIndices[idx] * 3;
         const dst3 = idx * 3;
         outPositions[dst3] = positions[src3];
         outPositions[dst3 + 1] = positions[src3 + 1];
@@ -223,35 +316,46 @@ export function filterStatisticalOutliers(
 }
 
 /**
- * Apply 4x4 matrix transformation to positions in-place
+ * Apply 4x4 matrix transformation to positions into an output buffer at dstOffset
  */
-export function transformFloat32Points(positions: Float32Array, matrix4: number[]): Float32Array {
-    const out = new Float32Array(positions.length);
+function transformFloat32PointsInto(
+    positions: Float32Array,
+    matrix4: number[],
+    out: Float32Array,
+    dstOffset: number,
+): void {
     const m = matrix4;
-    // Row-major or column-major support: Three.js Matrix4 elements are column-major
-    const isColumnMajor = true;
-    const m00 = isColumnMajor ? m[0] : m[0];
-    const m10 = isColumnMajor ? m[1] : m[4];
-    const m20 = isColumnMajor ? m[2] : m[8];
-    const m01 = isColumnMajor ? m[4] : m[1];
-    const m11 = isColumnMajor ? m[5] : m[5];
-    const m21 = isColumnMajor ? m[6] : m[9];
-    const m02 = isColumnMajor ? m[8] : m[2];
-    const m12 = isColumnMajor ? m[9] : m[6];
-    const m22 = isColumnMajor ? m[10] : m[10];
-    const m03 = isColumnMajor ? m[12] : m[3];
-    const m13 = isColumnMajor ? m[13] : m[7];
-    const m23 = isColumnMajor ? m[14] : m[11];
+    const m00 = m[0];
+    const m10 = m[1];
+    const m20 = m[2];
+    const m01 = m[4];
+    const m11 = m[5];
+    const m21 = m[6];
+    const m02 = m[8];
+    const m12 = m[9];
+    const m22 = m[10];
+    const m03 = m[12];
+    const m13 = m[13];
+    const m23 = m[14];
 
     for (let i = 0; i < positions.length; i += 3) {
         const x = positions[i];
         const y = positions[i + 1];
         const z = positions[i + 2];
+        const dst = dstOffset + i;
 
-        out[i] = m00 * x + m01 * y + m02 * z + m03;
-        out[i + 1] = m10 * x + m11 * y + m12 * z + m13;
-        out[i + 2] = m20 * x + m21 * y + m22 * z + m23;
+        out[dst] = m00 * x + m01 * y + m02 * z + m03;
+        out[dst + 1] = m10 * x + m11 * y + m12 * z + m13;
+        out[dst + 2] = m20 * x + m21 * y + m22 * z + m23;
     }
+}
+
+/**
+ * Apply 4x4 matrix transformation to positions
+ */
+export function transformFloat32Points(positions: Float32Array, matrix4: number[]): Float32Array {
+    const out = new Float32Array(positions.length);
+    transformFloat32PointsInto(positions, matrix4, out, 0);
     return out;
 }
 
@@ -266,35 +370,40 @@ export function stitchAndSmoothPointClouds(
     const voxelSize = options.voxelSize ?? 0.05;
     const enableSOR = options.enableSOR ?? true;
 
-    // 1. Gather all points
-    const positionChunks: Float32Array[] = [currentFrame.positions];
-    const colorChunks: Float32Array[] = currentFrame.colors ? [currentFrame.colors] : [];
+    // 1. Compute total points and allocate unified merged buffer directly
     let totalPoints = Math.floor(currentFrame.positions.length / 3);
+    let hasColors = Boolean(currentFrame.colors && currentFrame.colors.length >= currentFrame.positions.length);
 
     for (const neighbor of neighborFrames) {
-        let transformedPositions = neighbor.positions;
-        if (neighbor.transform && neighbor.transform.length === 16) {
-            transformedPositions = transformFloat32Points(neighbor.positions, neighbor.transform);
-        }
-        positionChunks.push(transformedPositions);
-        if (neighbor.colors) {
-            colorChunks.push(neighbor.colors);
-        }
         totalPoints += Math.floor(neighbor.positions.length / 3);
+        if (!neighbor.colors || neighbor.colors.length < neighbor.positions.length) {
+            hasColors = false;
+        }
     }
 
-    // Allocate unified merged buffer
     const mergedPositions = new Float32Array(totalPoints * 3);
-    const hasColors = colorChunks.length === positionChunks.length;
     const mergedColors = hasColors ? new Float32Array(totalPoints * 3) : null;
 
     let offset = 0;
-    for (let c = 0; c < positionChunks.length; c++) {
-        mergedPositions.set(positionChunks[c], offset);
-        if (mergedColors && colorChunks[c]) {
-            mergedColors.set(colorChunks[c], offset);
+    const currentLen = Math.floor(currentFrame.positions.length / 3) * 3;
+    mergedPositions.set(currentFrame.positions.subarray(0, currentLen), offset);
+    if (mergedColors && currentFrame.colors) {
+        mergedColors.set(currentFrame.colors.subarray(0, currentLen), offset);
+    }
+    offset += currentLen;
+
+    for (const neighbor of neighborFrames) {
+        const len = Math.floor(neighbor.positions.length / 3) * 3;
+        const posSub = neighbor.positions.subarray(0, len);
+        if (neighbor.transform && neighbor.transform.length === 16) {
+            transformFloat32PointsInto(posSub, neighbor.transform, mergedPositions, offset);
+        } else {
+            mergedPositions.set(posSub, offset);
         }
-        offset += positionChunks[c].length;
+        if (mergedColors && neighbor.colors) {
+            mergedColors.set(neighbor.colors.subarray(0, len), offset);
+        }
+        offset += len;
     }
 
     // 2. Multi-level Smoothing: Voxel Grid Centroid Downsampling

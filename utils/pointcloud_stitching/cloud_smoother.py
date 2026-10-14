@@ -57,31 +57,40 @@ class PointCloudSmoother:
         # 1. Tính chỉ số voxel nguyên cho từng điểm: [ix, iy, iz]
         voxel_coords = np.floor(pts_xyz / vs).astype(np.int64)
 
-        # 2. Tạo khóa duy nhất cho mỗi voxel bằng cách mã hóa hoặc dùng structured view
-        # Để tránh tràn số, offset min về 0
-        min_coords = np.min(voxel_coords, axis=0)
+        # 2. Tạo khóa duy nhất 1D int64 cho mỗi voxel (tránh tràn số bằng cách dịch min về 0)
+        min_coords = voxel_coords.min(axis=0)
         shifted_coords = voxel_coords - min_coords
+        grid_dims = shifted_coords.max(axis=0) + 1
 
-        # Dùng numpy unique trên mảng có cấu trúc để nhóm các điểm cực nhanh
-        dtype = [('x', np.int64), ('y', np.int64), ('z', np.int64)]
-        struct_coords = np.empty(len(shifted_coords), dtype=dtype)
-        struct_coords['x'] = shifted_coords[:, 0]
-        struct_coords['y'] = shifted_coords[:, 1]
-        struct_coords['z'] = shifted_coords[:, 2]
+        if float(grid_dims[0]) * float(grid_dims[1]) * float(grid_dims[2]) < float(1 << 62):
+            voxel_keys = (
+                shifted_coords[:, 0] * (grid_dims[1] * grid_dims[2])
+                + shifted_coords[:, 1] * grid_dims[2]
+                + shifted_coords[:, 2]
+            )
+            _, inverse_indices, counts = np.unique(
+                voxel_keys, return_inverse=True, return_counts=True
+            )
+        else:
+            contig = np.ascontiguousarray(shifted_coords)
+            void_view = contig.view(np.dtype((np.void, contig.dtype.itemsize * 3))).ravel()
+            _, inverse_indices, counts = np.unique(
+                void_view, return_inverse=True, return_counts=True
+            )
 
-        _, inverse_indices, counts = np.unique(struct_coords, return_inverse=True, return_counts=True)
         num_voxels = len(counts)
 
-        # 3. Tính trung bình các trường (x, y, z, intensity, ...) trong từng voxel
+        # 3. Tính trung bình các trường (x, y, z, intensity, ...) trong từng voxel bằng np.bincount
         num_features = points.shape[1]
-        sum_features = np.zeros((num_voxels, num_features), dtype=np.float64)
+        pts_f64 = points.astype(np.float64, copy=False)
+        inv_counts = (1.0 / counts)[:, np.newaxis]
 
-        # Tích lũy tổng điểm theo từng voxel
-        for col in range(num_features):
-            np.add.at(sum_features[:, col], inverse_indices, points[:, col])
+        sum_features = np.column_stack([
+            np.bincount(inverse_indices, weights=pts_f64[:, col], minlength=num_voxels)
+            for col in range(num_features)
+        ])
 
-        # Chia cho số điểm trong mỗi voxel để ra trọng tâm (centroid)
-        smoothed_points = (sum_features / counts[:, np.newaxis]).astype(np.float32)
+        smoothed_points = (sum_features * inv_counts).astype(np.float32)
         return smoothed_points
 
     def remove_statistical_outliers(
@@ -109,9 +118,10 @@ class PointCloudSmoother:
         ratio = std_ratio if std_ratio is not None else self.std_ratio
         k = min(k, len(points) - 1)
 
-        tree = cKDTree(points[:, :3])
+        pts_xyz = np.ascontiguousarray(points[:, :3], dtype=np.float64)
+        tree = cKDTree(pts_xyz, leafsize=48, compact_nodes=True, balanced_tree=False)
         # Tìm k+1 láng giềng (bao gồm chính nó ở vị trí đầu tiên)
-        distances, _ = tree.query(points[:, :3], k=k + 1, workers=-1)
+        distances, _ = tree.query(pts_xyz, k=k + 1, workers=-1)
 
         # Bỏ cột 0 (khoảng cách tới chính nó = 0)
         neighbor_distances = distances[:, 1:]
@@ -124,3 +134,24 @@ class PointCloudSmoother:
         inlier_mask = mean_distances <= threshold
 
         return points[inlier_mask], inlier_mask
+
+    def remove_radius_outliers(
+        self,
+        points: np.ndarray,
+        radius: float = 0.5,
+        min_neighbors: int = 5
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Lọc nhiễu bán kính ROR (Radius Outlier Removal).
+        Loại bỏ các điểm có ít hơn min_neighbors láng giềng trong bán kính radius.
+        """
+        if len(points) == 0:
+            return points, np.zeros(0, dtype=bool)
+
+        pts_xyz = np.ascontiguousarray(points[:, :3], dtype=np.float64)
+        tree = cKDTree(pts_xyz, leafsize=48, compact_nodes=True, balanced_tree=False)
+        counts = tree.query_ball_point(pts_xyz, r=radius, return_length=True, workers=-1)
+        # Trừ chính điểm đó (1)
+        inlier_mask = (counts - 1) >= min_neighbors
+        return points[inlier_mask], inlier_mask
+

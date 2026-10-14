@@ -55,45 +55,38 @@ class TrajectorySmoother:
             # Nếu timestamps bị trùng hoặc giảm, tạo chuỗi đều giả định
             t_arr = np.linspace(0.0, float(n - 1), n)
 
-        # 1. Trích xuất Translations (x, y, z)
-        translations = np.array([p[:3, 3] for p in poses], dtype=np.float64)
+        # 1. Trích xuất Translations (x, y, z) và Rotations dạng mảng vector hóa
+        poses_arr = np.asarray(poses, dtype=np.float64)
+        translations = poses_arr[:, :3, 3]
+        rotations = R.from_matrix(poses_arr[:, :3, :3])
 
-        # 2. Trích xuất Rotations
-        rot_matrices = [p[:3, :3] for p in poses]
-        rotations = R.from_matrix(rot_matrices)
-
-        # 3. Làm mượt vị trí (x, y, z)
+        # 2. Làm mượt vị trí (x, y, z)
         k = min(self.spline_degree, n - 1)
         smooth_trans = np.zeros_like(translations)
 
         try:
-            # Dùng UnivariateSpline có s để khử nhiễu
-            s = self.smoothing_factor * (n * np.var(translations)) * 0.01
+            # Dùng UnivariateSpline có s theo phương sai từng trục để khử nhiễu
             for axis in range(3):
+                axis_var = float(np.var(translations[:, axis]))
+                s = self.smoothing_factor * (n * axis_var) * 0.01
                 spl = UnivariateSpline(t_arr, translations[:, axis], k=k, s=s)
                 smooth_trans[:, axis] = spl(t_arr)
         except Exception:
             # Fallback sang make_interp_spline
-            for axis in range(3):
-                spl = make_interp_spline(t_arr, translations[:, axis], k=min(k, 3))
-                smooth_trans[:, axis] = spl(t_arr)
+            spl = make_interp_spline(t_arr, translations, k=min(k, 3), axis=0)
+            smooth_trans = spl(t_arr)
 
-        # 4. Làm mượt góc quay Quaternion bằng SLERP
-        smooth_rots = []
+        # 3. Làm mượt góc quay Quaternion bằng SLERP
         try:
-            # Tạo Slerp interpolator
             slerp = Slerp(t_arr, rotations)
-            # Sample lại tại các mốc thời gian
             smooth_rots = slerp(t_arr)
         except Exception:
             smooth_rots = rotations
 
-        # 5. Tái cấu trúc ma trận SE(3)
-        smoothed_poses = []
-        for i in range(n):
-            T = np.eye(4, dtype=np.float64)
-            T[:3, :3] = smooth_rots[i].as_matrix()
-            T[:3, 3] = smooth_trans[i]
-            smoothed_poses.append(T)
+        # 4. Tái cấu trúc ma trận SE(3) vector hóa
+        smoothed_mats = np.broadcast_to(np.eye(4, dtype=np.float64), (n, 4, 4)).copy()
+        smoothed_mats[:, :3, :3] = smooth_rots.as_matrix()
+        smoothed_mats[:, :3, 3] = smooth_trans
 
-        return smoothed_poses
+        return [smoothed_mats[i] for i in range(n)]
+

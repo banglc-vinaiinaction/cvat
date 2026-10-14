@@ -89,6 +89,23 @@ class SceneStitcher:
         self.pose_by_index: Dict[int, np.ndarray] = {
             cvat_idx: self.smoothed_poses[i] for i, cvat_idx in enumerate(self.frame_indices)
         }
+        self._pcd_cache: Dict[str, Tuple[np.ndarray, List[str], Dict[str, Any]]] = {}
+        self._max_cache_size: int = max(4, 2 * self.window_size + 3)
+
+    def _load_pcd(self, filepath: str) -> Tuple[np.ndarray, List[str], Dict[str, Any]]:
+        """Đọc file PCD có bộ nhớ đệm (sliding window LRU cache) để tránh đọc lặp lại từ ổ cứng."""
+        cached = self._pcd_cache.get(filepath)
+        if cached is not None:
+            # Move to end (most recently used)
+            self._pcd_cache[filepath] = self._pcd_cache.pop(filepath)
+            return cached
+
+        result = read_pcd(filepath)
+        if len(self._pcd_cache) >= self._max_cache_size:
+            oldest_key = next(iter(self._pcd_cache))
+            del self._pcd_cache[oldest_key]
+        self._pcd_cache[filepath] = result
+        return result
 
     def get_relative_transform(self, frame_from: int, frame_to: int) -> np.ndarray:
         """Tính ma trận biến đổi T_{to <- from} sử dụng pose đã làm mượt."""
@@ -120,7 +137,7 @@ class SceneStitcher:
         if not target_pcd_path or not os.path.exists(target_pcd_path):
             raise FileNotFoundError(f"PCD file for target frame {target_cvat_index} not found.")
 
-        target_points, fields, meta = read_pcd(target_pcd_path)
+        target_points, fields, meta = self._load_pcd(target_pcd_path)
         original_count = len(target_points)
 
         # Xác định vị trí của target_frame trong chuỗi thời gian
@@ -145,7 +162,7 @@ class SceneStitcher:
             if not os.path.exists(n_pcd_path):
                 continue
 
-            n_points, _, _ = read_pcd(n_pcd_path)
+            n_points, _, _ = self._load_pcd(n_pcd_path)
             if len(n_points) == 0:
                 continue
 

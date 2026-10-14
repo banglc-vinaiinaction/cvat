@@ -34,6 +34,7 @@ import SnapToRoadControl, {
 import SceneStitchControl, {
     Props as SceneStitchControlProps,
 } from './scene-stitch-control';
+import StandardizeCuboidsModal from '../standardize-cuboids-modal';
 import GlobalHotKeys, { KeyMap, KeyMapItem } from 'utils/mousetrap-react';
 import ControlVisibilityObserver from 'components/annotation-page/standard-workspace/controls-side-bar/control-visibility-observer';
 import { filterApplicableForType } from 'utils/filter-applicable-labels';
@@ -142,14 +143,22 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         repeatDrawShape,
         updateActiveControl,
         resetGroup,
+        jobInstance: propsJobInstance,
     } = props;
 
-    const { selectedStatesID, activatedStateID } = useSelector(
+    const [standardizeModalVisible, setStandardizeModalVisible] = React.useState<boolean>(false);
+
+    const {
+        selectedStatesID, activatedStateID, annotationStates, reduxJobInstance,
+    } = useSelector(
         (state: CombinedState) => ({
             selectedStatesID: state.annotation.annotations.selectedStatesID,
             activatedStateID: state.annotation.annotations.activatedStateID,
+            annotationStates: state.annotation.annotations.states,
+            reduxJobInstance: state.annotation.job.instance,
         }),
     );
+    const jobInstance = propsJobInstance || reduxJobInstance;
     const canvasActiveID = canvasInstance && typeof (canvasInstance as any).getActiveElement === 'function' ?
         (canvasInstance as any).getActiveElement() : null;
     let activeTargetID: number | null = canvasActiveID;
@@ -160,6 +169,14 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             [activeTargetID] = selectedStatesID;
         }
     }
+
+    const activeState = activeTargetID !== null ?
+        annotationStates?.find((s: any) => s.clientID === activeTargetID) : null;
+    const activeLabelId: number | null = activeState?.label?.id ?? null;
+    const activeTrack = activeState && activeState.objectType === 'track' ? {
+        serverID: activeState.serverID ?? null,
+        clientID: activeState.clientID,
+    } : null;
 
     const applicableLabels = filterApplicableForType(LabelType.CUBOID, labels);
     const preventDefault = (event: KeyboardEvent | undefined): void => {
@@ -224,6 +241,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             className: 'cvat-split-track-control cvat-active-canvas-control',
             onClick: (): void => {
                 canvasInstance.split({ enabled: false });
+                updateActiveControl(ActiveControl.CURSOR);
             },
         } :
         {
@@ -270,7 +288,8 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         ISOLATE_OBJECT_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();
             const targetID = activeTargetID;
-            if (targetID === null) {
+            const isIsolated = Boolean((canvasInstance as any)?.isObjectIsolatedState?.());
+            if (targetID === null && !isIsolated) {
                 notification.warning({ message: 'No 3D object selected', duration: 2 });
                 return;
             }
@@ -323,6 +342,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
                 canvasInstance={canvasInstance}
                 jobInstance={jobInstance}
                 disabled={controlsDisabled}
+                onOpenStandardizeModal={() => setStandardizeModalVisible(true)}
             />
             <ObservedSceneStitchControl
                 canvasInstance={canvasInstance}
@@ -346,6 +366,13 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
                 canvasInstance={canvasInstance}
                 dynamicIconProps={dynamicTrackIconProps}
                 disabled={controlsDisabled}
+            />
+            <StandardizeCuboidsModal
+                visible={standardizeModalVisible}
+                onClose={() => setStandardizeModalVisible(false)}
+                applicableLabels={applicableLabels}
+                activeLabelId={activeLabelId}
+                activeTrack={activeTrack}
             />
         </Layout.Sider>
     );

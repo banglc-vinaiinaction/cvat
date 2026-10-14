@@ -86,15 +86,15 @@ class EgoPoseManager:
     def sensor_to_world_point(self, pt: np.ndarray, frame_index: int) -> np.ndarray:
         """Transforms 3D point [x, y, z] from LiDAR sensor to World coordinates."""
         T = self.get_world_transform(frame_index)
-        homo = np.array([pt[0], pt[1], pt[2], 1.0], dtype=np.float64)
-        return (T @ homo)[:3]
+        pt_arr = np.asarray(pt[:3], dtype=np.float64)
+        return T[:3, :3] @ pt_arr + T[:3, 3]
 
     def world_to_sensor_point(self, pt: np.ndarray, frame_index: int) -> np.ndarray:
         """Transforms 3D point [x, y, z] from World to LiDAR sensor coordinates."""
         T = self.get_world_transform(frame_index)
         T_inv = np.linalg.inv(T)
-        homo = np.array([pt[0], pt[1], pt[2], 1.0], dtype=np.float64)
-        return (T_inv @ homo)[:3]
+        pt_arr = np.asarray(pt[:3], dtype=np.float64)
+        return T_inv[:3, :3] @ pt_arr + T_inv[:3, 3]
 
     def transform_points(self, points: np.ndarray, transform_matrix: np.ndarray) -> np.ndarray:
         """
@@ -103,10 +103,12 @@ class EgoPoseManager:
         """
         if len(points) == 0:
             return points
-        pts_xyz = points[:, :3]
-        homo = np.hstack([pts_xyz, np.ones((len(points), 1), dtype=np.float32)])
-        transformed_xyz = (transform_matrix @ homo.T).T[:, :3].astype(np.float32)
-
+        R_mat = np.ascontiguousarray(transform_matrix[:3, :3].T, dtype=np.float32)
+        t_vec = transform_matrix[:3, 3].astype(np.float32)
+        out = np.empty_like(points, dtype=np.float32)
+        pts_xyz = points[:, :3].astype(np.float32, copy=False)
+        out[:, :3] = pts_xyz @ R_mat + t_vec
         if points.shape[1] > 3:
-            return np.hstack([transformed_xyz, points[:, 3:]])
-        return transformed_xyz
+            out[:, 3:] = points[:, 3:]
+        return out
+

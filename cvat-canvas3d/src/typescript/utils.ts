@@ -8,7 +8,7 @@ const disposedGeometries = new WeakSet<THREE.BufferGeometry>();
 const disposedMaterials = new WeakSet<THREE.Material>();
 
 function disposeMaterial(material: THREE.Material): void {
-    if (disposedMaterials.has(material)) {
+    if (material.userData?.shared || disposedMaterials.has(material)) {
         return;
     }
     disposedMaterials.add(material);
@@ -24,7 +24,7 @@ function disposeMaterial(material: THREE.Material): void {
 
 export function disposeObjectResources(object: THREE.Object3D): void {
     if ('geometry' in object && object.geometry instanceof THREE.BufferGeometry) {
-        if (!disposedGeometries.has(object.geometry)) {
+        if (!object.geometry.userData?.shared && !disposedGeometries.has(object.geometry)) {
             disposedGeometries.add(object.geometry);
             object.geometry.dispose();
         }

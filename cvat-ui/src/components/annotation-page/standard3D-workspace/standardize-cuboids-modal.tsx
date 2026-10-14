@@ -86,6 +86,10 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
 
         setLoading(true);
         try {
+            if (jobInstance.annotations?.hasUnsavedChanges?.()) {
+                await jobInstance.annotations.save();
+            }
+
             const isTaskScope = scope === 'task' && jobInstance.taskId;
             const instanceType = isTaskScope ? 'task' : 'job';
             const instanceId = isTaskScope ? jobInstance.taskId : jobInstance.id;
@@ -109,8 +113,18 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
                 frame_to: fTo,
             };
 
-            if (scope === 'selected_track' && activeTrack?.serverID) {
-                payload.track_id = activeTrack.serverID;
+            if (scope === 'selected_track') {
+                let trackServerId = activeTrack?.serverID ?? null;
+                if (!trackServerId && activeTrack?.clientID !== undefined) {
+                    const currentStates = await jobInstance.annotations.get(currentFrame);
+                    const matched = currentStates?.find((s: any) => s.clientID === activeTrack.clientID);
+                    if (matched?.serverID) {
+                        trackServerId = matched.serverID;
+                    }
+                }
+                if (trackServerId) {
+                    payload.track_id = trackServerId;
+                }
             }
 
             const result = await (serverProxy.annotations as any).standardizeCuboids(
@@ -131,7 +145,8 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
                 duration: 4.5,
             });
 
-            // Reload annotations into Redux store and canvas
+            // Clear cvat-core in-memory session cache and reload fresh annotations from server
+            await jobInstance.annotations.clear({ reload: true });
             dispatch(fetchAnnotationsAsync());
             onClose();
         } catch (error: any) {
@@ -148,7 +163,7 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
         if (!jobInstance || !selectedLabelId) return;
 
         if (scope === 'selected_track') {
-            if (!activeTrack?.serverID) {
+            if (!activeTrack?.serverID && !jobInstance.annotations?.hasUnsavedChanges?.()) {
                 notification.error({
                     message: 'Unsaved Track',
                     description: `Track #${activeTrack?.clientID} is not saved to the server yet. ` +
@@ -156,22 +171,6 @@ export default function StandardizeCuboidsModal(props: Props): JSX.Element {
                 });
                 return;
             }
-        }
-
-        if (jobInstance.annotations?.hasUnsavedChanges?.()) {
-            Modal.confirm({
-                title: 'Unsaved Changes Detected',
-                content: 'Standardizing dimensions reloads annotations from the database, ' +
-                    'which will discard any unsaved changes in this job. ' +
-                    'Save your annotations (Ctrl + S) first or confirm to proceed.',
-                okText: 'Proceed and Overwrite',
-                okType: 'danger',
-                cancelText: 'Cancel & Save First',
-                onOk: () => {
-                    executeStandardize();
-                },
-            });
-            return;
         }
 
         executeStandardize();

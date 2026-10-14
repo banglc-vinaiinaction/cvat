@@ -32,6 +32,94 @@ export function makeCornerPointsMatrix(x: number, y: number, z: number): number[
     ]);
 }
 
+const SHARED_BOX_GEOMETRY = new THREE.BoxGeometry(1, 1, 1);
+SHARED_BOX_GEOMETRY.computeBoundingBox();
+SHARED_BOX_GEOMETRY.computeBoundingSphere();
+SHARED_BOX_GEOMETRY.userData.shared = true;
+
+const SHARED_EDGES_GEOMETRY = new THREE.EdgesGeometry(SHARED_BOX_GEOMETRY);
+SHARED_EDGES_GEOMETRY.computeBoundingBox();
+SHARED_EDGES_GEOMETRY.computeBoundingSphere();
+SHARED_EDGES_GEOMETRY.userData.shared = true;
+
+const SHARED_DASHED_EDGES_GEOMETRY = new THREE.EdgesGeometry(SHARED_BOX_GEOMETRY);
+const dummyDashedLines = new THREE.LineSegments(SHARED_DASHED_EDGES_GEOMETRY);
+dummyDashedLines.computeLineDistances();
+SHARED_DASHED_EDGES_GEOMETRY.computeBoundingBox();
+SHARED_DASHED_EDGES_GEOMETRY.computeBoundingSphere();
+SHARED_DASHED_EDGES_GEOMETRY.userData.shared = true;
+
+const SHARED_PLANE_GEOMETRY = new THREE.PlaneGeometry(1, 1, 1, 1);
+SHARED_PLANE_GEOMETRY.computeBoundingBox();
+SHARED_PLANE_GEOMETRY.computeBoundingSphere();
+SHARED_PLANE_GEOMETRY.userData.shared = true;
+
+const SHARED_SPHERE_GEOMETRY = new THREE.SphereGeometry(0.1);
+SHARED_SPHERE_GEOMETRY.computeBoundingBox();
+SHARED_SPHERE_GEOMETRY.computeBoundingSphere();
+SHARED_SPHERE_GEOMETRY.userData.shared = true;
+
+const SHARED_HIDDEN_MATERIAL = new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    visible: false,
+});
+SHARED_HIDDEN_MATERIAL.userData.shared = true;
+
+const SHARED_CORNER_POINTS = makeCornerPointsMatrix(0.5, 0.5, 0.5).map(
+    (point) => new THREE.Vector3().fromArray(point),
+);
+
+function createTemplateArrow(dir: THREE.Vector3, origin: THREE.Vector3, color: number): THREE.ArrowHelper {
+    const arrow = new THREE.ArrowHelper(dir, origin, 1, color);
+    arrow.line.geometry.computeBoundingBox();
+    arrow.line.geometry.computeBoundingSphere();
+    arrow.line.geometry.userData.shared = true;
+    (arrow.line.material as THREE.Material).userData.shared = true;
+
+    arrow.cone.geometry.computeBoundingBox();
+    arrow.cone.geometry.computeBoundingSphere();
+    arrow.cone.geometry.userData.shared = true;
+    (arrow.cone.material as THREE.Material).userData.shared = true;
+    return arrow;
+}
+
+const TEMPLATE_ARROW_X = createTemplateArrow(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0.5, 0, 0), 0xff0000);
+const TEMPLATE_ARROW_Y = createTemplateArrow(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0.5, 0), 0x00ff00);
+const TEMPLATE_ARROW_Z = createTemplateArrow(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 0.5), 0x0000ff);
+
+function cloneSharedArrow(template: THREE.ArrowHelper): THREE.ArrowHelper {
+    const arrow = new THREE.Object3D() as THREE.ArrowHelper;
+    Object.setPrototypeOf(arrow, THREE.ArrowHelper.prototype);
+    (arrow as any).type = 'ArrowHelper';
+    arrow.position.copy(template.position);
+    arrow.quaternion.copy(template.quaternion);
+    arrow.scale.copy(template.scale);
+    arrow.visible = false;
+
+    const line = new THREE.Line(template.line.geometry, template.line.material);
+    line.matrixAutoUpdate = false;
+    line.scale.copy(template.line.scale);
+    line.matrix.copy(template.line.matrix);
+    arrow.line = line;
+    arrow.add(line);
+
+    const cone = new THREE.Mesh(template.cone.geometry, template.cone.material);
+    cone.matrixAutoUpdate = false;
+    cone.position.copy(template.cone.position);
+    cone.scale.copy(template.cone.scale);
+    cone.matrix.copy(template.cone.matrix);
+    arrow.cone = cone;
+    arrow.add(cone);
+
+    return arrow;
+}
+
+const TEMPLATE_CAM_ROTATE_HELPER = new THREE.Object3D();
+TEMPLATE_CAM_ROTATE_HELPER.translateX(-2);
+TEMPLATE_CAM_ROTATE_HELPER.name = 'camRefRot';
+TEMPLATE_CAM_ROTATE_HELPER.up = new THREE.Vector3(0, 0, 1);
+TEMPLATE_CAM_ROTATE_HELPER.lookAt(new THREE.Vector3(0, 0, 0));
+
 export class CuboidModel {
     public perspective: THREE.Mesh;
     public top: THREE.Mesh;
@@ -47,7 +135,7 @@ export class CuboidModel {
     };
 
     public constructor(outline: string, outlineColor: string) {
-        const geometry = new THREE.BoxGeometry(1, 1, 1);
+        const geometry = SHARED_BOX_GEOMETRY;
         const material = new THREE.MeshBasicMaterial({
             color: 0x00ff00,
             wireframe: false,
@@ -56,23 +144,35 @@ export class CuboidModel {
         });
 
         this.perspective = new THREE.Mesh(geometry, material);
-        const geo = new THREE.EdgesGeometry(this.perspective.geometry);
+        this.perspective.frustumCulled = true;
+        this.perspective.matrixAutoUpdate = true;
+
+        const isLine = outline === 'line';
+        const geo = isLine ? SHARED_EDGES_GEOMETRY : SHARED_DASHED_EDGES_GEOMETRY;
         this.wireframe = new THREE.LineSegments(
             geo,
-            outline === 'line' ? new THREE.LineBasicMaterial({ color: outlineColor, linewidth: 4 }) :
+            isLine ? new THREE.LineBasicMaterial({ color: outlineColor, linewidth: 4 }) :
                 new THREE.LineDashedMaterial({
                     color: outlineColor,
                     dashSize: 0.05,
                     gapSize: 0.05,
                 }),
         );
-        this.wireframe.computeLineDistances();
+        this.wireframe.frustumCulled = true;
         this.wireframe.renderOrder = 1;
         this.perspective.add(this.wireframe);
 
         this.top = new THREE.Mesh(geometry, material);
+        this.top.frustumCulled = true;
+        this.top.matrixAutoUpdate = true;
+
         this.side = new THREE.Mesh(geometry, material);
+        this.side.frustumCulled = true;
+        this.side.matrixAutoUpdate = true;
+
         this.front = new THREE.Mesh(geometry, material);
+        this.front.frustumCulled = true;
+        this.front.matrixAutoUpdate = true;
 
         [ViewType.PERSPECTIVE, ViewType.TOP, ViewType.SIDE, ViewType.FRONT].forEach((view): void => {
             this.orientationArrows[view] = this.createArrows();
@@ -81,29 +181,9 @@ export class CuboidModel {
             });
         });
 
-        const planeTop = new THREE.Mesh(
-            new THREE.PlaneGeometry(1, 1, 1, 1),
-            new THREE.MeshBasicMaterial({
-                color: 0xff0000,
-                visible: false,
-            }),
-        );
-
-        const planeSide = new THREE.Mesh(
-            new THREE.PlaneGeometry(1, 1, 1, 1),
-            new THREE.MeshBasicMaterial({
-                color: 0xff0000,
-                visible: false,
-            }),
-        );
-
-        const planeFront = new THREE.Mesh(
-            new THREE.PlaneGeometry(1, 1, 1, 1),
-            new THREE.MeshBasicMaterial({
-                color: 0xff0000,
-                visible: false,
-            }),
-        );
+        const planeTop = new THREE.Mesh(SHARED_PLANE_GEOMETRY, SHARED_HIDDEN_MATERIAL);
+        const planeSide = new THREE.Mesh(SHARED_PLANE_GEOMETRY, SHARED_HIDDEN_MATERIAL);
+        const planeFront = new THREE.Mesh(SHARED_PLANE_GEOMETRY, SHARED_HIDDEN_MATERIAL);
 
         this.top.add(planeTop);
         planeTop.rotation.set(0, 0, 0);
@@ -112,37 +192,35 @@ export class CuboidModel {
 
         this.side.add(planeSide);
         planeSide.rotation.set(-Math.PI / 2, 0, Math.PI);
-        planeTop.position.set(0, 0.5, 0);
+        planeSide.position.set(0, 0.5, 0);
         planeSide.name = constants.PLANE_ROTATION_HELPER;
 
         this.front.add(planeFront);
         planeFront.rotation.set(0, Math.PI / 2, 0);
-        planeTop.position.set(0.5, 0, 0);
+        planeFront.position.set(0.5, 0, 0);
         planeFront.name = constants.PLANE_ROTATION_HELPER;
 
-        const cornerPoints = makeCornerPointsMatrix(0.5, 0.5, 0.5);
-        for (let i = 0; i < cornerPoints.length; i++) {
-            const point = new THREE.Vector3().fromArray(cornerPoints[i]);
-            const helper = new THREE.Mesh(new THREE.SphereGeometry(0.1));
+        for (let i = 0; i < SHARED_CORNER_POINTS.length; i++) {
+            const helper = new THREE.Mesh(SHARED_SPHERE_GEOMETRY, SHARED_HIDDEN_MATERIAL);
             helper.visible = false;
             helper.name = `cuboidNodeHelper_${i}`;
+            helper.position.copy(SHARED_CORNER_POINTS[i]);
             this.perspective.add(helper);
-            helper.position.copy(point);
         }
 
         const camRotateHelper = new THREE.Object3D();
-        camRotateHelper.translateX(-2);
         camRotateHelper.name = 'camRefRot';
-        camRotateHelper.up = new THREE.Vector3(0, 0, 1);
-        camRotateHelper.lookAt(new THREE.Vector3(0, 0, 0));
-        this.front.add(camRotateHelper.clone());
+        camRotateHelper.position.copy(TEMPLATE_CAM_ROTATE_HELPER.position);
+        camRotateHelper.quaternion.copy(TEMPLATE_CAM_ROTATE_HELPER.quaternion);
+        camRotateHelper.up.copy(TEMPLATE_CAM_ROTATE_HELPER.up);
+        this.front.add(camRotateHelper);
     }
 
     private createArrows(): ObjectArrowHelper {
         return {
-            x: new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0.5, 0, 0), 1, 0xff0000),
-            y: new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0.5, 0), 1, 0x00ff00),
-            z: new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 0.5), 1, 0x0000ff),
+            x: cloneSharedArrow(TEMPLATE_ARROW_X),
+            y: cloneSharedArrow(TEMPLATE_ARROW_Y),
+            z: cloneSharedArrow(TEMPLATE_ARROW_Z),
         };
     }
 
@@ -154,11 +232,7 @@ export class CuboidModel {
     }
 
     public getResizeHelperPositions(): THREE.Vector3[] {
-        const cornerPoints = makeCornerPointsMatrix(0.5, 0.5, 0.5);
-        return cornerPoints.map((point) => {
-            const localPoint = new THREE.Vector3().fromArray(point);
-            return this.perspective.localToWorld(localPoint.clone());
-        });
+        return SHARED_CORNER_POINTS.map((point) => this.perspective.localToWorld(point.clone()));
     }
 
     public setOrientationVisibility(orientationVisibility: OrientationVisibility): void {
@@ -265,9 +339,14 @@ export class CuboidModel {
     }
 }
 
+const SHARED_WHITE_EDGE_MATERIAL = new THREE.LineBasicMaterial({ color: '#ffffff', linewidth: 3 });
+SHARED_WHITE_EDGE_MATERIAL.userData.shared = true;
+
 export function createCuboidEdges(instance: THREE.Mesh): THREE.LineSegments {
-    const geometry = new THREE.EdgesGeometry(instance.geometry);
-    const edges = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: '#ffffff', linewidth: 3 }));
+    const geometry = instance.geometry === SHARED_BOX_GEOMETRY ?
+        SHARED_EDGES_GEOMETRY :
+        new THREE.EdgesGeometry(instance.geometry);
+    const edges = new THREE.LineSegments(geometry, SHARED_WHITE_EDGE_MATERIAL);
     edges.name = constants.CUBOID_EDGE_NAME;
     instance.add(edges);
     return edges;
@@ -281,17 +360,25 @@ export function removeCuboidEdges(instance: THREE.Mesh): void {
     }
 }
 
-export function createResizeHelper(cuboid: CuboidModel, viewType: ViewType): void {
-    const material = new THREE.SpriteMaterial({
-        color: '#ff0000',
-        opacity: 1,
-        map: getCircleTexture,
-    });
+const SHARED_RESIZE_HELPER_MATERIAL = new THREE.SpriteMaterial({
+    color: '#ff0000',
+    opacity: 1,
+    map: getCircleTexture,
+});
+SHARED_RESIZE_HELPER_MATERIAL.userData.shared = true;
 
+const SHARED_ROTATION_HELPER_MATERIAL = new THREE.SpriteMaterial({
+    color: '#33b864',
+    opacity: 1,
+    map: getCircleTexture,
+});
+SHARED_ROTATION_HELPER_MATERIAL.userData.shared = true;
+
+export function createResizeHelper(cuboid: CuboidModel, viewType: ViewType): void {
     const positions = cuboid.getResizeHelperPositions();
     for (let i = 0; i < positions.length; i++) {
         const position = positions[i];
-        const helper = new THREE.Sprite(material);
+        const helper = new THREE.Sprite(SHARED_RESIZE_HELPER_MATERIAL);
         helper.renderOrder = Number.MAX_SAFE_INTEGER;
         helper.name = `${constants.RESIZE_HELPER_NAME}_${i}`;
         helper.position.copy(position);
@@ -303,8 +390,8 @@ export function removeResizeHelper(instance: THREE.Mesh): void {
     instance.parent.children.filter((child: THREE.Object3D) => child.name.startsWith(constants.RESIZE_HELPER_NAME))
         .forEach((helper) => {
             instance.parent.remove(helper);
-            if ((helper as THREE.Sprite).material) {
-                const material = (helper as THREE.Sprite).material as THREE.SpriteMaterial;
+            const material = (helper as THREE.Sprite).material as THREE.SpriteMaterial;
+            if (material && !material.userData?.shared) {
                 material.dispose();
             }
         });
@@ -313,11 +400,7 @@ export function removeResizeHelper(instance: THREE.Mesh): void {
 export function createRotationHelper(cuboid: CuboidModel, viewType: ViewType): void {
     if ([ViewType.TOP, ViewType.SIDE, ViewType.FRONT].includes(viewType)) {
         const helperPosition = cuboid.getRotationHelperPosition(viewType);
-        const rotationHelper = new THREE.Sprite(new THREE.SpriteMaterial({
-            color: '#33b864',
-            opacity: 1,
-            map: getCircleTexture,
-        }));
+        const rotationHelper = new THREE.Sprite(SHARED_ROTATION_HELPER_MATERIAL);
         rotationHelper.renderOrder = Number.MAX_SAFE_INTEGER;
         rotationHelper.name = constants.ROTATION_HELPER_NAME;
         rotationHelper.position.copy(helperPosition);
@@ -329,8 +412,8 @@ export function removeRotationHelper(instance: THREE.Mesh): void {
     const helper = instance.parent.getObjectByName(constants.ROTATION_HELPER_NAME);
     if (helper) {
         instance.parent.remove(helper);
-        if ((helper as THREE.Sprite).material) {
-            const material = (helper as THREE.Sprite).material as THREE.SpriteMaterial;
+        const material = (helper as THREE.Sprite).material as THREE.SpriteMaterial;
+        if (material && !material.userData?.shared) {
             material.dispose();
         }
     }

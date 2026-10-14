@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Icon from '@ant-design/icons';
 import Dropdown from 'antd/lib/dropdown';
 import notification from 'antd/lib/notification';
@@ -27,6 +27,7 @@ const LayersStitchIcon = (): JSX.Element => (
 
 function SceneStitchControl(props: Props): JSX.Element {
     const { canvasInstance, jobInstance, disabled } = props;
+    const isMountedRef = useRef<boolean>(true);
     const [isStitched, setIsStitched] = useState<boolean>(false);
     const [loading, setLoading] = useState<boolean>(false);
     const [windowRadius, setWindowRadius] = useState<number>(() => {
@@ -39,21 +40,39 @@ function SceneStitchControl(props: Props): JSX.Element {
     });
 
     useEffect(() => {
+        isMountedRef.current = true;
+        return () => {
+            isMountedRef.current = false;
+            notification.destroy('scene_stitch_progress');
+        };
+    }, []);
+
+    useEffect(() => {
         const checkStatus = (): void => {
+            if (!isMountedRef.current) return;
             if (canvasInstance && typeof (canvasInstance as any).isSceneStitched === 'function') {
                 setIsStitched((canvasInstance as any).isSceneStitched());
             }
         };
 
         checkStatus();
+        const perspectiveDOM = (canvasInstance as any)?.html?.()?.perspective as HTMLElement | undefined;
         const container = window.document.querySelector('.cvat-canvas3d-perspective');
-        if (container) {
+        if (perspectiveDOM) {
+            perspectiveDOM.addEventListener('canvas.sceneStitched', checkStatus);
+            perspectiveDOM.addEventListener('canvas.setup', checkStatus);
+        }
+        if (container && container !== perspectiveDOM) {
             container.addEventListener('canvas.sceneStitched', checkStatus);
             container.addEventListener('canvas.setup', checkStatus);
         }
 
         return () => {
-            if (container) {
+            if (perspectiveDOM) {
+                perspectiveDOM.removeEventListener('canvas.sceneStitched', checkStatus);
+                perspectiveDOM.removeEventListener('canvas.setup', checkStatus);
+            }
+            if (container && container !== perspectiveDOM) {
                 container.removeEventListener('canvas.sceneStitched', checkStatus);
                 container.removeEventListener('canvas.setup', checkStatus);
             }
@@ -82,6 +101,7 @@ function SceneStitchControl(props: Props): JSX.Element {
                 windowRadius,
                 voxelSize,
                 (msg: string, pct: number) => {
+                    if (!isMountedRef.current) return;
                     notification.open({
                         key: notifKey,
                         message: `Stitching Scene (${pct}%)`,
@@ -92,6 +112,7 @@ function SceneStitchControl(props: Props): JSX.Element {
             );
 
             notification.destroy(notifKey);
+            if (!isMountedRef.current) return;
             setIsStitched(res.stitched);
 
             if (res.stitched) {
@@ -111,6 +132,7 @@ function SceneStitchControl(props: Props): JSX.Element {
             }
         } catch (err: any) {
             notification.destroy('scene_stitch_progress');
+            if (!isMountedRef.current) return;
             notification.error({
                 key: `stitch_error_${Date.now()}`,
                 message: 'Scene Stitching Failed',
@@ -118,7 +140,9 @@ function SceneStitchControl(props: Props): JSX.Element {
                 duration: 4,
             });
         } finally {
-            setLoading(false);
+            if (isMountedRef.current) {
+                setLoading(false);
+            }
         }
     };
 

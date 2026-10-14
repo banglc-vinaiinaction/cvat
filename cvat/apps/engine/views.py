@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: MIT
 
 import itertools
+import math
 import os
 import os.path as osp
 import re
@@ -20,8 +21,11 @@ from typing import Any, cast
 import django_rq
 from attr.converters import to_bool
 from django.conf import settings
+from django.core.exceptions import EmptyResultSet
 from django.core.files.storage import storages
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
+from django.db.models import Q
+from django.db.models.expressions import RawSQL
 from django.utils import timezone
 from django.db.models.query import Prefetch, prefetch_related_objects
 from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseNotFound
@@ -1025,19 +1029,56 @@ def _standardize_cuboids_impl(
     frame_to: int | None = None,
     track_id: int | None = None,
 ) -> tuple[int, int]:
+    if not all(
+        isinstance(d, (int, float)) and not isinstance(d, bool) and math.isfinite(d) and d > 0
+        for d in (dx, dy, dz)
+    ):
+        raise ValidationError(
+            "Each cuboid dimension (dx, dy, dz) must be a finite positive number (> 0)."
+        )
+
+    if frame_from is not None and frame_to is not None and frame_from > frame_to:
+        raise ValidationError("frame_from must be less than or equal to frame_to.")
+
     updated_shapes = 0
     updated_tracks = 0
 
     with transaction.atomic():
+        if job_id is not None:
+            db_job = models.Job.objects.select_related("segment__task").filter(pk=job_id).first()
+            if db_job is None:
+                raise ValidationError(f"Job #{job_id} does not exist.")
+            db_task = db_job.segment.task
+        elif task_id is not None:
+            db_task = models.Task.objects.filter(pk=task_id).first()
+            if db_task is None:
+                raise ValidationError(f"Task #{task_id} does not exist.")
+        else:
+            raise ValidationError("Either task_id or job_id must be specified.")
+
+        label_filter = Q(task_id=db_task.id)
+        if db_task.project_id is not None:
+            label_filter |= Q(project_id=db_task.project_id)
+        if not models.Label.objects.filter(label_filter, pk=label_id).exists():
+            raise ValidationError(
+                f"Label #{label_id} does not belong to the target {'job' if job_id is not None else 'task'}."
+            )
+
         if track_id is not None:
             labeled_shapes_qs = models.LabeledShape.objects.none()
             if job_id is not None:
+                if not models.LabeledTrack.objects.filter(pk=track_id, job_id=job_id).exists():
+                    raise ValidationError(f"Track #{track_id} does not belong to job #{job_id}.")
                 tracked_shapes_qs = models.TrackedShape.objects.filter(
                     track_id=track_id,
                     track__job_id=job_id,
                     type=models.ShapeType.CUBOID,
                 )
             else:
+                if not models.LabeledTrack.objects.filter(
+                    pk=track_id, job__segment__task_id=task_id
+                ).exists():
+                    raise ValidationError(f"Track #{track_id} does not belong to task #{task_id}.")
                 tracked_shapes_qs = models.TrackedShape.objects.filter(
                     track_id=track_id,
                     track__job__segment__task_id=task_id,
@@ -1073,57 +1114,64 @@ def _standardize_cuboids_impl(
             labeled_shapes_qs = labeled_shapes_qs.filter(frame__lte=frame_to)
             tracked_shapes_qs = tracked_shapes_qs.filter(frame__lte=frame_to)
 
-        shapes_to_update = []
-        for shape in labeled_shapes_qs.iterator(chunk_size=1000):
-            pts = list(shape.points)
-            if len(pts) >= 9:
-                if reground:
-                    old_z = pts[2]
-                    old_dz = pts[8]
-                    z_bottom = old_z - old_dz / 2.0
-                    pts[2] = round(z_bottom + dz / 2.0, 4)
-                pts[6] = round(dx, 4)
-                pts[7] = round(dy, 4)
-                pts[8] = round(dz, 4)
-                shape.points = pts
-                shapes_to_update.append(shape)
-                if len(shapes_to_update) >= 1000:
-                    models.LabeledShape.objects.bulk_update(shapes_to_update, ["points"])
-                    updated_shapes += len(shapes_to_update)
-                    shapes_to_update = []
-        if shapes_to_update:
-            models.LabeledShape.objects.bulk_update(shapes_to_update, ["points"])
-            updated_shapes += len(shapes_to_update)
+        dx_str = str(round(dx, 4))
+        dy_str = str(round(dy, 4))
+        dz_str = str(round(dz, 4))
+        half_dz = dz * 0.5
 
-        tracks_to_update = []
-        for shape in tracked_shapes_qs.iterator(chunk_size=1000):
-            pts = list(shape.points)
-            if len(pts) >= 9:
-                if reground:
-                    old_z = pts[2]
-                    old_dz = pts[8]
-                    z_bottom = old_z - old_dz / 2.0
-                    pts[2] = round(z_bottom + dz / 2.0, 4)
-                pts[6] = round(dx, 4)
-                pts[7] = round(dy, 4)
-                pts[8] = round(dz, 4)
-                shape.points = pts
-                tracks_to_update.append(shape)
-                if len(tracks_to_update) >= 1000:
-                    models.TrackedShape.objects.bulk_update(tracks_to_update, ["points"])
-                    updated_tracks += len(tracks_to_update)
-                    tracks_to_update = []
-        if tracks_to_update:
-            models.TrackedShape.objects.bulk_update(tracks_to_update, ["points"])
-            updated_tracks += len(tracks_to_update)
+        def _bulk_standardize_qs(qs, table_name: str) -> int:
+            try:
+                sub_qs = qs.annotate(
+                    a=RawSQL(f'string_to_array("{table_name}"."points", \',\')', ())
+                ).values("id", "a")
+                sub_sql, sub_params = sub_qs.query.sql_with_params()
+            except EmptyResultSet:
+                return 0
+
+            if reground:
+                expr_sql = (
+                    "s.a[1:2] "
+                    "|| ARRAY[round((s.a[3]::float8 - s.a[9]::float8 * 0.5 + %s)::numeric, 4)::text] "
+                    "|| s.a[4:6] "
+                    "|| ARRAY[%s, %s, %s] "
+                    "|| s.a[10:array_upper(s.a, 1)]"
+                )
+                expr_params = [half_dz, dx_str, dy_str, dz_str]
+            else:
+                expr_sql = (
+                    "s.a[1:6] "
+                    "|| ARRAY[%s, %s, %s] "
+                    "|| s.a[10:array_upper(s.a, 1)]"
+                )
+                expr_params = [dx_str, dy_str, dz_str]
+
+            sql = (
+                f"WITH s AS MATERIALIZED ({sub_sql}) "
+                f"UPDATE {table_name} AS t "
+                f"SET points = array_to_string({expr_sql}, ',') "
+                f"FROM s "
+                f"WHERE t.id = s.id AND array_length(s.a, 1) >= 9"
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(sql, [*sub_params, *expr_params])
+                return cursor.rowcount
+
+        updated_shapes = _bulk_standardize_qs(
+            labeled_shapes_qs, models.LabeledShape._meta.db_table
+        )
+        updated_tracks = _bulk_standardize_qs(
+            tracked_shapes_qs, models.TrackedShape._meta.db_table
+        )
 
         now = timezone.now()
         if job_id is not None:
             models.Job.objects.filter(pk=job_id).update(updated_date=now)
-            models.Task.objects.filter(segment__job__id=job_id).update(updated_date=now)
+            models.Task.objects.filter(pk=db_task.id).update(updated_date=now)
         elif task_id is not None:
-            models.Task.objects.filter(pk=task_id).update(updated_date=now)
-            models.Job.objects.filter(segment__task_id=task_id).update(updated_date=now)
+            models.Task.objects.filter(pk=db_task.id).update(updated_date=now)
+            models.Job.objects.filter(segment__task_id=db_task.id).update(updated_date=now)
+        if db_task.project_id is not None:
+            models.Project.objects.filter(pk=db_task.project_id).update(updated_date=now)
 
     return updated_shapes, updated_tracks
 

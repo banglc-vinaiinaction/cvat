@@ -54,14 +54,28 @@ def read_pcd(filepath: str) -> Tuple[np.ndarray, List[str], Dict[str, Any]]:
         counts = [int(c) for c in metadata.get('COUNT', [1] * len(fields))]
         num_points = int(metadata.get('POINTS', [metadata.get('WIDTH', [0])[0]])[0])
 
+        total_cols = sum(counts) if counts else len(fields)
+
         if data_format == 'ascii':
-            # Fast numpy load for ascii data
-            data = np.loadtxt(f, dtype=np.float32)
-            if data.ndim == 1:
-                data = data.reshape(1, -1)
-            return data, fields, metadata
+            raw_text = f.read().decode('ascii', errors='ignore')
+            flat = np.fromstring(raw_text, dtype=np.float32, sep=' ')
+            if flat.size == 0:
+                return np.empty((0, total_cols), dtype=np.float32), fields, metadata
+            return flat.reshape(-1, total_cols), fields, metadata
         elif data_format == 'binary':
-            # Create numpy dtype from header
+            raw_bytes = f.read()
+            if num_points == 0 or not raw_bytes:
+                return np.empty((0, total_cols), dtype=np.float32), fields, metadata
+
+            # Fast path when all fields are standard 32-bit floats
+            if all(t.upper() == 'F' and s == 4 for t, s in zip(types, sizes)):
+                expected_floats = num_points * total_cols
+                data = np.frombuffer(
+                    raw_bytes, dtype=np.float32, count=expected_floats
+                ).reshape(num_points, total_cols).copy()
+                return data, fields, metadata
+
+            # Create numpy dtype from header for heterogeneous field types
             type_map = {'F': 'f', 'U': 'u', 'I': 'i'}
             dtype_fields = []
             for name, size, t, count in zip(fields, sizes, types, counts):
@@ -72,17 +86,19 @@ def read_pcd(filepath: str) -> Tuple[np.ndarray, List[str], Dict[str, Any]]:
                     dtype_fields.append((name, np_code))
 
             dt = np.dtype(dtype_fields)
-            raw_bytes = f.read()
             structured_data = np.frombuffer(raw_bytes, dtype=dt, count=num_points)
 
-            # Convert structured array to float32 array
-            float_cols = []
-            for name in fields:
-                col = structured_data[name].astype(np.float32)
-                if col.ndim == 1:
-                    col = col[:, np.newaxis]
-                float_cols.append(col)
-            data = np.hstack(float_cols)
+            # Convert structured array into preallocated float32 array
+            data = np.empty((num_points, total_cols), dtype=np.float32)
+            col_idx = 0
+            for name, count in zip(fields, counts):
+                col = structured_data[name]
+                if count > 1:
+                    data[:, col_idx:col_idx + count] = col
+                    col_idx += count
+                else:
+                    data[:, col_idx] = col
+                    col_idx += 1
             return data, fields, metadata
         else:
             raise ValueError(f"Unsupported PCD DATA format: {data_format}")

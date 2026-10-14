@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import mimetypes
 import os
 import re
@@ -5116,7 +5117,7 @@ class AnnotationGuideWriteSerializer(WriteOnceMixin, serializers.ModelSerializer
 
 
 class StandardizeCuboidsSerializer(serializers.Serializer):
-    label_id = serializers.IntegerField(required=True)
+    label_id = serializers.IntegerField(required=True, min_value=1)
     dimensions = serializers.ListField(
         child=serializers.FloatField(min_value=0.01),
         min_length=3,
@@ -5124,6 +5125,30 @@ class StandardizeCuboidsSerializer(serializers.Serializer):
         required=True,
     )
     reground = serializers.BooleanField(default=True, required=False)
-    frame_from = serializers.IntegerField(required=False, allow_null=True, default=None)
-    frame_to = serializers.IntegerField(required=False, allow_null=True, default=None)
-    track_id = serializers.IntegerField(required=False, allow_null=True, default=None)
+    frame_from = serializers.IntegerField(
+        required=False, allow_null=True, default=None, min_value=0
+    )
+    frame_to = serializers.IntegerField(
+        required=False, allow_null=True, default=None, min_value=0
+    )
+    track_id = serializers.IntegerField(
+        required=False, allow_null=True, default=None, min_value=1
+    )
+
+    def validate_dimensions(self, value: list[float]) -> list[float]:
+        for dim in value:
+            if not math.isfinite(dim) or dim <= 0:
+                raise serializers.ValidationError(
+                    "Each dimension (dx, dy, dz) must be a finite positive number (> 0)."
+                )
+        return value
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        frame_from = attrs.get("frame_from")
+        frame_to = attrs.get("frame_to")
+        if frame_from is not None and frame_to is not None and frame_from > frame_to:
+            raise serializers.ValidationError(
+                {"frame_from": "frame_from must be less than or equal to frame_to."}
+            )
+        return attrs
+

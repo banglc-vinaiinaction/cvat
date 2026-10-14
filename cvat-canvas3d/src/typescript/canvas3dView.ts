@@ -167,6 +167,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private controller: Canvas3dController;
     private gpuCapabilities: GpuCapabilities;
     private mainRenderer: THREE.WebGLRenderer;
+    private masterCanvas: HTMLCanvasElement;
+    private dockCanvases: Record<ViewType, HTMLCanvasElement>;
+    private dockContexts: Record<ViewType, CanvasRenderingContext2D | null>;
     private mainSceneWorker: MainSceneWorker;
     private onDocumentMouseUp: () => void;
     private views: Views;
@@ -199,6 +202,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private basePointCloudGeometry: THREE.BufferGeometry | null = null;
     private filteredPointCloudGeometry: THREE.BufferGeometry | null = null;
     private lastIsolationToggleTime: number = 0;
+    private activeIsolationMargin: { horiz: number; vert: number } = { horiz: 1.2, vert: 0.8 };
     private groundGrid: GroundElevationGrid | null = null;
     private previousCuboids: Map<number, number[][]> = new Map();
     private isObjectIsolated: boolean = false;
@@ -207,12 +211,16 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private groundStrippingOffset: number = 0.12;
     private isSceneStitchedState: boolean = false;
     private unstitchedBaseGeometry: THREE.BufferGeometry | null = null;
+    private static readonly MAX_STITCHED_CACHE_FRAMES = 16;
     private stitchedCache: Map<number, THREE.BufferGeometry> = new Map();
+    private onWebGLContextLost: ((event: Event) => void) | null = null;
+    private onWebGLContextRestored: (() => void) | null = null;
     private groundClippingPlane: THREE.Plane | null = null;
     private cachedGlobalGroundPlane: [number, number, number, number] | null = null;
     private pointCloudMeshes: THREE.Points[] = [];
     private hiddenByIsolation: Set<number> = new Set();
     private orthoPointsGeometry: THREE.BufferGeometry | null = null;
+    private orthoRoiSubGeometry: THREE.BufferGeometry | null = null;
     private orthoRoiSphereUniform: { value: THREE.Vector4 } = { value: new THREE.Vector4(0, 0, 0, 0) };
     private lastRoiCenter: THREE.Vector3 | null = null;
     private scenePlanes: Record<string, THREE.Mesh | null> = {
@@ -220,11 +228,16 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         [ViewType.SIDE]: null,
         [ViewType.FRONT]: null,
     };
+    private static readonly MAX_GEOMETRY_CACHE_FRAMES = 64;
+    private static readonly MAX_GEOMETRY_CACHE_BYTES = 192 * 1024 * 1024;
+    private geometryCacheBytes: number = 0;
     private geometryCache: Map<number, {
         geometry: THREE.BufferGeometry;
         strippedGeometry?: THREE.BufferGeometry | null;
+        strippedOffset?: number;
         groundGrid: GroundElevationGrid;
         globalGroundPlane: [number, number, number, number];
+        byteLength?: number;
     }> = new Map();
     private perfFps: number = 60;
     private perfFrameTimeMs: number = 16.7;
@@ -238,10 +251,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     public getPerformanceStats(): Canvas3dPerformanceStats {
         const { mainWorkerActive } = areSceneWorkersActive();
         let gpuTierLabel = 'iGPU';
-        let renderingMethodLabel = 'iGPU Balanced (4-View WebGL2 + Shader ROI)';
+        let renderingMethodLabel = 'iGPU Balanced (Single-Context WebGL2 Scissor + Shader ROI)';
         if (this.gpuCapabilities.tier === 'dgpu') {
             gpuTierLabel = 'dGPU';
-            renderingMethodLabel = 'dGPU 4-View Direct WebGL2 + Shader ROI';
+            renderingMethodLabel = 'dGPU Unified Single-Context WebGL2 Scissor + Shader ROI';
         } else if (this.gpuCapabilities.tier === 'software') {
             gpuTierLabel = 'Software';
             renderingMethodLabel = 'Software Low-Overhead';
@@ -316,6 +329,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.perfHudElement.textContent = [
             `GPU Tier    : ${stats.gpuTier} (${stats.gpuRenderer})`,
             `Render Mode : ${stats.renderingMethod}`,
+            `GPU Context : 1 Shared WebGL2 Context (4-View Scissor Multiplexing)`,
             `Scene Worker: MainSceneWorker [${w1}] | VRAM Cache: ${this.geometryCache.size}/64 frames`,
             `FPS / Frame : ${stats.fps} FPS (${stats.frameTimeMs.toFixed(1)} ms | GPU draw: ${stats.renderTimeMs.toFixed(2)} ms)`,
             `Points      : ${stats.pointCount.toLocaleString()} main | ${stats.orthoRoiPoints.toLocaleString()} ortho ROI | ${stats.cuboidCount} cuboids`,
@@ -681,9 +695,14 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     private buildGroundStrippedGeometry(baseGeo: THREE.BufferGeometry): THREE.BufferGeometry {
         const frameNumber = this.model.data.imageID;
+        const baseOffset = Math.max(this.groundStrippingOffset, 0.18);
         if (frameNumber !== null && this.geometryCache.has(frameNumber)) {
             const cached = this.geometryCache.get(frameNumber)!;
-            if (cached.geometry === baseGeo && cached.strippedGeometry) {
+            if (
+                cached.geometry === baseGeo &&
+                cached.strippedGeometry &&
+                cached.strippedOffset === baseOffset
+            ) {
                 return cached.strippedGeometry;
             }
         }
@@ -709,6 +728,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             gA = -gA; gB = -gB; gC = -gC; gD = -gD;
         }
         const safeGC = Math.abs(gC) > 0.25 ? gC : 1.0;
+        const invSafeGC = -1.0 / safeGC;
 
         if (!baseGeo.boundingBox) {
             baseGeo.computeBoundingBox();
@@ -721,29 +741,32 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         // 1) Coarse 2.5m terrain grid to estimate local road elevation across slopes, crowns, and hills
         const coarseCell = Math.max(2.5, (maxX - minX) / 240, (maxY - minY) / 240);
-        const cCols = Math.min(256, Math.max(1, Math.ceil((maxX - minX) / coarseCell) + 1));
-        const cRows = Math.min(256, Math.max(1, Math.ceil((maxY - minY) / coarseCell) + 1));
+        const invCoarseCell = 1.0 / coarseCell;
+        const cCols = Math.min(256, Math.max(1, Math.ceil((maxX - minX) * invCoarseCell) + 1));
+        const cRows = Math.min(256, Math.max(1, Math.ceil((maxY - minY) * invCoarseCell) + 1));
         const coarseMinZ = new Float32Array(cCols * cRows);
         coarseMinZ.fill(Infinity);
+        const pointCoarseIdx = new Int32Array(numPoints);
 
         for (let i = 0; i < numPoints; i++) {
             const i3 = i * 3;
             const x = positions[i3];
             const y = positions[i3 + 1];
             const z = positions[i3 + 2];
-            const zPlane = -(gA * x + gB * y + gD) / safeGC;
+            const cx = Math.min(cCols - 1, Math.max(0, Math.floor((x - minX) * invCoarseCell)));
+            const cy = Math.min(cRows - 1, Math.max(0, Math.floor((y - minY) * invCoarseCell)));
+            const idx = cy * cCols + cx;
+            pointCoarseIdx[i] = idx;
+            const zPlane = (gA * x + gB * y + gD) * invSafeGC;
             const distXY = Math.sqrt(x * x + y * y);
             if (z >= zPlane - 1.5 && z <= zPlane + 2.5 + 0.04 * distXY) {
-                const cx = Math.min(cCols - 1, Math.max(0, Math.floor((x - minX) / coarseCell)));
-                const cy = Math.min(cRows - 1, Math.max(0, Math.floor((y - minY) / coarseCell)));
-                const idx = cy * cCols + cx;
                 if (z < coarseMinZ[idx]) {
                     coarseMinZ[idx] = z;
                 }
             }
         }
 
-        // Smooth coarse grid with 3x3 ditch-resistant minimum (plus 5x5 fallback for empty cells)
+        // Smooth coarse grid with 3x3 ditch-resistant minimum (plus 5x5 outer ring fallback for empty cells)
         const smoothedRoadZ = new Float32Array(cCols * cRows);
         for (let cy = 0; cy < cRows; cy++) {
             for (let cx = 0; cx < cCols; cx++) {
@@ -753,10 +776,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 for (let dy = -1; dy <= 1; dy++) {
                     const ny = cy + dy;
                     if (ny < 0 || ny >= cRows) continue;
+                    const rowOff = ny * cCols;
                     for (let dx = -1; dx <= 1; dx++) {
                         const nx = cx + dx;
                         if (nx < 0 || nx >= cCols) continue;
-                        const nz = coarseMinZ[ny * cCols + nx];
+                        const nz = coarseMinZ[rowOff + nx];
                         if (nz < min1) {
                             min2 = min1;
                             min1 = nz;
@@ -775,10 +799,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     for (let dy = -2; dy <= 2; dy++) {
                         const ny = cy + dy;
                         if (ny < 0 || ny >= cRows) continue;
+                        const rowOff = ny * cCols;
                         for (let dx = -2; dx <= 2; dx++) {
+                            if (dy >= -1 && dy <= 1 && dx >= -1 && dx <= 1) continue;
                             const nx = cx + dx;
                             if (nx < 0 || nx >= cCols) continue;
-                            const nz = coarseMinZ[ny * cCols + nx];
+                            const nz = coarseMinZ[rowOff + nx];
                             if (nz < min5) min5 = nz;
                         }
                     }
@@ -789,8 +815,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         // 2) Fine 1.0m vertical-span grid to distinguish flat pavement/curb cells from cells with vertical objects
         const fineCell = Math.max(1.0, (maxX - minX) / 480, (maxY - minY) / 480);
-        const fCols = Math.min(512, Math.max(1, Math.ceil((maxX - minX) / fineCell) + 1));
-        const fRows = Math.min(512, Math.max(1, Math.ceil((maxY - minY) / fineCell) + 1));
+        const invFineCell = 1.0 / fineCell;
+        const fCols = Math.min(512, Math.max(1, Math.ceil((maxX - minX) * invFineCell) + 1));
+        const fRows = Math.min(512, Math.max(1, Math.ceil((maxY - minY) * invFineCell) + 1));
         const fineMinZ = new Float32Array(fCols * fRows);
         const fineMaxZ = new Float32Array(fCols * fRows);
         fineMinZ.fill(Infinity);
@@ -801,27 +828,30 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             const x = positions[i3];
             const y = positions[i3 + 1];
             const z = positions[i3 + 2];
-            const cx = Math.min(cCols - 1, Math.max(0, Math.floor((x - minX) / coarseCell)));
-            const cy = Math.min(cRows - 1, Math.max(0, Math.floor((y - minY) / coarseCell)));
-            let zRoad = smoothedRoadZ[cy * cCols + cx];
+            let zRoad = smoothedRoadZ[pointCoarseIdx[i]];
             if (zRoad === Infinity) {
-                zRoad = -(gA * x + gB * y + gD) / safeGC;
+                zRoad = (gA * x + gB * y + gD) * invSafeGC;
             }
             if (z >= zRoad - 0.35 && z <= zRoad + 2.5) {
-                const fx = Math.min(fCols - 1, Math.max(0, Math.floor((x - minX) / fineCell)));
-                const fy = Math.min(fRows - 1, Math.max(0, Math.floor((y - minY) / fineCell)));
+                const fx = Math.min(fCols - 1, Math.max(0, Math.floor((x - minX) * invFineCell)));
+                const fy = Math.min(fRows - 1, Math.max(0, Math.floor((y - minY) * invFineCell)));
                 const fIdx = fy * fCols + fx;
                 if (z < fineMinZ[fIdx]) fineMinZ[fIdx] = z;
                 if (z > fineMaxZ[fIdx]) fineMaxZ[fIdx] = z;
             }
         }
 
-        // 3) Collect visible 3D cuboids so points inside annotated object footprints are protected above tire bottoms
+        // 3) Collect visible 3D cuboids and bin them into coarse grid cells to avoid O(N_points * N_cuboids) loop
         const activeCuboids: {
             px: number; py: number; bottomZ: number;
             uxX: number; uxY: number; uyX: number; uyY: number;
             halfL: number; halfW: number; radiusSq: number;
         }[] = [];
+        const cuboidCellHead = new Int32Array(cCols * cRows);
+        cuboidCellHead.fill(-1);
+        const cuboidLinkBox: number[] = [];
+        const cuboidLinkNext: number[] = [];
+
         for (const key of Object.keys(this.drawnObjects)) {
             const obj = this.drawnObjects[+key];
             if (!obj || obj.data.outside || obj.data.hidden || !obj.cuboid?.perspective) continue;
@@ -830,6 +860,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             const sinZ = Math.sin(rot.z);
             const halfL = scale.x / 2 + 0.12;
             const halfW = scale.y / 2 + 0.12;
+            const radiusSq = halfL * halfL + halfW * halfW;
+            const radius = Math.sqrt(radiusSq);
+            const boxIdx = activeCuboids.length;
             activeCuboids.push({
                 px: pos.x,
                 py: pos.y,
@@ -840,12 +873,26 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 uyY: cosZ,
                 halfL,
                 halfW,
-                radiusSq: halfL * halfL + halfW * halfW,
+                radiusSq,
             });
+
+            const cxMin = Math.min(cCols - 1, Math.max(0, Math.floor((pos.x - radius - minX) * invCoarseCell)));
+            const cxMax = Math.min(cCols - 1, Math.max(0, Math.floor((pos.x + radius - minX) * invCoarseCell)));
+            const cyMin = Math.min(cRows - 1, Math.max(0, Math.floor((pos.y - radius - minY) * invCoarseCell)));
+            const cyMax = Math.min(cRows - 1, Math.max(0, Math.floor((pos.y + radius - minY) * invCoarseCell)));
+            for (let cy = cyMin; cy <= cyMax; cy++) {
+                const rowOff = cy * cCols;
+                for (let cx = cxMin; cx <= cxMax; cx++) {
+                    const cIdx = rowOff + cx;
+                    const linkIdx = cuboidLinkBox.length;
+                    cuboidLinkBox.push(boxIdx);
+                    cuboidLinkNext.push(cuboidCellHead[cIdx]);
+                    cuboidCellHead[cIdx] = linkIdx;
+                }
+            }
         }
 
         const grid = this.getGroundGrid();
-        const baseOffset = Math.max(this.groundStrippingOffset, 0.18);
         const keepMask = new Uint8Array(numPoints);
         let keptCount = 0;
 
@@ -855,11 +902,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             const y = positions[i3 + 1];
             const z = positions[i3 + 2];
 
-            const cx = Math.min(cCols - 1, Math.max(0, Math.floor((x - minX) / coarseCell)));
-            const cy = Math.min(cRows - 1, Math.max(0, Math.floor((y - minY) / coarseCell)));
-            let zRoad = smoothedRoadZ[cy * cCols + cx];
+            const cIdx = pointCoarseIdx[i];
+            let zRoad = smoothedRoadZ[cIdx];
             if (zRoad === Infinity) {
-                zRoad = -(gA * x + gB * y + gD) / safeGC;
+                zRoad = (gA * x + gB * y + gD) * invSafeGC;
             }
             if (grid) {
                 const gElev = grid.getElevation(x, y);
@@ -868,8 +914,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 }
             }
 
-            const fx = Math.min(fCols - 1, Math.max(0, Math.floor((x - minX) / fineCell)));
-            const fy = Math.min(fRows - 1, Math.max(0, Math.floor((y - minY) / fineCell)));
+            const fx = Math.min(fCols - 1, Math.max(0, Math.floor((x - minX) * invFineCell)));
+            const fy = Math.min(fRows - 1, Math.max(0, Math.floor((y - minY) * invFineCell)));
             const fIdx = fy * fCols + fx;
             const vSpan = fineMaxZ[fIdx] - fineMinZ[fIdx];
             const distXY = Math.sqrt(x * x + y * y);
@@ -879,17 +925,21 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 (zRoad + baseOffset + 0.26 + 0.003 * distXY) :
                 (zRoad + baseOffset + 0.04 + 0.002 * distXY);
 
-            for (let c = 0; c < activeCuboids.length; c++) {
-                const box = activeCuboids[c];
-                const dx = x - box.px;
-                const dy = y - box.py;
-                if (dx * dx + dy * dy <= box.radiusSq) {
-                    const lx = Math.abs(dx * box.uxX + dy * box.uxY);
-                    const ly = Math.abs(dx * box.uyX + dy * box.uyY);
-                    if (lx <= box.halfL && ly <= box.halfW) {
-                        stripCeiling = Math.min(stripCeiling, box.bottomZ + 0.08);
-                        break;
+            if (z <= stripCeiling) {
+                let link = cuboidCellHead[cIdx];
+                while (link !== -1) {
+                    const box = activeCuboids[cuboidLinkBox[link]];
+                    const dx = x - box.px;
+                    const dy = y - box.py;
+                    if (dx * dx + dy * dy <= box.radiusSq) {
+                        const lx = Math.abs(dx * box.uxX + dy * box.uxY);
+                        const ly = Math.abs(dx * box.uyX + dy * box.uyY);
+                        if (lx <= box.halfL && ly <= box.halfW) {
+                            stripCeiling = Math.min(stripCeiling, box.bottomZ + 0.08);
+                            break;
+                        }
                     }
+                    link = cuboidLinkNext[link];
                 }
             }
 
@@ -925,6 +975,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
 
         const strippedGeo = new THREE.BufferGeometry();
+        strippedGeo.userData.shared = true;
         strippedGeo.setAttribute('position', new THREE.Float32BufferAttribute(outPos, 3));
         if (outCol) {
             strippedGeo.setAttribute('color', new THREE.Float32BufferAttribute(outCol, 3));
@@ -942,7 +993,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         if (frameNumber !== null && this.geometryCache.has(frameNumber)) {
             const cached = this.geometryCache.get(frameNumber)!;
             if (cached.geometry === baseGeo) {
+                if (cached.strippedGeometry && cached.strippedGeometry !== strippedGeo) {
+                    cached.strippedGeometry.dispose();
+                }
                 cached.strippedGeometry = strippedGeo;
+                cached.strippedOffset = baseOffset;
             }
         }
         return strippedGeo;
@@ -973,13 +1028,25 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const uy = new THREE.Vector3(0, 1, 0).applyEuler(euler).normalize();
         const uz = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
 
-        const halfL = scale.x / 2 + 1.2;
-        const halfW = scale.y / 2 + 1.2;
-        const maxLocalZ = scale.z / 2 + 0.8;
+        const tightHoriz = 1.2;
+        const tightVert = 0.8;
+        const halfL = scale.x / 2 + tightHoriz;
+        const halfW = scale.y / 2 + tightHoriz;
+        const maxLocalZ = scale.z / 2 + tightVert;
         const minLocalZ = stripGround ? (-scale.z / 2 + 0.10) : (-scale.z / 2 - 0.6);
         const maxRadiusSq = halfL * halfL + halfW * halfW + maxLocalZ * maxLocalZ;
 
+        // Fallback expanded margin for distant/sparse cuboids where LiDAR rings are >1.2m apart
+        const fallbackHoriz = 6.0;
+        const fallbackVert = 3.0;
+        const fbHalfL = scale.x / 2 + fallbackHoriz;
+        const fbHalfW = scale.y / 2 + fallbackHoriz;
+        const fbMaxZ = scale.z / 2 + fallbackVert;
+        const fbMinZ = stripGround ? (-scale.z / 2 + 0.10) : (-scale.z / 2 - fallbackVert);
+        const fbRadiusSq = fbHalfL * fbHalfL + fbHalfW * fbHalfW + fbMaxZ * fbMaxZ;
+
         const keepMask = new Uint8Array(numPoints);
+        const fallbackCandidates: number[] = [];
         let keptCount = 0;
 
         for (let i = 0; i < numPoints; i++) {
@@ -987,13 +1054,41 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             const dx = positions[i3] - pos.x;
             const dy = positions[i3 + 1] - pos.y;
             const dz = positions[i3 + 2] - pos.z;
-            if (dx * dx + dy * dy + dz * dz <= maxRadiusSq) {
+            const rSq = dx * dx + dy * dy + dz * dz;
+            if (rSq <= fbRadiusSq) {
+                if (rSq <= maxRadiusSq) {
+                    const lx = dx * ux.x + dy * ux.y + dz * ux.z;
+                    if (Math.abs(lx) <= halfL) {
+                        const ly = dx * uy.x + dy * uy.y + dz * uy.z;
+                        if (Math.abs(ly) <= halfW) {
+                            const lz = dx * uz.x + dy * uz.y + dz * uz.z;
+                            if (lz >= minLocalZ && lz <= maxLocalZ) {
+                                keepMask[i] = 1;
+                                keptCount++;
+                            }
+                        }
+                    }
+                }
+                fallbackCandidates.push(i);
+            }
+        }
+
+        if (keptCount > 0) {
+            this.activeIsolationMargin = { horiz: tightHoriz, vert: tightVert };
+        } else {
+            this.activeIsolationMargin = { horiz: fallbackHoriz, vert: fallbackVert };
+            for (let k = 0; k < fallbackCandidates.length; k++) {
+                const i = fallbackCandidates[k];
+                const i3 = i * 3;
+                const dx = positions[i3] - pos.x;
+                const dy = positions[i3 + 1] - pos.y;
+                const dz = positions[i3 + 2] - pos.z;
                 const lx = dx * ux.x + dy * ux.y + dz * ux.z;
-                if (Math.abs(lx) <= halfL) {
+                if (Math.abs(lx) <= fbHalfL) {
                     const ly = dx * uy.x + dy * uy.y + dz * uy.z;
-                    if (Math.abs(ly) <= halfW) {
+                    if (Math.abs(ly) <= fbHalfW) {
                         const lz = dx * uz.x + dy * uz.y + dz * uz.z;
-                        if (lz >= minLocalZ && lz <= maxLocalZ) {
+                        if (lz >= fbMinZ && lz <= fbMaxZ) {
                             keepMask[i] = 1;
                             keptCount++;
                         }
@@ -1048,7 +1143,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const baseGeo = this.basePointCloudGeometry || this.pointCloudPoints?.geometry;
         if (!baseGeo || this.pointCloudMeshes.length === 0) return;
 
-        if (this.filteredPointCloudGeometry) {
+        if (this.filteredPointCloudGeometry && !this.filteredPointCloudGeometry.userData?.shared) {
             this.filteredPointCloudGeometry.dispose();
             this.filteredPointCloudGeometry = null;
         }
@@ -1094,8 +1189,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 const uy = new THREE.Vector3(0, 1, 0).applyEuler(euler).normalize();
                 const uz = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
 
-                const marginHoriz = 1.2;
-                const marginVert = 0.8;
+                const marginHoriz = this.activeIsolationMargin.horiz;
+                const marginVert = this.activeIsolationMargin.vert;
 
                 const halfL = scale.x / 2 + marginHoriz;
                 const halfW = scale.y / 2 + marginHoriz;
@@ -1131,11 +1226,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     public toggleObjectIsolation(clientID?: number | null): boolean {
-        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-        if (now - this.lastIsolationToggleTime < 80) {
-            return this.isObjectIsolated;
-        }
-        this.lastIsolationToggleTime = now;
+        this.lastIsolationToggleTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
         let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
         if (targetClientID === null) {
@@ -1165,7 +1256,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
 
         // If no cuboid is currently selected, find the visible cuboid closest to camera lookAt target
-        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+        if (
+            targetClientID === null ||
+            !(targetClientID in this.drawnObjects) ||
+            this.drawnObjects[targetClientID].data.outside ||
+            this.drawnObjects[targetClientID].data.hidden
+        ) {
             const lookTarget = this.views.perspective.controls ?
                 this.views.perspective.controls.getTarget(new THREE.Vector3()) :
                 new THREE.Vector3(0, 0, 0);
@@ -1254,8 +1350,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 if (localPlane) {
                     return localPlane;
                 }
-            }
-            if (positions && positions.length >= 9) {
+            } else if (positions && positions.length >= 9) {
                 const localPlane = estimateLocalRoadPlane(pos.x, pos.y, pos.z, positions, 3.5);
                 if (localPlane) {
                     return localPlane;
@@ -1277,7 +1372,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     private refreshGroundClippingPlane(): [number, number, number, number] {
-        const planeEq = this.getGroundPlane();
+        const planeEq = this.cachedGlobalGroundPlane || this.getGroundPlane();
         let [A, B, C, D] = planeEq;
         const len = Math.sqrt(A * A + B * B + C * C);
         if (len > 1e-6) {
@@ -1401,9 +1496,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         onProgress?.('Preparing current frame point cloud...', 10);
         this.unstitchedBaseGeometry = currentGeo;
 
-        // Check in-memory cache
+        // Check in-memory LRU cache
         if (this.stitchedCache.has(frameNumber)) {
             const cachedGeo = this.stitchedCache.get(frameNumber)!;
+            this.stitchedCache.delete(frameNumber);
+            this.stitchedCache.set(frameNumber, cachedGeo);
             this.basePointCloudGeometry = cachedGeo;
             this.isSceneStitchedState = true;
             this.applyPointCloudFilter();
@@ -1472,6 +1569,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                         if (pcd?.geometry?.attributes?.position) {
                             nPos = pcd.geometry.attributes.position.array as Float32Array;
                             nCol = pcd.geometry.attributes.color ? (pcd.geometry.attributes.color.array as Float32Array) : null;
+                            pcd.geometry.dispose();
+                            if (pcd.material instanceof THREE.Material) {
+                                pcd.material.dispose();
+                            }
                         }
                     }
                 }
@@ -1494,7 +1595,17 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             neighborFrames,
             { voxelSize, enableSOR: true },
         );
+        stitchedGeo.userData.shared = true;
 
+        while (this.stitchedCache.size >= Canvas3dViewImpl.MAX_STITCHED_CACHE_FRAMES) {
+            const oldestKey = this.stitchedCache.keys().next().value;
+            if (oldestKey === undefined) break;
+            const evictedGeo = this.stitchedCache.get(oldestKey);
+            this.stitchedCache.delete(oldestKey);
+            if (evictedGeo && evictedGeo !== this.basePointCloudGeometry) {
+                evictedGeo.dispose();
+            }
+        }
         this.stitchedCache.set(frameNumber, stitchedGeo);
         this.basePointCloudGeometry = stitchedGeo;
         this.isSceneStitchedState = true;
@@ -1632,51 +1743,102 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.gpuCapabilities = detectGpuCapabilities();
         this.mainSceneWorker = new MainSceneWorker();
 
-        const perspectiveCanvas = window.document.createElement('canvas');
-        perspectiveCanvas.style.width = '100%';
-        perspectiveCanvas.style.height = '100%';
+        this.masterCanvas = window.document.createElement('canvas');
+        this.masterCanvas.style.width = '100%';
+        this.masterCanvas.style.height = '100%';
+        this.masterCanvas.width = 100;
+        this.masterCanvas.height = 100;
 
         this.mainRenderer = new THREE.WebGLRenderer({
-            canvas: perspectiveCanvas,
+            canvas: this.masterCanvas,
             antialias: this.gpuCapabilities.antialias,
             powerPreference: 'high-performance',
         });
         this.mainRenderer.localClippingEnabled = true;
-        this.mainRenderer.setPixelRatio(this.gpuCapabilities.pixelRatio);
-        const origMainSetSize = this.mainRenderer.setSize.bind(this.mainRenderer);
-        this.mainRenderer.setSize = (w: number, h: number, updateStyle: boolean = false) => {
-            origMainSetSize(w, h, updateStyle);
-        };
-        this.mainRenderer.dispose = () => {
-            this.mainRenderer.renderLists.dispose();
-            this.mainRenderer.clear();
-        };
+        this.mainRenderer.setPixelRatio(1);
 
-        const createOrthoViewRenderer = (): THREE.WebGLRenderer => {
+        this.onWebGLContextLost = (event: Event): void => {
+            event.preventDefault();
+            this.geometryCache.forEach((entry) => {
+                entry.geometry.dispose();
+                entry.strippedGeometry?.dispose();
+            });
+            this.geometryCache.clear();
+            this.geometryCacheBytes = 0;
+            this.stitchedCache.forEach((geo) => {
+                geo.dispose();
+            });
+            this.stitchedCache.clear();
+        };
+        this.onWebGLContextRestored = (): void => {
+            this.requestRender(2);
+        };
+        this.masterCanvas.addEventListener('webglcontextlost', this.onWebGLContextLost, false);
+        this.masterCanvas.addEventListener('webglcontextrestored', this.onWebGLContextRestored, false);
+
+        this.dockCanvases = {} as Record<ViewType, HTMLCanvasElement>;
+        this.dockContexts = {} as Record<ViewType, CanvasRenderingContext2D | null>;
+
+        const createDockCanvas = (viewType: ViewType): HTMLCanvasElement => {
+            if (viewType === ViewType.PERSPECTIVE) {
+                this.dockCanvases[viewType] = this.masterCanvas;
+                this.dockContexts[viewType] = null;
+                return this.masterCanvas;
+            }
             const canvas = window.document.createElement('canvas');
             canvas.style.width = '100%';
             canvas.style.height = '100%';
-            const renderer = new THREE.WebGLRenderer({
-                canvas,
-                antialias: this.gpuCapabilities.antialias,
-                powerPreference: 'high-performance',
+            this.dockCanvases[viewType] = canvas;
+            this.dockContexts[viewType] = (canvas.getContext('2d', { alpha: false }) ||
+                canvas.getContext('2d')) as CanvasRenderingContext2D | null;
+            return canvas;
+        };
+
+        const createViewRendererProxy = (viewType: ViewType, dockCanvas: HTMLCanvasElement): THREE.WebGLRenderer => {
+            return new Proxy(this.mainRenderer, {
+                get: (target: THREE.WebGLRenderer, prop: string | symbol, receiver: any) => {
+                    if (prop === 'domElement') {
+                        return dockCanvas;
+                    }
+                    if (prop === 'setSize') {
+                        return (w: number, h: number, updateStyle: boolean = false) => {
+                            const pr = this.gpuCapabilities.pixelRatio;
+                            const pw = Math.max(1, Math.round(w * pr));
+                            const ph = Math.max(1, Math.round(h * pr));
+                            if (dockCanvas.width !== pw || dockCanvas.height !== ph) {
+                                dockCanvas.width = pw;
+                                dockCanvas.height = ph;
+                            }
+                            if (updateStyle) {
+                                dockCanvas.style.width = `${w}px`;
+                                dockCanvas.style.height = `${h}px`;
+                            }
+                        };
+                    }
+                    if (prop === 'render') {
+                        return (scene: THREE.Scene, camera: THREE.Camera) => {
+                            this.renderViewUnified(viewType, scene, camera);
+                        };
+                    }
+                    if (prop === 'dispose') {
+                        return () => {
+                            target.renderLists.dispose();
+                        };
+                    }
+                    if (prop === 'clear') {
+                        return () => {
+                            target.clear();
+                        };
+                    }
+                    const val = Reflect.get(target, prop, receiver);
+                    return typeof val === 'function' ? val.bind(target) : val;
+                },
             });
-            renderer.localClippingEnabled = true;
-            renderer.setPixelRatio(this.gpuCapabilities.pixelRatio);
-            const origSetSize = renderer.setSize.bind(renderer);
-            renderer.setSize = (w: number, h: number, updateStyle: boolean = false) => {
-                origSetSize(w, h, updateStyle);
-            };
-            renderer.dispose = () => {
-                renderer.renderLists.dispose();
-                renderer.clear();
-            };
-            return renderer;
         };
 
         this.views = {
             perspective: {
-                renderer: this.mainRenderer,
+                renderer: createViewRendererProxy(ViewType.PERSPECTIVE, createDockCanvas(ViewType.PERSPECTIVE)),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -1684,7 +1846,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 },
             },
             top: {
-                renderer: createOrthoViewRenderer(),
+                renderer: createViewRendererProxy(ViewType.TOP, createDockCanvas(ViewType.TOP)),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -1692,7 +1854,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 },
             },
             side: {
-                renderer: createOrthoViewRenderer(),
+                renderer: createViewRendererProxy(ViewType.SIDE, createDockCanvas(ViewType.SIDE)),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -1700,7 +1862,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 },
             },
             front: {
-                renderer: createOrthoViewRenderer(),
+                renderer: createViewRendererProxy(ViewType.FRONT, createDockCanvas(ViewType.FRONT)),
                 scene: new THREE.Scene(),
                 rayCaster: {
                     renderer: new THREE.Raycaster(),
@@ -3083,18 +3245,32 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                         this.cachedGlobalGroundPlane = result.globalGroundPlane;
 
                                         if (frameNumber !== null) {
-                                            if (this.geometryCache.size >= 64) {
+                                            geometry.userData.shared = true;
+                                            const entryBytes = (result.positions?.byteLength || 0) +
+                                                (result.colors?.byteLength || 0) +
+                                                (result.normals?.byteLength || 0);
+                                            while (
+                                                this.geometryCache.size >= Canvas3dViewImpl.MAX_GEOMETRY_CACHE_FRAMES ||
+                                                (this.geometryCacheBytes + entryBytes > Canvas3dViewImpl.MAX_GEOMETRY_CACHE_BYTES &&
+                                                    this.geometryCache.size > 0)
+                                            ) {
                                                 const oldestKey = this.geometryCache.keys().next().value;
-                                                if (oldestKey !== undefined) {
-                                                    const evicted = this.geometryCache.get(oldestKey);
-                                                    this.geometryCache.delete(oldestKey);
-                                                    evicted?.geometry.dispose();
-                                                }
+                                                if (oldestKey === undefined) break;
+                                                const evicted = this.geometryCache.get(oldestKey);
+                                                this.geometryCache.delete(oldestKey);
+                                                this.geometryCacheBytes = Math.max(
+                                                    0,
+                                                    this.geometryCacheBytes - (evicted?.byteLength || 0),
+                                                );
+                                                evicted?.geometry.dispose();
+                                                evicted?.strippedGeometry?.dispose();
                                             }
+                                            this.geometryCacheBytes += entryBytes;
                                             this.geometryCache.set(frameNumber, {
                                                 geometry,
                                                 groundGrid,
                                                 globalGroundPlane: result.globalGroundPlane,
+                                                byteLength: entryBytes,
                                             });
                                         }
 
@@ -3337,7 +3513,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const previousPoints = this.pointCloudPoints;
         const previousMeshes = this.pointCloudMeshes;
         const previousOrthoGeo = this.orthoPointsGeometry;
+        const previousFilteredGeo = this.filteredPointCloudGeometry;
         this.pointCloudPoints = null;
+        this.filteredPointCloudGeometry = null;
         this.perfPointCount = 0;
         this.perfOrthoRoiPoints = 0;
         this.groundGrid = null;
@@ -3347,9 +3525,14 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.previousCuboids.clear();
         this.isObjectIsolated = false;
         this.isolatedClientID = null;
+        this.activeIsolationMargin = null;
         this.hiddenByIsolation.clear();
         this.pointCloudMeshes = [];
         this.orthoPointsGeometry = null;
+        if (this.orthoRoiSubGeometry) {
+            this.orthoRoiSubGeometry.dispose();
+            this.orthoRoiSubGeometry = null;
+        }
         this.orthoRoiSphereUniform.value.set(0, 0, 0, 0);
         this.lastRoiCenter = null;
         this.scenePlanes = {
@@ -3384,8 +3567,20 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 }
             }
         }
-        if (previousOrthoGeo && previousOrthoGeo !== previousPoints?.geometry) {
+        if (
+            previousOrthoGeo &&
+            previousOrthoGeo !== previousPoints?.geometry &&
+            !previousOrthoGeo.userData?.shared
+        ) {
             previousOrthoGeo.dispose();
+        }
+        if (
+            previousFilteredGeo &&
+            previousFilteredGeo !== previousPoints?.geometry &&
+            previousFilteredGeo !== previousOrthoGeo &&
+            !previousFilteredGeo.userData?.shared
+        ) {
+            previousFilteredGeo.dispose();
         }
 
         Object.keys(this.views).forEach((view: string): void => {
@@ -3770,6 +3965,102 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
     }
 
+    private renderViewUnified(viewType: ViewType, scene?: THREE.Scene, camera?: THREE.Camera): void {
+        const targetScene = scene || this.views[viewType]?.scene;
+        const targetCamera = camera || this.views[viewType]?.camera;
+        if (!targetScene || !targetCamera) return;
+
+        const dockCanvas = this.dockCanvases[viewType];
+        if (!dockCanvas) return;
+
+        let width = this.viewSizes[viewType]?.width || 0;
+        let height = this.viewSizes[viewType]?.height || 0;
+
+        if (width <= 0 || height <= 0) {
+            const parent = dockCanvas.parentElement;
+            if (parent && parent.clientWidth > 0 && parent.clientHeight > 0) {
+                width = parent.clientWidth;
+                height = parent.clientHeight;
+                this.viewSizes[viewType].width = width;
+                this.viewSizes[viewType].height = height;
+            } else {
+                width = Math.max(1, dockCanvas.clientWidth || 300);
+                height = Math.max(1, dockCanvas.clientHeight || 150);
+            }
+        }
+
+        const pr = this.gpuCapabilities.pixelRatio;
+        const targetW = Math.max(1, Math.round(width * pr));
+        const targetH = Math.max(1, Math.round(height * pr));
+
+        if (viewType === ViewType.PERSPECTIVE) {
+            if (this.masterCanvas.width !== targetW || this.masterCanvas.height !== targetH) {
+                this.mainRenderer.setSize(targetW, targetH, false);
+            }
+            this.mainRenderer.setViewport(0, 0, targetW, targetH);
+            this.mainRenderer.setScissorTest(false);
+            this.mainRenderer.render(targetScene, targetCamera);
+            return;
+        }
+
+        if (dockCanvas.width !== targetW || dockCanvas.height !== targetH) {
+            dockCanvas.width = targetW;
+            dockCanvas.height = targetH;
+        }
+
+        if (this.masterCanvas.width < targetW || this.masterCanvas.height < targetH) {
+            const mw = Math.max(this.masterCanvas.width, targetW);
+            const mh = Math.max(this.masterCanvas.height, targetH);
+            this.mainRenderer.setSize(mw, mh, false);
+        }
+
+        const vx = 0;
+        const vy = this.masterCanvas.height - targetH;
+        this.mainRenderer.setViewport(vx, vy, targetW, targetH);
+        this.mainRenderer.setScissor(vx, vy, targetW, targetH);
+        this.mainRenderer.setScissorTest(true);
+
+        const roiSphere = this.orthoRoiSphereUniform.value;
+        const hiddenOrthoMeshes: THREE.Object3D[] = [];
+        if (roiSphere.w > 0) {
+            const cullRadSq = (roiSphere.w * 2.5) * (roiSphere.w * 2.5);
+            const cx = roiSphere.x;
+            const cy = roiSphere.y;
+            const cz = roiSphere.z;
+            const activeID = this.getActiveElement();
+            Object.entries(this.drawnObjects).forEach(([idStr, entry]) => {
+                if (+idStr === activeID) return;
+                const mesh = entry.cuboid?.[viewType];
+                if (mesh && mesh.visible) {
+                    const p = mesh.position;
+                    const dx = p.x - cx;
+                    const dy = p.y - cy;
+                    const dz = p.z - cz;
+                    if (dx * dx + dy * dy + dz * dz > cullRadSq) {
+                        mesh.visible = false;
+                        hiddenOrthoMeshes.push(mesh);
+                    }
+                }
+            });
+        }
+
+        this.mainRenderer.render(targetScene, targetCamera);
+
+        for (let i = 0; i < hiddenOrthoMeshes.length; i++) {
+            hiddenOrthoMeshes[i].visible = true;
+        }
+        this.mainRenderer.setScissorTest(false);
+
+        const ctx = this.dockContexts[viewType];
+        if (ctx) {
+            ctx.drawImage(
+                this.masterCanvas,
+                0, 0, targetW, targetH,
+                0, 0, targetW, targetH,
+            );
+        }
+    }
+
     private resizeRendererToDisplaySize(viewType: ViewType, view: RenderView): boolean {
         const { camera, renderer } = view;
         const canvas = renderer.domElement;
@@ -3924,11 +4215,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
 
         let didRenderAnyView = false;
-        Object.keys(this.views).forEach((view: string): void => {
+        let didRenderOrtho = false;
+        const orderedViews: ViewType[] = [ViewType.TOP, ViewType.SIDE, ViewType.FRONT, ViewType.PERSPECTIVE];
+        orderedViews.forEach((view: ViewType): void => {
             const viewType = this.views[view as keyof Views];
             if (!(viewType.controls && viewType.camera && viewType.rayCaster)) return;
 
-            const resized = this.resizeRendererToDisplaySize(view as ViewType, viewType);
+            const resized = this.resizeRendererToDisplaySize(view, viewType);
             let controlsUpdated = false;
             if (viewType.controls.enabled) {
                 controlsUpdated = viewType.controls.update(delta);
@@ -3943,7 +4236,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 this.hoverNeedsUpdate;
 
             let shouldRender = isPerspective ?
-                (forceRenderPerspective || resized || controlsUpdated || needsPerspectiveInteraction) :
+                (forceRenderPerspective || didRenderOrtho || resized || controlsUpdated || needsPerspectiveInteraction) :
                 (initialForceOrtho || this.needsOrthoRenderCount > 0 || resized || controlsUpdated || isScanningView);
 
             if (isPerspective && viewType.scene.children.length !== 0) {
@@ -3958,6 +4251,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             if (shouldRender) {
                 viewType.renderer.render(viewType.scene, viewType.camera);
                 didRenderAnyView = true;
+                if (!isPerspective) {
+                    didRenderOrtho = true;
+                }
             }
         });
 
@@ -4480,7 +4776,22 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         this.lastRoiCenter = pos.clone();
         this.orthoRoiSphereUniform.value.set(cx, cy, cz, radius);
-        this.perfOrthoRoiPoints = this.perfPointCount;
+        const positions = this.getBasePointCloudPositions();
+        if (positions && positions.length >= 3) {
+            const rSq = radius * radius;
+            let roiCount = 0;
+            for (let i = 0; i < positions.length; i += 3) {
+                const dx = positions[i] - cx;
+                const dy = positions[i + 1] - cy;
+                const dz = positions[i + 2] - cz;
+                if (dx * dx + dy * dy + dz * dz <= rSq) {
+                    roiCount++;
+                }
+            }
+            this.perfOrthoRoiPoints = roiCount;
+        } else {
+            this.perfOrthoRoiPoints = this.perfPointCount;
+        }
         this.requestOrthoRender();
     }
 
@@ -4610,10 +4921,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     public html(): ViewsDOM {
         return {
-            perspective: this.views.perspective.renderer.domElement,
-            top: this.views.top.renderer.domElement,
-            side: this.views.side.renderer.domElement,
-            front: this.views.front.renderer.domElement,
+            perspective: this.dockCanvases[ViewType.PERSPECTIVE],
+            top: this.dockCanvases[ViewType.TOP],
+            side: this.dockCanvases[ViewType.SIDE],
+            front: this.dockCanvases[ViewType.FRONT],
         };
     }
 
@@ -4621,6 +4932,16 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         if (this.onDocumentMouseUp) {
             window.document.removeEventListener('mouseup', this.onDocumentMouseUp);
             this.onDocumentMouseUp = null;
+        }
+        if (this.masterCanvas) {
+            if (this.onWebGLContextLost) {
+                this.masterCanvas.removeEventListener('webglcontextlost', this.onWebGLContextLost);
+                this.onWebGLContextLost = null;
+            }
+            if (this.onWebGLContextRestored) {
+                this.masterCanvas.removeEventListener('webglcontextrestored', this.onWebGLContextRestored);
+                this.onWebGLContextRestored = null;
+            }
         }
         if (this.perfHudElement) {
             this.perfHudElement.remove();
@@ -4633,11 +4954,29 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
         this.geometryCache.forEach((entry) => {
             entry.geometry.dispose();
+            entry.strippedGeometry?.dispose();
         });
         this.geometryCache.clear();
+        this.geometryCacheBytes = 0;
+        this.stitchedCache.forEach((geo) => {
+            geo.dispose();
+        });
+        this.stitchedCache.clear();
         Object.values(this.views).forEach((view) => {
             view.controls?.dispose();
         });
         this.mainRenderer?.dispose();
+        if (this.masterCanvas) {
+            this.masterCanvas.width = 1;
+            this.masterCanvas.height = 1;
+        }
+        if (this.dockCanvases) {
+            Object.values(this.dockCanvases).forEach((canvas) => {
+                if (canvas) {
+                    canvas.width = 1;
+                    canvas.height = 1;
+                }
+            });
+        }
     }
 }
