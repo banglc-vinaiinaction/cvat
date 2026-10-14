@@ -98,31 +98,31 @@ const componentShortcuts: Record<string, KeyMapItem> = {
     SNAP_TO_ROAD_3D_CONTROLS: {
         name: 'Snap to Road & Orient',
         description: 'Snap selected 3D cuboid flush to the road plane and align its yaw with vehicle points',
-        sequences: ['f'],
+        sequences: ['alt+s'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
     REVERT_SNAP_3D_CONTROLS: {
         name: 'Revert Snap to Road',
         description: 'Revert previously snapped 3D cuboid to its original position and orientation',
-        sequences: ['shift+f'],
+        sequences: ['alt+shift+s'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
     INVERT_HEADING_3D_CONTROLS: {
         name: 'Invert Heading (180°)',
         description: 'Invert selected 3D cuboid heading by 180 degrees',
-        sequences: ['h'],
+        sequences: ['alt+h'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
     ISOLATE_OBJECT_3D_CONTROLS: {
         name: 'Toggle Object Isolation',
         description: 'Clip point cloud to local volume around active cuboid and dim scene clutter',
-        sequences: ['i'],
+        sequences: ['shift+i'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
     SNAP_TRACK_TO_ROAD_3D_CONTROLS: {
         name: 'Snap Track to Road',
         description: 'Snap selected track across all frames to the road surface with smoothed trajectory',
-        sequences: ['alt+f'],
+        sequences: ['alt+t'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
 };
@@ -267,7 +267,7 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
         SNAP_TO_ROAD_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();
             const targetID = activeTargetID;
-            if (event && (event.shiftKey || event.key === 'F')) {
+            if (event && event.shiftKey) {
                 canvasInstance.revertSnap(targetID);
             } else {
                 canvasInstance.snapToRoad(targetID);

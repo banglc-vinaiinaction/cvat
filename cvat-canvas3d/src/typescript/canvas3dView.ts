@@ -22,6 +22,7 @@ import { disposeScene } from './utils';
 import {
     snapCuboidToRoadAndOrient, fitClusterAtPoint,
     alignEulerToRoadPlane, GroundElevationGrid,
+    computeSceneGroundPlane, estimateLocalRoadPlane,
 } from './snapping';
 
 export interface Canvas3dView {
@@ -45,6 +46,8 @@ export interface Canvas3dView {
     ): boolean;
     toggleObjectIsolation(clientID?: number | null): boolean;
     isObjectIsolatedState(): boolean;
+    toggleGroundStripping(elevationOffset?: number): boolean;
+    isGroundStrippedState(): boolean;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -162,6 +165,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private previousCuboids: Map<number, number[][]> = new Map();
     private isObjectIsolated: boolean = false;
     private isolatedClientID: number | null = null;
+    private isGroundStripped: boolean = false;
+    private groundStrippingOffset: number = 0.12;
+    private groundClippingPlane: THREE.Plane | null = null;
+    private cachedGlobalGroundPlane: [number, number, number, number] | null = null;
     private pointCloudMeshes: THREE.Points[] = [];
     private hiddenByIsolation: Set<number> = new Set();
 
@@ -706,50 +713,53 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return true;
     }
 
-    private updateIsolationPlanes(): void {
-        if (!this.isObjectIsolated || this.isolatedClientID === null) {
-            for (const cloud of this.pointCloudMeshes) {
-                if (cloud && cloud.material) {
-                    (cloud.material as THREE.PointsMaterial).clippingPlanes = [];
-                }
+    private updateClippingPlanes(): void {
+        const planes: THREE.Plane[] = [];
+
+        if (this.isObjectIsolated && this.isolatedClientID !== null) {
+            const drawn = this.drawnObjects[this.isolatedClientID];
+            if (drawn && drawn.cuboid) {
+                const { cuboid } = drawn;
+                const { position: pos, rotation: rot, scale } = cuboid.perspective;
+
+                const euler = new THREE.Euler(rot.x, rot.y, rot.z, 'XYZ');
+                const ux = new THREE.Vector3(1, 0, 0).applyEuler(euler).normalize();
+                const uy = new THREE.Vector3(0, 1, 0).applyEuler(euler).normalize();
+                const uz = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
+
+                const marginHoriz = 1.5;
+                const marginVert = 1.0;
+
+                const halfL = scale.x / 2 + marginHoriz;
+                const halfW = scale.y / 2 + marginHoriz;
+                const halfH = scale.z / 2 + marginVert;
+
+                const pPosX = new THREE.Plane(ux.clone().negate(), ux.dot(pos) + halfL);
+                const pNegX = new THREE.Plane(ux.clone(), -ux.dot(pos) + halfL);
+
+                const pPosY = new THREE.Plane(uy.clone().negate(), uy.dot(pos) + halfW);
+                const pNegY = new THREE.Plane(uy.clone(), -uy.dot(pos) + halfW);
+
+                const pPosZ = new THREE.Plane(uz.clone().negate(), uz.dot(pos) + halfH);
+                const pNegZ = new THREE.Plane(uz.clone(), -uz.dot(pos) + halfH);
+
+                planes.push(pPosX, pNegX, pPosY, pNegY, pPosZ, pNegZ);
             }
-            return;
         }
 
-        const drawn = this.drawnObjects[this.isolatedClientID];
-        if (!drawn || !drawn.cuboid) return;
-
-        const { cuboid } = drawn;
-        const { position: pos, rotation: rot, scale } = cuboid.perspective;
-
-        const euler = new THREE.Euler(rot.x, rot.y, rot.z, 'XYZ');
-        const ux = new THREE.Vector3(1, 0, 0).applyEuler(euler).normalize();
-        const uy = new THREE.Vector3(0, 1, 0).applyEuler(euler).normalize();
-        const uz = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
-
-        const marginHoriz = 1.5;
-        const marginVert = 1.0;
-
-        const halfL = scale.x / 2 + marginHoriz;
-        const halfW = scale.y / 2 + marginHoriz;
-        const halfH = scale.z / 2 + marginVert;
-
-        const pPosX = new THREE.Plane(ux.clone().negate(), ux.dot(pos) + halfL);
-        const pNegX = new THREE.Plane(ux.clone(), -ux.dot(pos) + halfL);
-
-        const pPosY = new THREE.Plane(uy.clone().negate(), uy.dot(pos) + halfW);
-        const pNegY = new THREE.Plane(uy.clone(), -uy.dot(pos) + halfW);
-
-        const pPosZ = new THREE.Plane(uz.clone().negate(), uz.dot(pos) + halfH);
-        const pNegZ = new THREE.Plane(uz.clone(), -uz.dot(pos) + halfH);
-
-        const planes = [pPosX, pNegX, pPosY, pNegY, pPosZ, pNegZ];
+        if (this.isGroundStripped && this.groundClippingPlane) {
+            planes.push(this.groundClippingPlane);
+        }
 
         for (const cloud of this.pointCloudMeshes) {
             if (cloud && cloud.material) {
                 (cloud.material as THREE.PointsMaterial).clippingPlanes = planes;
             }
         }
+    }
+
+    private updateIsolationPlanes(): void {
+        this.updateClippingPlanes();
     }
 
     public toggleObjectIsolation(clientID?: number | null): boolean {
@@ -809,6 +819,106 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     public isObjectIsolatedState(): boolean {
         return this.isObjectIsolated;
+    }
+
+    public getGroundPlane(): [number, number, number, number] {
+        if (this.cachedGlobalGroundPlane) {
+            return this.cachedGlobalGroundPlane;
+        }
+
+        const positions = this.pointCloudPoints?.geometry?.attributes?.position?.array;
+        if (!positions || positions.length < 9) {
+            return [0, 0, 1, 1.65];
+        }
+
+        const targetClientID = (this.isObjectIsolated && this.isolatedClientID !== null) ?
+            this.isolatedClientID : this.getActiveElement();
+
+        if (targetClientID !== null && this.drawnObjects[targetClientID]?.cuboid?.perspective) {
+            const { position: pos } = this.drawnObjects[targetClientID].cuboid.perspective;
+            const grid = this.getGroundGrid();
+            if (grid) {
+                const localPlane = grid.getRoadPlane(pos.x, pos.y);
+                if (localPlane) {
+                    return localPlane;
+                }
+            }
+            const localPlane = estimateLocalRoadPlane(pos.x, pos.y, pos.z, positions, 3.5);
+            if (localPlane) {
+                return localPlane;
+            }
+        }
+
+        const scenePlane = computeSceneGroundPlane(positions);
+        this.cachedGlobalGroundPlane = scenePlane;
+        return scenePlane;
+    }
+
+    public toggleGroundStripping(elevationOffset: number = 0.12): boolean {
+        if (this.isGroundStripped) {
+            this.isGroundStripped = false;
+            this.groundClippingPlane = null;
+            this.updateClippingPlanes();
+
+            this.dispatchEvent(new CustomEvent('canvas.groundStripped', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    stripped: false,
+                    elevationOffset: this.groundStrippingOffset,
+                },
+            }));
+            this.requestRender();
+            return false;
+        }
+
+        this.isGroundStripped = true;
+        this.groundStrippingOffset = typeof elevationOffset === 'number' && Number.isFinite(elevationOffset) ?
+            elevationOffset : 0.12;
+
+        const planeEq = this.getGroundPlane();
+        let [A, B, C, D] = planeEq;
+        const len = Math.sqrt(A * A + B * B + C * C);
+        if (len > 1e-6) {
+            A /= len;
+            B /= len;
+            C /= len;
+            D /= len;
+        } else {
+            A = 0;
+            B = 0;
+            C = 1;
+            D = 1.65;
+        }
+
+        if (C < 0) {
+            A = -A;
+            B = -B;
+            C = -C;
+            D = -D;
+        }
+
+        const normal = new THREE.Vector3(A, B, C);
+        this.groundClippingPlane = new THREE.Plane(normal, D - this.groundStrippingOffset);
+
+        this.updateClippingPlanes();
+
+        const groundZ = C !== 0 ? -D / C : -1.65;
+        this.dispatchEvent(new CustomEvent('canvas.groundStripped', {
+            bubbles: false,
+            cancelable: true,
+            detail: {
+                stripped: true,
+                elevationOffset: this.groundStrippingOffset,
+                groundZ,
+            },
+        }));
+        this.requestRender();
+        return true;
+    }
+
+    public isGroundStrippedState(): boolean {
+        return this.isGroundStripped;
     }
 
     public async snapTrackToRoad(
@@ -2705,6 +2815,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private clearScene(): void {
         this.pointCloudPoints = null;
         this.groundGrid = null;
+        this.cachedGlobalGroundPlane = null;
+        this.groundClippingPlane = null;
         this.previousCuboids.clear();
         this.isObjectIsolated = false;
         this.isolatedClientID = null;
@@ -2973,9 +3085,30 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.views.front.scene.add(frontScenePlane);
 
         this.pointCloudMeshes = [points, topCloud, sideCloud, frontCloud];
-        if (this.isObjectIsolated && this.isolatedClientID !== null) {
-            this.updateIsolationPlanes();
+        if (this.isGroundStripped) {
+            const planeEq = this.getGroundPlane();
+            let [A, B, C, D] = planeEq;
+            const len = Math.sqrt(A * A + B * B + C * C);
+            if (len > 1e-6) {
+                A /= len;
+                B /= len;
+                C /= len;
+                D /= len;
+            } else {
+                A = 0;
+                B = 0;
+                C = 1;
+                D = 1.65;
+            }
+            if (C < 0) {
+                A = -A;
+                B = -B;
+                C = -C;
+                D = -D;
+            }
+            this.groundClippingPlane = new THREE.Plane(new THREE.Vector3(A, B, C), D - this.groundStrippingOffset);
         }
+        this.updateClippingPlanes();
 
         if (this.mode === Mode.DRAW) {
             this.views[ViewType.PERSPECTIVE].scene.children[0].add(this.cube.perspective);
@@ -3665,6 +3798,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     public keyControls(key: any): void {
+        if (!key.ctrlKey && !key.altKey && !key.metaKey && !key.shiftKey && key.code === 'KeyG') {
+            this.toggleGroundStripping();
+            key.preventDefault?.();
+            key.stopPropagation?.();
+            return;
+        }
+
         const activeClientID = this.getActiveElement();
 
         // Object micro-nudging and hotkeys when a cuboid is active

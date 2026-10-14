@@ -52,6 +52,8 @@ interface Canvas3d {
     ): boolean;
     toggleObjectIsolation(clientID?: number | null): boolean;
     isObjectIsolated(): boolean;
+    toggleGroundStripping(elevationOffset?: number): boolean;
+    isGroundStripped(): boolean;
     snapTrackToRoad(
         jobInstance: any,
         clientID?: number | null,
@@ -178,6 +180,14 @@ class Canvas3dImpl implements Canvas3d {
 
     public isObjectIsolated(): boolean {
         return this.view.isObjectIsolatedState();
+    }
+
+    public toggleGroundStripping(elevationOffset?: number): boolean {
+        return this.view.toggleGroundStripping(elevationOffset);
+    }
+
+    public isGroundStripped(): boolean {
+        return this.view.isGroundStrippedState();
     }
 
     public async snapTrackToRoad(

@@ -83,7 +83,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
             message: `Auto-Snap on Move: ${next ? 'ENABLED' : 'DISABLED'}`,
             description: next ?
                 'Cuboids will automatically snap flush to the road pavement when translated.' :
-                'Automatic road snapping disabled. Press F to snap manually.',
+                'Automatic road snapping disabled. Press Alt+S to snap manually.',
             duration: 2.5,
         });
     };
@@ -118,7 +118,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
         },
         {
             key: 'snap_track',
-            label: 'Snap Track to Road (Alt+F)',
+            label: 'Snap Track to Road (Alt+T)',
             onClick: async () => {
                 if (!targetID || !jobInstance) return;
                 try {
@@ -160,10 +160,28 @@ function SnapToRoadControl(props: Props): JSX.Element {
         },
         {
             key: 'revert',
-            label: 'Revert Snap (Shift+F)',
+            label: 'Revert Snap (Alt+Shift+S)',
             onClick: () => {
                 if (targetID !== null) {
                     canvasInstance.revertSnap(targetID);
+                }
+            },
+        },
+        {
+            key: 'ground_strip',
+            label: 'Toggle Ground Stripping (G)',
+            onClick: () => {
+                if (canvasInstance?.toggleGroundStripping) {
+                    canvasInstance.toggleGroundStripping();
+                }
+            },
+        },
+        {
+            key: 'isolate',
+            label: 'Toggle Object Isolation (Shift+I)',
+            onClick: () => {
+                if (canvasInstance?.toggleObjectIsolation) {
+                    canvasInstance.toggleObjectIsolation(targetID);
                 }
             },
         },
@@ -194,7 +212,7 @@ function SnapToRoadControl(props: Props): JSX.Element {
         <Dropdown menu={{ items: menuItems }} trigger={['contextMenu']}>
             <span className='cvat-snap-to-road-control-wrapper'>
                 <CVATTooltip
-                    title={`Snap (F): ${modeLabel} • Auto-Snap: ${autoSnap ? 'ON' : 'OFF'} (Right-click to configure)`}
+                    title={`Snap (Alt+S): ${modeLabel} • Auto-Snap: ${autoSnap ? 'ON' : 'OFF'} (Right-click to configure)`}
                     placement='right'
                 >
                     <Icon

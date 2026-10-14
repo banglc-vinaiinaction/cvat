@@ -457,11 +457,10 @@ export function snapCuboidToRoadAndOrient(
     const localIndices: number[] = [];
     const groundCandidateIndices: number[] = [];
 
-    // Allow searching down beneath the cuboid (up to 5.0m below bottomZ or down to cz - 6.0m)
-    // For ground candidates, exclude anything higher than bottomZ + 0.35m or cz - dz * 0.15m
+    // Allow searching down beneath the cuboid or up if cuboid was placed sunken
     const zMin = Math.min(bottomZ - 5.0, cz - 6.0);
-    const zMax = cz + dz / 2 + 1.5;
-    const zMaxGround = Math.min(bottomZ + 0.35, cz - dz * 0.15);
+    const zMax = Math.max(cz + dz / 2 + 2.0, bottomZ + dz + 2.0);
+    const zMaxGround = Math.max(bottomZ + 0.60, cz + dz * 0.25);
 
     for (let i = 0; i < totalPoints; i++) {
         const px = pointCloudPositions[i * 3];
@@ -525,9 +524,8 @@ export function snapCuboidToRoadAndOrient(
             }
             const lprZ = lprSum / lprCount;
 
-            // If the lowest observed point is significantly higher than the cuboid bottom,
-            // the ground beneath is occluded/unobserved. Do not move vertically.
-            if (lprZ <= bottomZ + 0.25) {
+            // Allow ground detection even if cuboid bottom is sunken beneath the ground
+            if (lprZ <= bottomZ + 3.0) {
                 // Extract candidate ground seeds tightly around LPR
                 const groundSeeds = groundPool.filter((idx) => {
                     const pz = pointCloudPositions[idx * 3 + 2];
@@ -562,11 +560,13 @@ export function snapCuboidToRoadAndOrient(
                 const groundP90Z = seedZValues[p90Idx];
                 const baseGroundZ = Math.max(groundZ, groundP90Z) + groundClearance;
 
-                // Restrict ground snapping adjustment to realistic range
+                // Restrict ground snapping adjustment to realistic range, but allow pulling sunken boxes up
                 if (Math.abs(baseGroundZ - bottomZ) <= 0.45) {
                     groundZ = baseGroundZ;
+                } else if (baseGroundZ > bottomZ) {
+                    groundZ = baseGroundZ;
                 } else {
-                    groundZ = bottomZ + (baseGroundZ > bottomZ ? 0.40 : -0.25);
+                    groundZ = bottomZ - 0.25;
                 }
 
                 newZ = groundZ + dz / 2;
@@ -693,8 +693,9 @@ export function snapCuboidToRoadAndOrient(
             const u = distX * cosYaw + distY * sinYaw;
             const v = -distX * sinYaw + distY * cosYaw;
 
+            const currentBaseZ = groundZ > bottomZ ? groundZ : bottomZ;
             if (Math.abs(u) <= halfL + marginX && Math.abs(v) <= halfW + marginY) {
-                if (pz <= bottomZ + 0.35 && pz >= bottomZ - 0.70) {
+                if (pz <= currentBaseZ + 0.35 && pz >= currentBaseZ - 0.70) {
                     footprintGround.push({ u, v, z: pz });
                 }
             }
@@ -808,8 +809,8 @@ export function snapCuboidToRoadAndOrient(
             const baseZ = meanGroundZ + groundClearance;
             newZ = baseZ + newDz / 2;
 
-            // Restrict vertical shift to realistic bound relative to cz
-            newZ = Math.max(cz - 0.25, Math.min(cz + 0.35, newZ));
+            // Restrict vertical shift to realistic bound relative to cz (allow pulling sunken boxes up to 3.0m)
+            newZ = Math.max(cz - 0.50, Math.min(cz + 3.0, newZ));
 
             // Convert longitudinal tilt (thetaLong) and lateral tilt (thetaLat) to 3D Euler angles (XYZ)
             const thetaLong = Math.atan(slopeX);
@@ -1442,4 +1443,47 @@ export function resizeCuboidWithAnchor(
     result[8] = parseFloat(newDz.toFixed(4));
 
     return result;
+}
+
+/**
+ * Computes a robust global ground plane Ax + By + Cz + D = 0 for the point cloud scene using GPF.
+ * Samples points within a central ground ROI, extracts ground seeds, and fits the optimal plane.
+ */
+export function computeSceneGroundPlane(
+    positions: ArrayLike<number>,
+    maxRadius: number = 35.0,
+): [number, number, number, number] {
+    if (!positions || positions.length < 9) {
+        return [0, 0, 1, 1.65];
+    }
+
+    const totalPoints = Math.floor(positions.length / 3);
+    const candidateIndices: number[] = [];
+    const r2 = maxRadius * maxRadius;
+
+    // Stride to sample at most ~5,000 points uniformly for fast & accurate fit
+    const stride = Math.max(1, Math.floor(totalPoints / 5000));
+    for (let i = 0; i < totalPoints; i += stride) {
+        const px = positions[i * 3];
+        const py = positions[i * 3 + 1];
+        const pz = positions[i * 3 + 2];
+        if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) continue;
+        if (px * px + py * py <= r2) {
+            candidateIndices.push(i);
+        }
+    }
+
+    if (candidateIndices.length < 10) {
+        for (let i = 0; i < totalPoints; i += stride) {
+            const pz = positions[i * 3 + 2];
+            if (Number.isFinite(pz)) candidateIndices.push(i);
+        }
+    }
+
+    return fitGroundPlaneGPF(positions, candidateIndices, {
+        lprRatio: 0.2,
+        seedThreshold: 0.15,
+        distanceThreshold: 0.10,
+        refineIterations: 2,
+    });
 }

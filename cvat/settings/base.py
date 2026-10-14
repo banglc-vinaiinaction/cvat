@@ -875,3 +875,10 @@ USER_LAST_ACTIVITY_UPDATE_MIN_INTERVAL = timedelta(days=1)
 
 # Health check settings
 HEALTH_CHECK = {"DISK_USAGE_MAX": int(os.getenv("CVAT_HEALTH_DISK_USAGE_MAX", 90))}
+
+# Pluggable App & Extension Dependency Injection
+EXTRA_APPS = [app.strip() for app in os.getenv("CVAT_EXTRA_APPS", "").split(",") if app.strip()]
+for extra_app in EXTRA_APPS:
+    if extra_app not in INSTALLED_APPS:
+        INSTALLED_APPS.append(extra_app)
+

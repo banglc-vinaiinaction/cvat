@@ -834,6 +834,27 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
         }
     };
 
+    const onCanvasGroundStripped = (event: any): void => {
+        const { stripped, elevationOffset, groundZ } = event.detail || {};
+        if (stripped) {
+            const offsetCm = typeof elevationOffset === 'number' ? Math.round(elevationOffset * 100) : 12;
+            const zDesc = typeof groundZ === 'number' ? ` (road z ≈ ${groundZ.toFixed(2)}m)` : '';
+            notification.info({
+                key: 'ground_stripping_notice',
+                message: 'Ground Plane Stripping Active',
+                description: `Pavement points stripped below +${offsetCm}cm${zDesc}. Press 'G' to restore ground.`,
+                duration: 2.5,
+            });
+        } else {
+            notification.info({
+                key: 'ground_stripping_notice',
+                message: 'Ground Plane Stripping Disabled',
+                description: 'Restored full ground plane and pavement points.',
+                duration: 2.0,
+            });
+        }
+    };
+
     useEffect(() => {
         const canvasInstanceDOM = canvasInstance.html();
 
@@ -950,6 +971,7 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
         canvasInstanceDOM.perspective.addEventListener('canvas.snapped', onCanvasSnapped as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.inverted', onCanvasInverted as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.isolated', onCanvasIsolated as EventListener);
+        canvasInstanceDOM.perspective.addEventListener('canvas.groundStripped', onCanvasGroundStripped as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.reverted', onCanvasReverted as EventListener);
         canvasInstanceDOM.perspective.addEventListener('canvas.contextmenu', onContextMenu);
         canvasInstanceDOM.perspective.addEventListener('click', onCanvasClick);
@@ -966,6 +988,7 @@ const Canvas3DWrapperComponent = React.memo((props: Props): null => {
             canvasInstanceDOM.perspective.removeEventListener('canvas.snapped', onCanvasSnapped as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.inverted', onCanvasInverted as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.isolated', onCanvasIsolated as EventListener);
+            canvasInstanceDOM.perspective.removeEventListener('canvas.groundStripped', onCanvasGroundStripped as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.reverted', onCanvasReverted as EventListener);
             canvasInstanceDOM.perspective.removeEventListener('canvas.contextmenu', onContextMenu);
             canvasInstanceDOM.perspective.removeEventListener('click', onCanvasClick);
