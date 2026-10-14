@@ -189,6 +189,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         [ViewType.FRONT]: { width: 0, height: 0 },
     };
     private pointCloudPoints: any = null;
+    private basePointCloudGeometry: THREE.BufferGeometry | null = null;
+    private filteredPointCloudGeometry: THREE.BufferGeometry | null = null;
+    private lastIsolationToggleTime: number = 0;
     private groundGrid: GroundElevationGrid | null = null;
     private previousCuboids: Map<number, number[][]> = new Map();
     private isObjectIsolated: boolean = false;
@@ -209,6 +212,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     };
     private geometryCache: Map<number, {
         geometry: THREE.BufferGeometry;
+        strippedGeometry?: THREE.BufferGeometry | null;
         groundGrid: GroundElevationGrid;
         globalGroundPlane: [number, number, number, number];
     }> = new Map();
@@ -335,6 +339,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return null;
     }
 
+    private getBasePointCloudPositions(): Float32Array | null {
+        const geo = this.basePointCloudGeometry || this.pointCloudPoints?.geometry;
+        return (geo?.attributes?.position?.array as Float32Array) || null;
+    }
+
     public snapToRoad(clientID?: number | null, options?: { snapGround?: boolean; autoOrient?: boolean; snapGeometry?: boolean; }): void {
         let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
         if (targetClientID === null) {
@@ -348,11 +357,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.model.data.activeElement.clientID = `${targetClientID}`;
         this.activatedElementID = targetClientID;
 
-        if (!this.pointCloudPoints?.geometry?.attributes?.position?.array) {
+        const positions = this.getBasePointCloudPositions();
+        if (!positions) {
             return;
         }
-
-        const positions = this.pointCloudPoints.geometry.attributes.position.array;
         const { cuboid, data } = this.drawnObjects[targetClientID];
         if (data.lock) return;
 
@@ -858,7 +866,407 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return true;
     }
 
-    private updateClippingPlanes(): void {
+    private buildGroundStrippedGeometry(baseGeo: THREE.BufferGeometry): THREE.BufferGeometry {
+        const frameNumber = this.model.data.imageID;
+        if (frameNumber !== null && this.geometryCache.has(frameNumber)) {
+            const cached = this.geometryCache.get(frameNumber)!;
+            if (cached.geometry === baseGeo && cached.strippedGeometry) {
+                return cached.strippedGeometry;
+            }
+        }
+
+        const posAttr = baseGeo.getAttribute('position');
+        if (!posAttr || posAttr.count < 3) return baseGeo;
+        const positions = posAttr.array as Float32Array;
+        const colAttr = baseGeo.getAttribute('color');
+        const colors = colAttr ? (colAttr.array as Float32Array) : null;
+        const normAttr = baseGeo.getAttribute('normal');
+        const normals = normAttr ? (normAttr.array as Float32Array) : null;
+        const numPoints = posAttr.count;
+
+        const planeEq = this.cachedGlobalGroundPlane || computeSceneGroundPlane(positions);
+        let [gA, gB, gC, gD] = planeEq;
+        const pLen = Math.sqrt(gA * gA + gB * gB + gC * gC);
+        if (pLen > 1e-6) {
+            gA /= pLen; gB /= pLen; gC /= pLen; gD /= pLen;
+        } else {
+            gA = 0; gB = 0; gC = 1; gD = 1.65;
+        }
+        if (gC < 0) {
+            gA = -gA; gB = -gB; gC = -gC; gD = -gD;
+        }
+        const safeGC = Math.abs(gC) > 0.25 ? gC : 1.0;
+
+        if (!baseGeo.boundingBox) {
+            baseGeo.computeBoundingBox();
+        }
+        const bbox = baseGeo.boundingBox!;
+        const minX = bbox.min.x;
+        const minY = bbox.min.y;
+        const maxX = Math.max(bbox.max.x, minX + 1);
+        const maxY = Math.max(bbox.max.y, minY + 1);
+
+        // 1) Coarse 2.5m terrain grid to estimate local road elevation across slopes, crowns, and hills
+        const coarseCell = Math.max(2.5, (maxX - minX) / 240, (maxY - minY) / 240);
+        const cCols = Math.min(256, Math.max(1, Math.ceil((maxX - minX) / coarseCell) + 1));
+        const cRows = Math.min(256, Math.max(1, Math.ceil((maxY - minY) / coarseCell) + 1));
+        const coarseMinZ = new Float32Array(cCols * cRows);
+        coarseMinZ.fill(Infinity);
+
+        for (let i = 0; i < numPoints; i++) {
+            const i3 = i * 3;
+            const x = positions[i3];
+            const y = positions[i3 + 1];
+            const z = positions[i3 + 2];
+            const zPlane = -(gA * x + gB * y + gD) / safeGC;
+            const distXY = Math.sqrt(x * x + y * y);
+            if (z >= zPlane - 1.5 && z <= zPlane + 2.5 + 0.04 * distXY) {
+                const cx = Math.min(cCols - 1, Math.max(0, Math.floor((x - minX) / coarseCell)));
+                const cy = Math.min(cRows - 1, Math.max(0, Math.floor((y - minY) / coarseCell)));
+                const idx = cy * cCols + cx;
+                if (z < coarseMinZ[idx]) {
+                    coarseMinZ[idx] = z;
+                }
+            }
+        }
+
+        // Smooth coarse grid with 3x3 ditch-resistant minimum (plus 5x5 fallback for empty cells)
+        const smoothedRoadZ = new Float32Array(cCols * cRows);
+        for (let cy = 0; cy < cRows; cy++) {
+            for (let cx = 0; cx < cCols; cx++) {
+                const ownZ = coarseMinZ[cy * cCols + cx];
+                let min1 = Infinity;
+                let min2 = Infinity;
+                for (let dy = -1; dy <= 1; dy++) {
+                    const ny = cy + dy;
+                    if (ny < 0 || ny >= cRows) continue;
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = cx + dx;
+                        if (nx < 0 || nx >= cCols) continue;
+                        const nz = coarseMinZ[ny * cCols + nx];
+                        if (nz < min1) {
+                            min2 = min1;
+                            min1 = nz;
+                        } else if (nz < min2) {
+                            min2 = nz;
+                        }
+                    }
+                }
+                if (ownZ < Infinity) {
+                    const refMin = min2 < Infinity ? min2 : min1;
+                    smoothedRoadZ[cy * cCols + cx] = Math.min(ownZ, refMin + 0.15);
+                } else if (min1 < Infinity) {
+                    smoothedRoadZ[cy * cCols + cx] = min1;
+                } else {
+                    let min5 = Infinity;
+                    for (let dy = -2; dy <= 2; dy++) {
+                        const ny = cy + dy;
+                        if (ny < 0 || ny >= cRows) continue;
+                        for (let dx = -2; dx <= 2; dx++) {
+                            const nx = cx + dx;
+                            if (nx < 0 || nx >= cCols) continue;
+                            const nz = coarseMinZ[ny * cCols + nx];
+                            if (nz < min5) min5 = nz;
+                        }
+                    }
+                    smoothedRoadZ[cy * cCols + cx] = min5;
+                }
+            }
+        }
+
+        // 2) Fine 1.0m vertical-span grid to distinguish flat pavement/curb cells from cells with vertical objects
+        const fineCell = Math.max(1.0, (maxX - minX) / 480, (maxY - minY) / 480);
+        const fCols = Math.min(512, Math.max(1, Math.ceil((maxX - minX) / fineCell) + 1));
+        const fRows = Math.min(512, Math.max(1, Math.ceil((maxY - minY) / fineCell) + 1));
+        const fineMinZ = new Float32Array(fCols * fRows);
+        const fineMaxZ = new Float32Array(fCols * fRows);
+        fineMinZ.fill(Infinity);
+        fineMaxZ.fill(-Infinity);
+
+        for (let i = 0; i < numPoints; i++) {
+            const i3 = i * 3;
+            const x = positions[i3];
+            const y = positions[i3 + 1];
+            const z = positions[i3 + 2];
+            const cx = Math.min(cCols - 1, Math.max(0, Math.floor((x - minX) / coarseCell)));
+            const cy = Math.min(cRows - 1, Math.max(0, Math.floor((y - minY) / coarseCell)));
+            let zRoad = smoothedRoadZ[cy * cCols + cx];
+            if (zRoad === Infinity) {
+                zRoad = -(gA * x + gB * y + gD) / safeGC;
+            }
+            if (z >= zRoad - 0.35 && z <= zRoad + 2.5) {
+                const fx = Math.min(fCols - 1, Math.max(0, Math.floor((x - minX) / fineCell)));
+                const fy = Math.min(fRows - 1, Math.max(0, Math.floor((y - minY) / fineCell)));
+                const fIdx = fy * fCols + fx;
+                if (z < fineMinZ[fIdx]) fineMinZ[fIdx] = z;
+                if (z > fineMaxZ[fIdx]) fineMaxZ[fIdx] = z;
+            }
+        }
+
+        // 3) Collect visible 3D cuboids so points inside annotated object footprints are protected above tire bottoms
+        const activeCuboids: {
+            px: number; py: number; bottomZ: number;
+            uxX: number; uxY: number; uyX: number; uyY: number;
+            halfL: number; halfW: number; radiusSq: number;
+        }[] = [];
+        for (const key of Object.keys(this.drawnObjects)) {
+            const obj = this.drawnObjects[+key];
+            if (!obj || obj.data.outside || obj.data.hidden || !obj.cuboid?.perspective) continue;
+            const { position: pos, rotation: rot, scale } = obj.cuboid.perspective;
+            const cosZ = Math.cos(rot.z);
+            const sinZ = Math.sin(rot.z);
+            const halfL = scale.x / 2 + 0.12;
+            const halfW = scale.y / 2 + 0.12;
+            activeCuboids.push({
+                px: pos.x,
+                py: pos.y,
+                bottomZ: pos.z - scale.z / 2,
+                uxX: cosZ,
+                uxY: sinZ,
+                uyX: -sinZ,
+                uyY: cosZ,
+                halfL,
+                halfW,
+                radiusSq: halfL * halfL + halfW * halfW,
+            });
+        }
+
+        const grid = this.getGroundGrid();
+        const baseOffset = Math.max(this.groundStrippingOffset, 0.18);
+        const keepMask = new Uint8Array(numPoints);
+        let keptCount = 0;
+
+        for (let i = 0; i < numPoints; i++) {
+            const i3 = i * 3;
+            const x = positions[i3];
+            const y = positions[i3 + 1];
+            const z = positions[i3 + 2];
+
+            const cx = Math.min(cCols - 1, Math.max(0, Math.floor((x - minX) / coarseCell)));
+            const cy = Math.min(cRows - 1, Math.max(0, Math.floor((y - minY) / coarseCell)));
+            let zRoad = smoothedRoadZ[cy * cCols + cx];
+            if (zRoad === Infinity) {
+                zRoad = -(gA * x + gB * y + gD) / safeGC;
+            }
+            if (grid) {
+                const gElev = grid.getElevation(x, y);
+                if (gElev !== null && Math.abs(gElev - zRoad) <= 0.35) {
+                    zRoad = Math.max(zRoad, gElev);
+                }
+            }
+
+            const fx = Math.min(fCols - 1, Math.max(0, Math.floor((x - minX) / fineCell)));
+            const fy = Math.min(fRows - 1, Math.max(0, Math.floor((y - minY) / fineCell)));
+            const fIdx = fy * fCols + fx;
+            const vSpan = fineMaxZ[fIdx] - fineMinZ[fIdx];
+            const distXY = Math.sqrt(x * x + y * y);
+
+            // Flat cells without vertical objects (vSpan <= 0.28m) are pure road/curb/sidewalk: strip generously
+            let stripCeiling = vSpan <= 0.28 ?
+                (zRoad + baseOffset + 0.26 + 0.003 * distXY) :
+                (zRoad + baseOffset + 0.04 + 0.002 * distXY);
+
+            for (let c = 0; c < activeCuboids.length; c++) {
+                const box = activeCuboids[c];
+                const dx = x - box.px;
+                const dy = y - box.py;
+                if (dx * dx + dy * dy <= box.radiusSq) {
+                    const lx = Math.abs(dx * box.uxX + dy * box.uxY);
+                    const ly = Math.abs(dx * box.uyX + dy * box.uyY);
+                    if (lx <= box.halfL && ly <= box.halfW) {
+                        stripCeiling = Math.min(stripCeiling, box.bottomZ + 0.08);
+                        break;
+                    }
+                }
+            }
+
+            if (z > stripCeiling) {
+                keepMask[i] = 1;
+                keptCount++;
+            }
+        }
+
+        const outPos = new Float32Array(keptCount * 3);
+        const outCol = colors ? new Float32Array(keptCount * 3) : null;
+        const outNorm = normals ? new Float32Array(keptCount * 3) : null;
+        let outIdx = 0;
+        for (let i = 0; i < numPoints; i++) {
+            if (keepMask[i]) {
+                const src = i * 3;
+                const dst = outIdx * 3;
+                outPos[dst] = positions[src];
+                outPos[dst + 1] = positions[src + 1];
+                outPos[dst + 2] = positions[src + 2];
+                if (outCol && colors) {
+                    outCol[dst] = colors[src];
+                    outCol[dst + 1] = colors[src + 1];
+                    outCol[dst + 2] = colors[src + 2];
+                }
+                if (outNorm && normals) {
+                    outNorm[dst] = normals[src];
+                    outNorm[dst + 1] = normals[src + 1];
+                    outNorm[dst + 2] = normals[src + 2];
+                }
+                outIdx++;
+            }
+        }
+
+        const strippedGeo = new THREE.BufferGeometry();
+        strippedGeo.setAttribute('position', new THREE.Float32BufferAttribute(outPos, 3));
+        if (outCol) {
+            strippedGeo.setAttribute('color', new THREE.Float32BufferAttribute(outCol, 3));
+        }
+        if (outNorm) {
+            strippedGeo.setAttribute('normal', new THREE.Float32BufferAttribute(outNorm, 3));
+        }
+        if (baseGeo.boundingBox) {
+            strippedGeo.boundingBox = baseGeo.boundingBox.clone();
+        }
+        if (baseGeo.boundingSphere) {
+            strippedGeo.boundingSphere = baseGeo.boundingSphere.clone();
+        }
+
+        if (frameNumber !== null && this.geometryCache.has(frameNumber)) {
+            const cached = this.geometryCache.get(frameNumber)!;
+            if (cached.geometry === baseGeo) {
+                cached.strippedGeometry = strippedGeo;
+            }
+        }
+        return strippedGeo;
+    }
+
+    private buildIsolatedGeometry(
+        baseGeo: THREE.BufferGeometry,
+        clientID: number,
+        stripGround: boolean,
+    ): THREE.BufferGeometry {
+        const drawn = this.drawnObjects[clientID];
+        if (!drawn || !drawn.cuboid?.perspective) {
+            return stripGround ? this.buildGroundStrippedGeometry(baseGeo) : baseGeo;
+        }
+
+        const posAttr = baseGeo.getAttribute('position');
+        if (!posAttr || posAttr.count < 1) return baseGeo;
+        const positions = posAttr.array as Float32Array;
+        const colAttr = baseGeo.getAttribute('color');
+        const colors = colAttr ? (colAttr.array as Float32Array) : null;
+        const normAttr = baseGeo.getAttribute('normal');
+        const normals = normAttr ? (normAttr.array as Float32Array) : null;
+        const numPoints = posAttr.count;
+
+        const { position: pos, rotation: rot, scale } = drawn.cuboid.perspective;
+        const euler = new THREE.Euler(rot.x, rot.y, rot.z, 'XYZ');
+        const ux = new THREE.Vector3(1, 0, 0).applyEuler(euler).normalize();
+        const uy = new THREE.Vector3(0, 1, 0).applyEuler(euler).normalize();
+        const uz = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
+
+        const halfL = scale.x / 2 + 1.2;
+        const halfW = scale.y / 2 + 1.2;
+        const maxLocalZ = scale.z / 2 + 0.8;
+        const minLocalZ = stripGround ? (-scale.z / 2 + 0.10) : (-scale.z / 2 - 0.6);
+        const maxRadiusSq = halfL * halfL + halfW * halfW + maxLocalZ * maxLocalZ;
+
+        const keepMask = new Uint8Array(numPoints);
+        let keptCount = 0;
+
+        for (let i = 0; i < numPoints; i++) {
+            const i3 = i * 3;
+            const dx = positions[i3] - pos.x;
+            const dy = positions[i3 + 1] - pos.y;
+            const dz = positions[i3 + 2] - pos.z;
+            if (dx * dx + dy * dy + dz * dz <= maxRadiusSq) {
+                const lx = dx * ux.x + dy * ux.y + dz * ux.z;
+                if (Math.abs(lx) <= halfL) {
+                    const ly = dx * uy.x + dy * uy.y + dz * uy.z;
+                    if (Math.abs(ly) <= halfW) {
+                        const lz = dx * uz.x + dy * uz.y + dz * uz.z;
+                        if (lz >= minLocalZ && lz <= maxLocalZ) {
+                            keepMask[i] = 1;
+                            keptCount++;
+                        }
+                    }
+                }
+            }
+        }
+
+        const outPos = new Float32Array(keptCount * 3);
+        const outCol = colors ? new Float32Array(keptCount * 3) : null;
+        const outNorm = normals ? new Float32Array(keptCount * 3) : null;
+        let outIdx = 0;
+        for (let i = 0; i < numPoints; i++) {
+            if (keepMask[i]) {
+                const src = i * 3;
+                const dst = outIdx * 3;
+                outPos[dst] = positions[src];
+                outPos[dst + 1] = positions[src + 1];
+                outPos[dst + 2] = positions[src + 2];
+                if (outCol && colors) {
+                    outCol[dst] = colors[src];
+                    outCol[dst + 1] = colors[src + 1];
+                    outCol[dst + 2] = colors[src + 2];
+                }
+                if (outNorm && normals) {
+                    outNorm[dst] = normals[src];
+                    outNorm[dst + 1] = normals[src + 1];
+                    outNorm[dst + 2] = normals[src + 2];
+                }
+                outIdx++;
+            }
+        }
+
+        const isoGeo = new THREE.BufferGeometry();
+        isoGeo.setAttribute('position', new THREE.Float32BufferAttribute(outPos, 3));
+        if (outCol) {
+            isoGeo.setAttribute('color', new THREE.Float32BufferAttribute(outCol, 3));
+        }
+        if (outNorm) {
+            isoGeo.setAttribute('normal', new THREE.Float32BufferAttribute(outNorm, 3));
+        }
+        if (baseGeo.boundingBox) {
+            isoGeo.boundingBox = baseGeo.boundingBox.clone();
+        }
+        if (baseGeo.boundingSphere) {
+            isoGeo.boundingSphere = baseGeo.boundingSphere.clone();
+        }
+        return isoGeo;
+    }
+
+    private applyPointCloudFilter(): void {
+        const baseGeo = this.basePointCloudGeometry;
+        if (!baseGeo || this.pointCloudMeshes.length === 0) return;
+
+        if (this.filteredPointCloudGeometry) {
+            this.filteredPointCloudGeometry.dispose();
+            this.filteredPointCloudGeometry = null;
+        }
+
+        let targetGeo: THREE.BufferGeometry = baseGeo;
+        if (
+            this.isObjectIsolated &&
+            this.isolatedClientID !== null &&
+            this.drawnObjects[this.isolatedClientID]?.cuboid?.perspective
+        ) {
+            targetGeo = this.buildIsolatedGeometry(baseGeo, this.isolatedClientID, this.isGroundStripped);
+            this.filteredPointCloudGeometry = targetGeo;
+        } else if (this.isGroundStripped) {
+            targetGeo = this.buildGroundStrippedGeometry(baseGeo);
+        }
+
+        this.orthoPointsGeometry = targetGeo;
+        for (const mesh of this.pointCloudMeshes) {
+            if (mesh) {
+                mesh.geometry = targetGeo;
+            }
+        }
+        this.updateClippingPlanes(false);
+    }
+
+    private updateClippingPlanes(rebuildGeometry: boolean = true): void {
+        if (rebuildGeometry) {
+            this.applyPointCloudFilter();
+            return;
+        }
+
         const planes: THREE.Plane[] = [];
 
         if (this.isObjectIsolated && this.isolatedClientID !== null) {
@@ -872,8 +1280,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 const uy = new THREE.Vector3(0, 1, 0).applyEuler(euler).normalize();
                 const uz = new THREE.Vector3(0, 0, 1).applyEuler(euler).normalize();
 
-                const marginHoriz = 1.5;
-                const marginVert = 1.0;
+                const marginHoriz = 1.2;
+                const marginVert = 0.8;
 
                 const halfL = scale.x / 2 + marginHoriz;
                 const halfW = scale.y / 2 + marginHoriz;
@@ -892,22 +1300,29 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
         }
 
-        if (this.isGroundStripped && this.groundClippingPlane) {
-            planes.push(this.groundClippingPlane);
-        }
-
         for (const cloud of this.pointCloudMeshes) {
             if (cloud && cloud.material) {
-                (cloud.material as THREE.PointsMaterial).clippingPlanes = planes;
+                const mat = cloud.material as THREE.PointsMaterial;
+                const prevLen = mat.clippingPlanes ? mat.clippingPlanes.length : 0;
+                mat.clippingPlanes = planes;
+                if (prevLen !== planes.length) {
+                    mat.needsUpdate = true;
+                }
             }
         }
     }
 
-    private updateIsolationPlanes(): void {
-        this.updateClippingPlanes();
+    private updateIsolationPlanes(rebuildGeometry: boolean = true): void {
+        this.updateClippingPlanes(rebuildGeometry);
     }
 
     public toggleObjectIsolation(clientID?: number | null): boolean {
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (now - this.lastIsolationToggleTime < 80) {
+            return this.isObjectIsolated;
+        }
+        this.lastIsolationToggleTime = now;
+
         let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
         if (targetClientID === null) {
             targetClientID = this.getActiveElement();
@@ -916,7 +1331,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         if (this.isObjectIsolated) {
             this.isObjectIsolated = false;
             this.isolatedClientID = null;
-            this.updateIsolationPlanes();
 
             for (const id of this.hiddenByIsolation) {
                 if (this.drawnObjects[id]?.cuboid?.perspective) {
@@ -925,6 +1339,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
             this.hiddenByIsolation.clear();
 
+            this.applyPointCloudFilter();
             this.updateCameraFrustumPlane();
             this.dispatchEvent(new CustomEvent('canvas.isolated', {
                 bubbles: false,
@@ -935,13 +1350,52 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             return false;
         }
 
+        // If no cuboid is currently selected, find the visible cuboid closest to camera lookAt target
         if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+            const lookTarget = this.views.perspective.controls ?
+                this.views.perspective.controls.getTarget(new THREE.Vector3()) :
+                new THREE.Vector3(0, 0, 0);
+            let bestID: number | null = null;
+            let bestDistSq = Infinity;
+            for (const strId of Object.keys(this.drawnObjects)) {
+                const id = +strId;
+                const entry = this.drawnObjects[id];
+                if (entry && !entry.data.outside && !entry.data.hidden && entry.cuboid?.perspective) {
+                    const distSq = entry.cuboid.perspective.position.distanceToSquared(lookTarget);
+                    if (distSq < bestDistSq) {
+                        bestDistSq = distSq;
+                        bestID = id;
+                    }
+                }
+            }
+            if (bestID !== null) {
+                targetClientID = bestID;
+                this.model.data.activeElement.clientID = `${bestID}`;
+                this.dispatchEvent(
+                    new CustomEvent('canvas.selected', {
+                        bubbles: false,
+                        cancelable: true,
+                        detail: { clientID: bestID },
+                    }),
+                );
+            }
+        }
+
+        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
+            this.dispatchEvent(new CustomEvent('canvas.isolated', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    isolated: false,
+                    clientID: null,
+                    warning: 'No 3D objects in the current frame to isolate.',
+                },
+            }));
             return false;
         }
 
         this.isObjectIsolated = true;
         this.isolatedClientID = targetClientID;
-        this.updateIsolationPlanes();
 
         this.hiddenByIsolation.clear();
         Object.keys(this.drawnObjects).forEach((strId: string) => {
@@ -952,7 +1406,14 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
         });
 
+        if (this.drawnObjects[targetClientID]?.cuboid) {
+            this.drawnObjects[targetClientID].cuboid.perspective.visible = true;
+            this.fitObject(this.drawnObjects[targetClientID].cuboid, false);
+        }
+
+        this.applyPointCloudFilter();
         this.updateCameraFrustumPlane();
+        this.updateSideViewsZoom();
         this.dispatchEvent(new CustomEvent('canvas.isolated', {
             bubbles: false,
             cancelable: true,
@@ -967,7 +1428,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     public getGroundPlane(): [number, number, number, number] {
-        const positions = this.pointCloudPoints?.geometry?.attributes?.position?.array;
+        const positions = this.getBasePointCloudPositions();
         const targetClientID = (this.isObjectIsolated && this.isolatedClientID !== null) ?
             this.isolatedClientID : this.getActiveElement();
 
@@ -1028,11 +1489,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return [A, B, C, D];
     }
 
-    public toggleGroundStripping(elevationOffset: number = 0.12): boolean {
+    public toggleGroundStripping(elevationOffset: number = 0.18): boolean {
         if (this.isGroundStripped) {
             this.isGroundStripped = false;
             this.groundClippingPlane = null;
-            this.updateClippingPlanes();
+            this.applyPointCloudFilter();
 
             this.dispatchEvent(new CustomEvent('canvas.groundStripped', {
                 bubbles: false,
@@ -1048,10 +1509,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         this.isGroundStripped = true;
         this.groundStrippingOffset = typeof elevationOffset === 'number' && Number.isFinite(elevationOffset) ?
-            elevationOffset : 0.12;
+            elevationOffset : 0.18;
 
         const [, , C, D] = this.refreshGroundClippingPlane();
-        this.updateClippingPlanes();
+        this.applyPointCloudFilter();
 
         const groundZ = C !== 0 ? -D / C : -1.65;
         this.dispatchEvent(new CustomEvent('canvas.groundStripped', {
