@@ -353,17 +353,19 @@ workerScope.onmessage = (event: MessageEvent<MainWorkerRequest>) => {
   const msg = event.data;
 
   if (msg.type === 'INIT_SCENE') {
-    const generated = buildSyntheticLiDARPointCloud();
-    cachedPositions = new Float32Array(generated.positions);
-    cachedOriginalColors = new Float32Array(generated.colors);
-    cachedGroundStrippedColors = buildGroundStrippedColors(
-      cachedPositions,
-      cachedOriginalColors
-    );
-    spatialGrid = new SpatialGrid2D(cachedPositions, 2.0);
+    if (!cachedPositions || !cachedOriginalColors || !spatialGrid) {
+      const generated = buildSyntheticLiDARPointCloud();
+      cachedPositions = new Float32Array(generated.positions);
+      cachedOriginalColors = new Float32Array(generated.colors);
+      cachedGroundStrippedColors = buildGroundStrippedColors(
+        cachedPositions,
+        cachedOriginalColors
+      );
+      spatialGrid = new SpatialGrid2D(cachedPositions, 2.0);
+    }
 
-    const transferPositions = generated.positions;
-    const transferColors = generated.colors;
+    const transferPositions = new Float32Array(cachedPositions);
+    const transferColors = new Float32Array(cachedOriginalColors);
 
     workerScope.postMessage(
       {

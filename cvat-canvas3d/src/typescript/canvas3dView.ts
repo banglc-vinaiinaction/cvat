@@ -25,6 +25,35 @@ import {
     computeSceneGroundPlane, estimateLocalRoadPlane,
 } from './snapping';
 import { MainSceneWorker, OrthoViewsWorker } from './sceneWorkers';
+import { detectGpuCapabilities, GpuCapabilities } from './gpuDetector';
+
+let sharedOrthoRenderer: THREE.WebGLRenderer | null = null;
+
+function getSharedOrthoRenderer(gpu: GpuCapabilities): THREE.WebGLRenderer {
+    if (sharedOrthoRenderer) {
+        return sharedOrthoRenderer;
+    }
+
+    let offscreenCanvas: HTMLCanvasElement | OffscreenCanvas | undefined;
+    if (gpu.isDedicatedGpu && gpu.supportsOffscreenCanvas && typeof OffscreenCanvas !== 'undefined') {
+        try {
+            const osc = new OffscreenCanvas(300, 150);
+            (osc as any).style = { width: '', height: '' };
+            offscreenCanvas = osc;
+        } catch {
+            offscreenCanvas = undefined;
+        }
+    }
+
+    sharedOrthoRenderer = new THREE.WebGLRenderer({
+        ...(offscreenCanvas ? { canvas: offscreenCanvas as unknown as HTMLCanvasElement } : {}),
+        antialias: gpu.antialias,
+        powerPreference: 'high-performance',
+        preserveDrawingBuffer: true,
+    });
+    sharedOrthoRenderer.localClippingEnabled = true;
+    return sharedOrthoRenderer;
+}
 
 export interface Canvas3dView {
     html(): ViewsDOM;
@@ -54,6 +83,7 @@ export interface Canvas3dView {
         clientID?: number | null,
         onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }>;
+    destroy(): void;
 }
 
 export enum CameraAction {
@@ -141,10 +171,12 @@ function drawnDataFromState(state: ObjectState): DrawnObjectData {
 
 export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private controller: Canvas3dController;
+    private gpuCapabilities: GpuCapabilities;
     private mainRenderer: THREE.WebGLRenderer;
     private orthoRenderer: THREE.WebGLRenderer;
     private mainSceneWorker: MainSceneWorker;
     private orthoViewsWorker: OrthoViewsWorker;
+    private onDocumentMouseUp: () => void;
     private views: Views;
     private clock: THREE.Clock;
     private speed: number;
@@ -1240,6 +1272,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             },
         };
 
+        this.gpuCapabilities = detectGpuCapabilities();
         this.mainSceneWorker = new MainSceneWorker();
         this.orthoViewsWorker = new OrthoViewsWorker();
 
@@ -1249,11 +1282,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         this.mainRenderer = new THREE.WebGLRenderer({
             canvas: perspectiveCanvas,
-            antialias: false,
+            antialias: this.gpuCapabilities.antialias,
             powerPreference: 'high-performance',
         });
         this.mainRenderer.localClippingEnabled = true;
-        this.mainRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        this.mainRenderer.setPixelRatio(this.gpuCapabilities.pixelRatio);
         const origMainSetSize = this.mainRenderer.setSize.bind(this.mainRenderer);
         this.mainRenderer.setSize = (w: number, h: number, updateStyle: boolean = false) => {
             origMainSetSize(w, h, updateStyle);
@@ -1263,18 +1296,17 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.mainRenderer.clear();
         };
 
-        this.orthoRenderer = new THREE.WebGLRenderer({
-            antialias: false,
-            powerPreference: 'high-performance',
-            preserveDrawingBuffer: true,
-        });
-        this.orthoRenderer.localClippingEnabled = true;
+        this.orthoRenderer = getSharedOrthoRenderer(this.gpuCapabilities);
 
         const createOrthoViewRenderer = (): THREE.WebGLRenderer => {
             const canvas = window.document.createElement('canvas');
             canvas.style.width = '100%';
             canvas.style.height = '100%';
-            const ctx = canvas.getContext('2d');
+            const ctx = (
+                this.gpuCapabilities.isDedicatedGpu ?
+                    canvas.getContext('2d', { alpha: false, desynchronized: true }) :
+                    canvas.getContext('2d', { alpha: false })
+            ) || canvas.getContext('2d');
 
             return {
                 domElement: canvas,
@@ -1307,9 +1339,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
                     this.orthoRenderer.render(scene, camera);
 
-                    ctx.clearRect(0, 0, w, h);
                     ctx.drawImage(
-                        this.orthoRenderer.domElement,
+                        this.orthoRenderer.domElement as unknown as CanvasImageSource,
                         0,
                         this.orthoRenderer.domElement.height - h,
                         w,
@@ -1478,13 +1509,14 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 this.finalizeDraw();
             }
         });
-        window.document.addEventListener('mouseup', () => {
+        this.onDocumentMouseUp = () => {
             this.disablePerspectiveDragging();
             if (this.isPerspectiveBeingDragged && this.mode !== Mode.DRAG_CANVAS) {
                 // call this body only of drag was activated inside the canvas, but not globally
                 this.isPerspectiveBeingDragged = false;
             }
-        });
+        };
+        window.document.addEventListener('mouseup', this.onDocumentMouseUp);
 
         canvasTopView.addEventListener('mousedown', this.startAction.bind(this, 'top'));
         canvasSideView.addEventListener('mousedown', this.startAction.bind(this, 'side'));
@@ -3993,24 +4025,31 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const cy = pos.y;
         const cz = pos.z;
         const maxDim = Math.max(scale.x, scale.y, scale.z);
-        const radius = maxDim / 2 + 5.0;
+        const radius = maxDim / 2 + this.gpuCapabilities.orthoRoiRadiusPadding;
 
         this.lastRoiCenter = pos.clone();
         const currentGeo = this.orthoPointsGeometry;
-        this.orthoViewsWorker.computeROI(cx, cy, cz, radius, ({ positions: roiPositions, colors: roiColors }) => {
-            if (this.orthoPointsGeometry !== currentGeo) return;
-            const currentActiveID = this.getActiveElement();
-            if (currentActiveID === null || !(currentActiveID in this.drawnObjects)) {
-                this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
-                this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
+        this.orthoViewsWorker.computeROI(
+            cx,
+            cy,
+            cz,
+            radius,
+            ({ positions: roiPositions, colors: roiColors }) => {
+                if (this.orthoPointsGeometry !== currentGeo) return;
+                const currentActiveID = this.getActiveElement();
+                if (currentActiveID === null || !(currentActiveID in this.drawnObjects)) {
+                    this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+                    this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3));
+                    this.requestOrthoRender();
+                    return;
+                }
+                this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(roiPositions, 3));
+                this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(roiColors, 3));
+                this.orthoPointsGeometry.computeBoundingSphere();
                 this.requestOrthoRender();
-                return;
-            }
-            this.orthoPointsGeometry.setAttribute('position', new THREE.BufferAttribute(roiPositions, 3));
-            this.orthoPointsGeometry.setAttribute('color', new THREE.BufferAttribute(roiColors, 3));
-            this.orthoPointsGeometry.computeBoundingSphere();
-            this.requestOrthoRender();
-        });
+            },
+            this.gpuCapabilities.orthoMaxPoints,
+        );
     }
 
     public keyControls(key: any): void {
@@ -4144,5 +4183,21 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             side: this.views.side.renderer.domElement,
             front: this.views.front.renderer.domElement,
         };
+    }
+
+    public destroy(): void {
+        if (this.onDocumentMouseUp) {
+            window.document.removeEventListener('mouseup', this.onDocumentMouseUp);
+            this.onDocumentMouseUp = null;
+        }
+        try {
+            this.clearScene();
+        } catch (_) {
+            // ignore
+        }
+        Object.values(this.views).forEach((view) => {
+            view.controls?.dispose();
+        });
+        this.mainRenderer?.dispose();
     }
 }

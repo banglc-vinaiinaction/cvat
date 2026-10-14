@@ -30,6 +30,8 @@ export interface OrthoInitOffscreenCanvasMessage {
   width: number;
   height: number;
   pixelRatio: number;
+  antialias?: boolean;
+  orthoRoiMultiplier?: number;
   cuboid: CuboidParams;
   activeColor: string;
   isGroundStripped: boolean;
@@ -120,6 +122,7 @@ let orthoCameras: {
 
 let canvasWidth = 540;
 let canvasHeight = 164;
+let currentOrthoRoiMultiplier = 1.6;
 let currentCuboid: CuboidParams = {
   x: 10.2,
   y: 2.1,
@@ -154,14 +157,15 @@ export function computeOrthoRoiSubset(
   positions: Float32Array,
   colors: Float32Array,
   cuboid: CuboidParams,
-  isGroundStripped: boolean
+  isGroundStripped: boolean,
+  roiMultiplier: number = currentOrthoRoiMultiplier
 ): {
   roiPositions: Float32Array;
   roiColors: Float32Array;
   bounds: OrthoFrustumBounds;
 } {
   const { x, y, z, l, w, h, yaw } = cuboid;
-  const roiRadius = Math.max(l, w, h) * 1.6 + 3.5;
+  const roiRadius = Math.max(l, w, h) * roiMultiplier + 3.5;
 
   // Check if we can reuse the spatial ROI crop buffer and only re-classify in-box points
   const needsFullSpatialRecrop =
@@ -271,21 +275,33 @@ export function computeOrthoRoiSubset(
 
 /**
  * Initializes the Three.js WebGLRenderer, Scene, Meshes, and 3 OrthographicCameras
- * directly on the worker's OffscreenCanvas.
+ * directly on the worker's OffscreenCanvas. Safely disposes any previous renderer
+ * if the component remounted in React StrictMode.
  */
 function initOffscreenThreeRenderer(msg: OrthoInitOffscreenCanvasMessage): void {
+  if (orthoRenderer) {
+    try {
+      orthoRenderer.dispose();
+    } catch {
+      // Ignore disposal errors from previous OffscreenCanvas
+    }
+    orthoRenderer = null;
+  }
+
   canvasWidth = msg.width;
   canvasHeight = msg.height;
+  currentOrthoRoiMultiplier = msg.orthoRoiMultiplier ?? 1.6;
   currentCuboid = { ...msg.cuboid };
   currentActiveColor = msg.activeColor;
   currentIsGroundStripped = msg.isGroundStripped;
+  lastRoiCuboid = null;
 
   orthoScene = new THREE.Scene();
   orthoScene.background = new THREE.Color(0x090d16);
 
   orthoRenderer = new THREE.WebGLRenderer({
     canvas: msg.canvas as unknown as HTMLCanvasElement,
-    antialias: true,
+    antialias: msg.antialias ?? true,
     alpha: false,
     powerPreference: 'high-performance',
   });

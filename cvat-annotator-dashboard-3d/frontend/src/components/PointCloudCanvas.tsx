@@ -1,8 +1,9 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
 import type { CuboidParams, SnapMetrics } from '../utils/snappingAndOrientation';
 import { snapAndOrientCuboid } from '../utils/snappingAndOrientation';
 import { DualSceneWorkerController, type OrthoZoomLevels } from '../utils/sceneWorkers';
+import { detectGpuCapabilities, type GpuProfile } from '../utils/gpuDetector';
 import { Tooltip, Button, Tag } from 'antd';
 import {
   AimOutlined,
@@ -47,6 +48,9 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
   currentViewMode,
   onViewModeChange,
 }) => {
+  // Detect Dedicated GPU (dGPU) vs iGPU/Software capabilities once
+  const gpuProfile: GpuProfile = useMemo(() => detectGpuCapabilities(), []);
+
   // Renderer 1 (Main Thread): Main 3D Perspective Scene Refs
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -130,12 +134,12 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({
-      antialias: true,
+      antialias: gpuProfile.antialias,
       alpha: false,
       powerPreference: 'high-performance',
     });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(gpuProfile.pixelRatio);
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -155,7 +159,7 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
     // Main Point Cloud Mesh (populated asynchronously by Worker 1: MainSceneWorker)
     const geometry = new THREE.BufferGeometry();
     const material = new THREE.PointsMaterial({
-      size: 0.12,
+      size: gpuProfile.pointSize,
       vertexColors: true,
       transparent: true,
       opacity: 0.9,
@@ -285,10 +289,11 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
           offscreen,
           ORTHO_DOCK_WIDTH,
           ORTHO_DOCK_HEIGHT,
-          Math.min(window.devicePixelRatio || 1, 2),
+          gpuProfile.pixelRatio,
           cuboidRef.current,
           activeColorRef.current,
-          isGroundStrippedRef.current
+          isGroundStrippedRef.current,
+          gpuProfile
         );
       }
     }
@@ -297,7 +302,7 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
 
     // --- Demand-Driven + Smoothly Damped Animation Loop for Main 3D Scene (Renderer 1) ---
     let animId: number;
-    const damping = 0.25;
+    const damping = gpuProfile.dampingFactor;
 
     const animate = () => {
       animId = requestAnimationFrame(animate);
@@ -369,7 +374,7 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
         orthoContainer.removeChild(orthoCanvasEl);
       }
     };
-  }, []);
+  }, [gpuProfile]);
 
   // 2. Update Cuboid Mesh in Main 3D Scene (Renderer 1) and Offload Ortho Scene Render to Worker 2
   useEffect(() => {
@@ -803,6 +808,47 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
         </div>
       </div>
 
+      {/* Top-Right GPU Detector & Active Rendering Pipeline Status Badge */}
+      <Tooltip
+        title={`Detected GPU: ${gpuProfile.renderer} (${gpuProfile.vendor}) | Method: ${gpuProfile.renderingMethod} | DPR: ${gpuProfile.pixelRatio}x | MSAA: ${gpuProfile.antialias ? 'ON' : 'OFF'} | Pool: Strictly 2 Singleton Workers`}
+        placement="bottomRight"
+      >
+        <div
+          style={{
+            position: 'absolute',
+            top: 16,
+            right: 16,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            background: 'rgba(15, 23, 42, 0.88)',
+            padding: '6px 12px',
+            borderRadius: 8,
+            border:
+              gpuProfile.tier === 'dgpu'
+                ? '1px solid rgba(16, 185, 129, 0.45)'
+                : '1px solid rgba(245, 158, 11, 0.45)',
+            backdropFilter: 'blur(8px)',
+            fontSize: 11,
+            cursor: 'help',
+          }}
+        >
+          <Tag
+            color={gpuProfile.tier === 'dgpu' ? 'green' : gpuProfile.tier === 'igpu' ? 'gold' : 'volcano'}
+            style={{ margin: 0, fontWeight: 700, fontSize: 10 }}
+          >
+            {gpuProfile.tier === 'dgpu'
+              ? 'dGPU DETECTED'
+              : gpuProfile.tier === 'igpu'
+              ? 'iGPU MODE'
+              : 'SW WEBGL'}
+          </Tag>
+          <span style={{ color: '#e2e8f0', fontWeight: 600 }}>{gpuProfile.shortGpuLabel}</span>
+          <span style={{ color: '#64748b' }}>|</span>
+          <span style={{ color: '#38bdf8', fontSize: 10 }}>{gpuProfile.renderingMethod}</span>
+        </div>
+      </Tooltip>
+
       {/* OffscreenCanvas Multi-View Orthographic Dock (Worker 2 + Dedicated Worker WebGLRenderer) */}
       <div
         onMouseDown={(e) => e.stopPropagation()}
@@ -849,7 +895,7 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
               Worker 1: Main 3D
             </Tag>
             <Tag color="cyan" style={{ margin: 0, fontSize: 10, lineHeight: '16px' }}>
-              Worker 2: OffscreenCanvas WebGL
+              Worker 2: OffscreenCanvas ({gpuProfile.tier.toUpperCase()})
             </Tag>
           </div>
           <span style={{ color: '#94a3b8', fontSize: 10 }}>

@@ -373,7 +373,7 @@ self.onmessage = function (e) {
     }
 
     if (data.type === 'computeOrthoROI') {
-        const { id, cx, cy, cz, radius } = data;
+        const { id, cx, cy, cz, radius, maxPoints } = data;
         if (!cachedPositions || cachedPositions.length === 0) {
             const emptyPos = new Float32Array(0);
             const emptyCol = new Float32Array(0);
@@ -405,12 +405,17 @@ self.onmessage = function (e) {
             }
         }
 
-        const roiPositions = new Float32Array(outCount * 3);
-        const roiColors = new Float32Array(outCount * 3);
+        const limit = (maxPoints && maxPoints > 0) ? maxPoints : 25000;
+        const finalCount = outCount > limit ? limit : outCount;
+        const step = outCount > limit ? (outCount / limit) : 1;
+
+        const roiPositions = new Float32Array(finalCount * 3);
+        const roiColors = new Float32Array(finalCount * 3);
         const hasColors = Boolean(cachedColors && cachedColors.length >= cachedPositions.length);
 
-        for (let j = 0; j < outCount; j++) {
-            const srcIdx = scratchIndices[j] * 3;
+        for (let j = 0; j < finalCount; j++) {
+            const matchIdx = step > 1 ? Math.floor(j * step) : j;
+            const srcIdx = scratchIndices[matchIdx] * 3;
             const dstIdx = j * 3;
             roiPositions[dstIdx] = cachedPositions[srcIdx];
             roiPositions[dstIdx + 1] = cachedPositions[srcIdx + 1];
@@ -432,20 +437,20 @@ self.onmessage = function (e) {
             id,
             positionsBuffer: roiPositions.buffer,
             colorsBuffer: roiColors.buffer,
-            count: outCount,
+            count: finalCount,
         }, [roiPositions.buffer, roiColors.buffer]);
     }
 };
 `;
 
-function createInlineWorker(source: string): Worker | null {
+function createInlineWorker(source: string, name: string): Worker | null {
     if (typeof window === 'undefined' || typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') {
         return null;
     }
     try {
         const blob = new Blob([source], { type: 'application/javascript' });
         const url = URL.createObjectURL(blob);
-        const worker = new Worker(url);
+        const worker = new Worker(url, { name });
         URL.revokeObjectURL(url);
         return worker;
     } catch {
@@ -453,23 +458,45 @@ function createInlineWorker(source: string): Worker | null {
     }
 }
 
+// Strict module-level singleton workers: guarantees at most 2 workers exist across the entire browser tab
+// (1 for the main Three.js perspective scene, 1 for the top/side/front orthographic views),
+// even if Canvas3d / Canvas3dViewImpl is instantiated multiple times.
+let sharedMainWorker: Worker | null = null;
+let sharedMainRequestId: number = 0;
+
+let sharedOrthoWorker: Worker | null = null;
+let sharedOrthoRequestId: number = 0;
+
+function getSharedMainWorker(): Worker | null {
+    if (!sharedMainWorker) {
+        sharedMainWorker = createInlineWorker(MAIN_SCENE_WORKER_SOURCE, 'CVAT3D-MainSceneWorker');
+    }
+    return sharedMainWorker;
+}
+
+function getSharedOrthoWorker(): Worker | null {
+    if (!sharedOrthoWorker) {
+        sharedOrthoWorker = createInlineWorker(ORTHO_VIEWS_WORKER_SOURCE, 'CVAT3D-OrthoViewsWorker');
+    }
+    return sharedOrthoWorker;
+}
+
 /**
- * Worker 1: Dedicated background worker for the main Three.js perspective scene.
+ * Worker 1: Dedicated singleton background worker for the main Three.js perspective scene.
  * Offloads spatial ground elevation grid construction, bounding box calculation,
  * and global road plane GPF estimation from the main UI thread.
  */
 export class MainSceneWorker {
     private worker: Worker | null;
-    private latestRequestId: number = 0;
     private pendingCallback: ((result: MainSceneInitResult) => void) | null = null;
 
     constructor() {
-        this.worker = createInlineWorker(MAIN_SCENE_WORKER_SOURCE);
+        this.worker = getSharedMainWorker();
         if (this.worker) {
             this.worker.onmessage = (e: MessageEvent) => {
                 const data = e.data;
                 if (!data || data.type !== 'sceneInitialized') return;
-                if (data.id !== this.latestRequestId || !this.pendingCallback) return;
+                if (data.id !== sharedMainRequestId || !this.pendingCallback) return;
 
                 const { bbox, groundGrid, globalGroundPlane } = data;
                 const gridArray = new Float32Array(groundGrid.gridBuffer);
@@ -499,10 +526,37 @@ export class MainSceneWorker {
         onResult: (result: MainSceneInitResult) => void,
         cellSize: number = 0.5,
     ): void {
-        const id = ++this.latestRequestId;
+        const id = ++sharedMainRequestId;
         this.pendingCallback = onResult;
 
         if (this.worker) {
+            // Re-bind handler in case a newer Canvas3dViewImpl took over the singleton worker
+            this.worker.onmessage = (e: MessageEvent) => {
+                const data = e.data;
+                if (!data || data.type !== 'sceneInitialized') return;
+                if (data.id !== sharedMainRequestId || !this.pendingCallback) return;
+
+                const { bbox, groundGrid, globalGroundPlane } = data;
+                const gridArray = new Float32Array(groundGrid.gridBuffer);
+                const callback = this.pendingCallback;
+                this.pendingCallback = null;
+
+                callback({
+                    bbox,
+                    groundGrid: {
+                        cellSize: groundGrid.cellSize,
+                        minX: groundGrid.minX,
+                        minY: groundGrid.minY,
+                        maxX: groundGrid.maxX,
+                        maxY: groundGrid.maxY,
+                        cols: groundGrid.cols,
+                        rows: groundGrid.rows,
+                        grid: gridArray,
+                    },
+                    globalGroundPlane,
+                });
+            };
+
             const copy = new Float32Array(positions.length);
             copy.set(positions);
             this.worker.postMessage(
@@ -520,7 +574,7 @@ export class MainSceneWorker {
         // Synchronous fallback when Web Worker is unavailable
         const gridInstance = new GroundElevationGrid(positions, cellSize);
         const globalGroundPlane = computeSceneGroundPlane(positions, 35.0);
-        if (id === this.latestRequestId && this.pendingCallback) {
+        if (id === sharedMainRequestId && this.pendingCallback) {
             const callback = this.pendingCallback;
             this.pendingCallback = null;
             callback({
@@ -541,38 +595,29 @@ export class MainSceneWorker {
     }
 
     public clear(): void {
-        this.latestRequestId++;
+        sharedMainRequestId++;
         this.pendingCallback = null;
-    }
-
-    public dispose(): void {
-        this.clear();
-        if (this.worker) {
-            this.worker.terminate();
-            this.worker = null;
-        }
     }
 }
 
 /**
- * Worker 2: Dedicated background worker for the top, side, and front orthographic views.
+ * Worker 2: Dedicated singleton background worker for the top, side, and front orthographic views.
  * Caches point cloud coordinates & colors and computes compact spherical ROI vertex buffers
  * off the main thread, returning Float32Array position and color buffers via zero-copy Transferables.
  */
 export class OrthoViewsWorker {
     private worker: Worker | null;
-    private latestRequestId: number = 0;
     private pendingCallback: ((result: OrthoROIResult) => void) | null = null;
     private fallbackPositions: Float32Array | null = null;
     private fallbackColors: Float32Array | null = null;
 
     constructor() {
-        this.worker = createInlineWorker(ORTHO_VIEWS_WORKER_SOURCE);
+        this.worker = getSharedOrthoWorker();
         if (this.worker) {
             this.worker.onmessage = (e: MessageEvent) => {
                 const data = e.data;
                 if (!data || data.type !== 'orthoROIResult') return;
-                if (data.id !== this.latestRequestId || !this.pendingCallback) return;
+                if (data.id !== sharedOrthoRequestId || !this.pendingCallback) return;
 
                 const positions = new Float32Array(data.positionsBuffer, 0, data.count * 3);
                 const colors = new Float32Array(data.colorsBuffer, 0, data.count * 3);
@@ -584,7 +629,7 @@ export class OrthoViewsWorker {
     }
 
     public initPoints(positions: ArrayLike<number>, colors?: ArrayLike<number> | null): void {
-        this.latestRequestId++;
+        sharedOrthoRequestId++;
         this.pendingCallback = null;
 
         if (this.worker) {
@@ -626,11 +671,25 @@ export class OrthoViewsWorker {
         cz: number,
         radius: number,
         onResult: (result: OrthoROIResult) => void,
+        maxPoints: number = 25000,
     ): void {
-        const id = ++this.latestRequestId;
+        const id = ++sharedOrthoRequestId;
         this.pendingCallback = onResult;
 
         if (this.worker) {
+            // Re-bind handler in case a newer Canvas3dViewImpl took over the singleton worker
+            this.worker.onmessage = (e: MessageEvent) => {
+                const data = e.data;
+                if (!data || data.type !== 'orthoROIResult') return;
+                if (data.id !== sharedOrthoRequestId || !this.pendingCallback) return;
+
+                const positions = new Float32Array(data.positionsBuffer, 0, data.count * 3);
+                const colors = new Float32Array(data.colorsBuffer, 0, data.count * 3);
+                const callback = this.pendingCallback;
+                this.pendingCallback = null;
+                callback({ positions, colors });
+            };
+
             this.worker.postMessage({
                 type: 'computeOrthoROI',
                 id,
@@ -638,6 +697,7 @@ export class OrthoViewsWorker {
                 cy,
                 cz,
                 radius,
+                maxPoints,
             });
             return;
         }
@@ -665,11 +725,16 @@ export class OrthoViewsWorker {
             }
         }
         const outCount = indices.length;
-        const roiPositions = new Float32Array(outCount * 3);
-        const roiColors = new Float32Array(outCount * 3);
+        const limit = maxPoints > 0 ? maxPoints : 25000;
+        const finalCount = outCount > limit ? limit : outCount;
+        const step = outCount > limit ? (outCount / limit) : 1;
+
+        const roiPositions = new Float32Array(finalCount * 3);
+        const roiColors = new Float32Array(finalCount * 3);
         const hasColors = Boolean(colors && colors.length >= positions.length);
-        for (let j = 0; j < outCount; j++) {
-            const srcIdx = indices[j] * 3;
+        for (let j = 0; j < finalCount; j++) {
+            const matchIdx = step > 1 ? Math.floor(j * step) : j;
+            const srcIdx = indices[matchIdx] * 3;
             const dstIdx = j * 3;
             roiPositions[dstIdx] = positions[srcIdx];
             roiPositions[dstIdx + 1] = positions[srcIdx + 1];
@@ -684,27 +749,19 @@ export class OrthoViewsWorker {
                 roiColors[dstIdx + 2] = 1;
             }
         }
-        if (id === this.latestRequestId && this.pendingCallback) {
+        if (id === sharedOrthoRequestId && this.pendingCallback) {
             this.pendingCallback = null;
             onResult({ positions: roiPositions, colors: roiColors });
         }
     }
 
     public clear(): void {
-        this.latestRequestId++;
+        sharedOrthoRequestId++;
         this.pendingCallback = null;
         this.fallbackPositions = null;
         this.fallbackColors = null;
         if (this.worker) {
             this.worker.postMessage({ type: 'clear' });
-        }
-    }
-
-    public dispose(): void {
-        this.clear();
-        if (this.worker) {
-            this.worker.terminate();
-            this.worker = null;
         }
     }
 }

@@ -1,6 +1,8 @@
 /**
  * Dual-Worker Pipeline Controller (sceneWorkers.ts)
- * Coordinates:
+ * Uses a module-level Singleton Worker Pool (sharedMainWorker + sharedOrthoWorker)
+ * to guarantee strictly 2 Web Workers total in the browser tab across React 19
+ * StrictMode mounts/remounts:
  *   1. MainSceneWorker (Worker 1): Main Three.js scene point cloud generation,
  *      O(1) spatial grid indexing, dynamic color filtering (Ground Stripping &
  *      Object Isolation), and RANSAC/GPF + PCA road snapping.
@@ -9,6 +11,7 @@
  */
 
 import { snapAndOrientCuboid, type CuboidParams, type SnapResult } from './snappingAndOrientation';
+import type { GpuProfile } from './gpuDetector';
 import {
   buildSyntheticLiDARPointCloud,
   computeFilteredColors,
@@ -37,10 +40,47 @@ export interface DualWorkerCallbacks {
   ) => void;
 }
 
+/**
+ * Module-level Singleton Worker Pool — guarantees strictly 2 workers total
+ * (1 MainSceneWorker + 1 OrthoViewsWorker) in the entire application lifecycle.
+ */
+let sharedMainWorker: Worker | null = null;
+let sharedOrthoWorker: Worker | null = null;
+
+function getSharedWorkerPair(): { mainWorker: Worker | null; orthoWorker: Worker | null } {
+  if (typeof Worker === 'undefined') {
+    return { mainWorker: null, orthoWorker: null };
+  }
+
+  try {
+    if (!sharedMainWorker) {
+      sharedMainWorker = new Worker(
+        new URL('../workers/mainSceneWorker.ts', import.meta.url),
+        { type: 'module', name: 'MainSceneWorker' }
+      );
+    }
+    if (!sharedOrthoWorker) {
+      sharedOrthoWorker = new Worker(
+        new URL('../workers/orthoViewsWorker.ts', import.meta.url),
+        { type: 'module', name: 'OrthoViewsWorker' }
+      );
+    }
+  } catch {
+    sharedMainWorker = null;
+    sharedOrthoWorker = null;
+  }
+
+  return {
+    mainWorker: sharedMainWorker,
+    orthoWorker: sharedOrthoWorker,
+  };
+}
+
 export class DualSceneWorkerController {
   private mainWorker: Worker | null = null;
   private orthoWorker: Worker | null = null;
   private isOffscreenActive = false;
+  private isDisposed = false;
   private filterRequestId = 0;
   private snapRequestId = 0;
   private orthoRequestId = 0;
@@ -53,71 +93,62 @@ export class DualSceneWorkerController {
   constructor(callbacks: DualWorkerCallbacks) {
     this.callbacks = callbacks;
 
-    if (typeof Worker !== 'undefined') {
-      try {
-        this.mainWorker = new Worker(
-          new URL('../workers/mainSceneWorker.ts', import.meta.url),
-          { type: 'module', name: 'MainSceneWorker' }
-        );
-        this.orthoWorker = new Worker(
-          new URL('../workers/orthoViewsWorker.ts', import.meta.url),
-          { type: 'module', name: 'OrthoViewsWorker' }
-        );
+    const { mainWorker, orthoWorker } = getSharedWorkerPair();
+    this.mainWorker = mainWorker;
+    this.orthoWorker = orthoWorker;
 
-        this.mainWorker.onmessage = (event: MessageEvent<MainWorkerResponse>) => {
-          const msg = event.data;
-          if (msg.type === 'SCENE_INITIALIZED') {
-            // Transfer a point cloud copy to Worker 2 (OrthoViewsWorker)
-            const orthoPosCopy = new Float32Array(msg.positions);
-            const orthoColCopy = new Float32Array(msg.colors);
-            this.postToOrthoWorker(
-              {
-                type: 'SET_POINT_CLOUD',
-                positions: orthoPosCopy,
-                colors: orthoColCopy,
-              },
-              [orthoPosCopy.buffer, orthoColCopy.buffer]
+    if (this.mainWorker && this.orthoWorker) {
+      this.mainWorker.onmessage = (event: MessageEvent<MainWorkerResponse>) => {
+        if (this.isDisposed) return;
+        const msg = event.data;
+        if (msg.type === 'SCENE_INITIALIZED') {
+          // Transfer a point cloud copy to Worker 2 (OrthoViewsWorker)
+          const orthoPosCopy = new Float32Array(msg.positions);
+          const orthoColCopy = new Float32Array(msg.colors);
+          this.postToOrthoWorker(
+            {
+              type: 'SET_POINT_CLOUD',
+              positions: orthoPosCopy,
+              colors: orthoColCopy,
+            },
+            [orthoPosCopy.buffer, orthoColCopy.buffer]
+          );
+
+          this.callbacks.onMainSceneInitialized(msg.positions, msg.colors, msg.pointCount);
+        } else if (msg.type === 'POINT_CLOUD_FILTERED') {
+          if (msg.requestId === this.filterRequestId) {
+            this.callbacks.onMainPointCloudFiltered(msg.colors);
+          }
+        } else if (msg.type === 'SNAP_RESULT') {
+          if (msg.requestId === this.snapRequestId) {
+            this.callbacks.onMainSnapResult(msg.result);
+          }
+        }
+      };
+
+      this.orthoWorker.onmessage = (event: MessageEvent<OrthoWorkerResponse>) => {
+        if (this.isDisposed) return;
+        const msg = event.data;
+        if (msg.type === 'ROI_METRICS') {
+          if (msg.requestId === 0 || msg.requestId === this.orthoRequestId) {
+            this.callbacks.onOrthoRoiMetrics(msg.bounds);
+          }
+        } else if (msg.type === 'ORTHO_VIEWS_UPDATED') {
+          if (msg.requestId === this.orthoRequestId) {
+            this.callbacks.onOrthoRoiMetrics(msg.bounds);
+            this.callbacks.onOrthoViewsFallbackUpdated?.(
+              msg.roiPositions,
+              msg.roiColors,
+              msg.bounds
             );
-
-            this.callbacks.onMainSceneInitialized(msg.positions, msg.colors, msg.pointCount);
-          } else if (msg.type === 'POINT_CLOUD_FILTERED') {
-            // Latest-request-wins to prevent stale frames
-            if (msg.requestId === this.filterRequestId) {
-              this.callbacks.onMainPointCloudFiltered(msg.colors);
-            }
-          } else if (msg.type === 'SNAP_RESULT') {
-            if (msg.requestId === this.snapRequestId) {
-              this.callbacks.onMainSnapResult(msg.result);
-            }
           }
-        };
-
-        this.orthoWorker.onmessage = (event: MessageEvent<OrthoWorkerResponse>) => {
-          const msg = event.data;
-          if (msg.type === 'ROI_METRICS') {
-            if (msg.requestId === 0 || msg.requestId === this.orthoRequestId) {
-              this.callbacks.onOrthoRoiMetrics(msg.bounds);
-            }
-          } else if (msg.type === 'ORTHO_VIEWS_UPDATED') {
-            if (msg.requestId === this.orthoRequestId) {
-              this.callbacks.onOrthoRoiMetrics(msg.bounds);
-              this.callbacks.onOrthoViewsFallbackUpdated?.(
-                msg.roiPositions,
-                msg.roiColors,
-                msg.bounds
-              );
-            }
-          }
-        };
-      } catch {
-        this.mainWorker = null;
-        this.orthoWorker = null;
-      }
+        }
+      };
     }
   }
 
   private postToMainWorker(msg: MainWorkerRequest, transfer?: Transferable[]): void {
-    if (!this.mainWorker) return;
+    if (!this.mainWorker || this.isDisposed) return;
     if (transfer && transfer.length > 0) {
       this.mainWorker.postMessage(msg, transfer);
     } else {
@@ -126,7 +157,7 @@ export class DualSceneWorkerController {
   }
 
   private postToOrthoWorker(msg: OrthoWorkerRequest, transfer?: Transferable[]): void {
-    if (!this.orthoWorker) return;
+    if (!this.orthoWorker || this.isDisposed) return;
     if (transfer && transfer.length > 0) {
       this.orthoWorker.postMessage(msg, transfer);
     } else {
@@ -136,7 +167,7 @@ export class DualSceneWorkerController {
 
   /**
    * Transfers an OffscreenCanvas to Worker 2 so all Top, Side, and Front Three.js
-   * WebGL rendering executes 100% off the main thread.
+   * WebGL rendering executes 100% off the main thread, configured with the detected GpuProfile.
    */
   public initOffscreenCanvas(
     canvas: OffscreenCanvas,
@@ -145,9 +176,10 @@ export class DualSceneWorkerController {
     pixelRatio: number,
     cuboid: CuboidParams,
     activeColor: string,
-    isGroundStripped: boolean
+    isGroundStripped: boolean,
+    gpuProfile?: GpuProfile
   ): boolean {
-    if (!this.orthoWorker) return false;
+    if (!this.orthoWorker || this.isDisposed) return false;
     this.isOffscreenActive = true;
     this.postToOrthoWorker(
       {
@@ -155,7 +187,9 @@ export class DualSceneWorkerController {
         canvas,
         width,
         height,
-        pixelRatio,
+        pixelRatio: gpuProfile ? gpuProfile.pixelRatio : pixelRatio,
+        antialias: gpuProfile ? gpuProfile.antialias : true,
+        orthoRoiMultiplier: gpuProfile ? gpuProfile.orthoRoiMultiplier : 1.6,
         cuboid,
         activeColor,
         isGroundStripped,
@@ -287,15 +321,12 @@ export class DualSceneWorkerController {
     }
   }
 
+  /**
+   * Detaches controller callbacks without spawning additional workers on remount,
+   * preserving the strict 2-worker singleton pool.
+   */
   public dispose(): void {
-    if (this.mainWorker) {
-      this.mainWorker.terminate();
-      this.mainWorker = null;
-    }
-    if (this.orthoWorker) {
-      this.orthoWorker.terminate();
-      this.orthoWorker = null;
-    }
+    this.isDisposed = true;
     this.isOffscreenActive = false;
   }
 }
