@@ -205,11 +205,11 @@ function SnapToRoadControl(props: Props): JSX.Element {
                 const enabled = (canvasInstance as any)?.togglePerformanceHud?.();
                 const stats = (canvasInstance as any)?.getPerformanceStats?.();
                 const gpuDesc = stats?.gpuTier ?
-                    ` (${String(stats.gpuTier).toUpperCase()} • ${stats.renderMethod || 'Dual-Worker Pipeline'})` :
+                    ` (${String(stats.gpuTier).toUpperCase()} • ${stats.renderingMethod || '4-View WebGL2'})` :
                     '';
                 notification.info({
-                    message: `3D GPU & Dual-Worker HUD: ${enabled === false ? 'HIDDEN' : 'VISIBLE'}`,
-                    description: `Live GPU tier, Dual-Worker status, and frame timing overlay${gpuDesc}.`,
+                    message: `3D GPU & Performance HUD: ${enabled === false ? 'HIDDEN' : 'VISIBLE'}`,
+                    description: `Live GPU tier, scene worker status, and frame timing overlay${gpuDesc}.`,
                     duration: 2.5,
                 });
             },

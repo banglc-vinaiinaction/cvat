@@ -38,7 +38,6 @@ export interface Canvas3dPerformanceStats {
     gpuRenderer: string;
     renderingMethod: string;
     mainWorkerActive: boolean;
-    orthoWorkerActive: boolean;
 }
 
 export interface Canvas3dView {
@@ -223,7 +222,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private perfHudLastUpdate: number = 0;
 
     public getPerformanceStats(): Canvas3dPerformanceStats {
-        const { mainWorkerActive, orthoWorkerActive } = areSceneWorkersActive();
+        const { mainWorkerActive } = areSceneWorkersActive();
         let gpuTierLabel = 'iGPU';
         let renderingMethodLabel = 'iGPU Balanced (4-View WebGL2 + Shader ROI)';
         if (this.gpuCapabilities.tier === 'dgpu') {
@@ -246,7 +245,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             gpuRenderer: this.gpuCapabilities.renderer,
             renderingMethod: renderingMethodLabel,
             mainWorkerActive,
-            orthoWorkerActive,
         };
     }
 
@@ -304,7 +302,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.perfHudElement.textContent = [
             `GPU Tier    : ${stats.gpuTier} (${stats.gpuRenderer})`,
             `Render Mode : ${stats.renderingMethod}`,
-            `Scene Worker: MainSceneWorker [${w1}] | VRAM Cache: ${this.geometryCache.size}/16 frames`,
+            `Scene Worker: MainSceneWorker [${w1}] | VRAM Cache: ${this.geometryCache.size}/64 frames`,
             `FPS / Frame : ${stats.fps} FPS (${stats.frameTimeMs.toFixed(1)} ms | GPU draw: ${stats.renderTimeMs.toFixed(2)} ms)`,
             `Points      : ${stats.pointCount.toLocaleString()} main | ${stats.orthoRoiPoints.toLocaleString()} ortho ROI | ${stats.cuboidCount} cuboids`,
         ].join('\n');
@@ -969,15 +967,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     public getGroundPlane(): [number, number, number, number] {
-        if (this.cachedGlobalGroundPlane) {
-            return this.cachedGlobalGroundPlane;
-        }
-
         const positions = this.pointCloudPoints?.geometry?.attributes?.position?.array;
-        if (!positions || positions.length < 9) {
-            return [0, 0, 1, 1.65];
-        }
-
         const targetClientID = (this.isObjectIsolated && this.isolatedClientID !== null) ?
             this.isolatedClientID : this.getActiveElement();
 
@@ -990,15 +980,52 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     return localPlane;
                 }
             }
-            const localPlane = estimateLocalRoadPlane(pos.x, pos.y, pos.z, positions, 3.5);
-            if (localPlane) {
-                return localPlane;
+            if (positions && positions.length >= 9) {
+                const localPlane = estimateLocalRoadPlane(pos.x, pos.y, pos.z, positions, 3.5);
+                if (localPlane) {
+                    return localPlane;
+                }
             }
+        }
+
+        if (this.cachedGlobalGroundPlane) {
+            return this.cachedGlobalGroundPlane;
+        }
+
+        if (!positions || positions.length < 9) {
+            return [0, 0, 1, 1.65];
         }
 
         const scenePlane = computeSceneGroundPlane(positions);
         this.cachedGlobalGroundPlane = scenePlane;
         return scenePlane;
+    }
+
+    private refreshGroundClippingPlane(): [number, number, number, number] {
+        const planeEq = this.getGroundPlane();
+        let [A, B, C, D] = planeEq;
+        const len = Math.sqrt(A * A + B * B + C * C);
+        if (len > 1e-6) {
+            A /= len;
+            B /= len;
+            C /= len;
+            D /= len;
+        } else {
+            A = 0;
+            B = 0;
+            C = 1;
+            D = 1.65;
+        }
+
+        if (C < 0) {
+            A = -A;
+            B = -B;
+            C = -C;
+            D = -D;
+        }
+
+        this.groundClippingPlane = new THREE.Plane(new THREE.Vector3(A, B, C), D - this.groundStrippingOffset);
+        return [A, B, C, D];
     }
 
     public toggleGroundStripping(elevationOffset: number = 0.12): boolean {
@@ -1023,31 +1050,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.groundStrippingOffset = typeof elevationOffset === 'number' && Number.isFinite(elevationOffset) ?
             elevationOffset : 0.12;
 
-        const planeEq = this.getGroundPlane();
-        let [A, B, C, D] = planeEq;
-        const len = Math.sqrt(A * A + B * B + C * C);
-        if (len > 1e-6) {
-            A /= len;
-            B /= len;
-            C /= len;
-            D /= len;
-        } else {
-            A = 0;
-            B = 0;
-            C = 1;
-            D = 1.65;
-        }
-
-        if (C < 0) {
-            A = -A;
-            B = -B;
-            C = -C;
-            D = -D;
-        }
-
-        const normal = new THREE.Vector3(A, B, C);
-        this.groundClippingPlane = new THREE.Plane(normal, D - this.groundStrippingOffset);
-
+        const [, , C, D] = this.refreshGroundClippingPlane();
         this.updateClippingPlanes();
 
         const groundZ = C !== 0 ? -D / C : -1.65;
@@ -2509,6 +2512,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             }
             this.activatedElementID = null;
             this.resetBottomViewsCamera();
+            if (this.isGroundStripped) {
+                this.refreshGroundClippingPlane();
+                this.updateClippingPlanes();
+            }
             this.updateOrthoPointCloudROI(true);
             this.requestOrthoRender(2);
         }
@@ -2552,6 +2559,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.rotatePlane(null, null);
             this.detachCamera();
             this.updateCameraFrustumPlane();
+            if (this.isGroundStripped) {
+                this.refreshGroundClippingPlane();
+                this.updateClippingPlanes();
+            }
             this.updateOrthoPointCloudROI(true);
         }
     }
@@ -2646,11 +2657,102 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 states.findIndex((state: ObjectState) => state.clientID === clientID) === -1
             ));
 
-        this.deactivateObject();
+        const prevIsolatedPos = (
+            this.isObjectIsolated &&
+            this.isolatedClientID !== null &&
+            this.drawnObjects[this.isolatedClientID]?.cuboid?.perspective
+        ) ? this.drawnObjects[this.isolatedClientID].cuboid.perspective.position.clone() : null;
+
+        const nextActiveRaw = this.model.data.activeElement.clientID;
+        const nextActiveID = nextActiveRaw !== null ? +nextActiveRaw : null;
+        const nextActiveState = nextActiveID !== null ?
+            states.find((s: ObjectState) => s.clientID === nextActiveID) : undefined;
+        const prevActiveData = (this.activatedElementID !== null && this.drawnObjects[this.activatedElementID]) ?
+            this.drawnObjects[this.activatedElementID].data : null;
+        const canKeepActiveHelpers = (
+            this.activatedElementID !== null &&
+            this.activatedElementID === nextActiveID &&
+            Boolean(nextActiveState) &&
+            !nextActiveState!.outside &&
+            !nextActiveState!.hidden &&
+            Boolean(prevActiveData) &&
+            prevActiveData!.occluded === nextActiveState!.occluded &&
+            prevActiveData!.lock === nextActiveState!.lock
+        );
+
+        if (!canKeepActiveHelpers) {
+            this.deactivateObject();
+        }
         this.createObjects(created);
         this.updateObjects(updated);
         this.deleteObjects(deleted);
-        this.activateObject();
+
+        if (this.isObjectIsolated && this.isolatedClientID !== null) {
+            const isolatedEntry = this.drawnObjects[this.isolatedClientID];
+            if (isolatedEntry && !isolatedEntry.data.outside && !isolatedEntry.data.hidden && isolatedEntry.cuboid?.perspective) {
+                isolatedEntry.cuboid.perspective.visible = true;
+                this.hiddenByIsolation.clear();
+                Object.keys(this.drawnObjects).forEach((strId: string) => {
+                    const id = +strId;
+                    if (id !== this.isolatedClientID && this.drawnObjects[id]?.cuboid?.perspective?.visible) {
+                        this.drawnObjects[id].cuboid.perspective.visible = false;
+                        this.hiddenByIsolation.add(id);
+                    }
+                });
+                if (prevIsolatedPos && this.views.perspective.controls) {
+                    const newPos = isolatedEntry.cuboid.perspective.position;
+                    const dx = newPos.x - prevIsolatedPos.x;
+                    const dy = newPos.y - prevIsolatedPos.y;
+                    const dz = newPos.z - prevIsolatedPos.z;
+                    if (dx * dx + dy * dy + dz * dz > 1e-8) {
+                        const camPos = this.views.perspective.controls.getPosition(new THREE.Vector3());
+                        const camTarget = this.views.perspective.controls.getTarget(new THREE.Vector3());
+                        this.views.perspective.controls.setLookAt(
+                            camPos.x + dx, camPos.y + dy, camPos.z + dz,
+                            camTarget.x + dx, camTarget.y + dy, camTarget.z + dz,
+                            false,
+                        );
+                    }
+                }
+            } else {
+                this.isObjectIsolated = false;
+                this.isolatedClientID = null;
+                this.hiddenByIsolation.forEach((id: number) => {
+                    const obj = this.drawnObjects[id];
+                    if (obj?.cuboid?.perspective && !obj.data.outside && !obj.data.hidden) {
+                        obj.cuboid.perspective.visible = true;
+                    }
+                });
+                this.hiddenByIsolation.clear();
+            }
+        }
+
+        if (canKeepActiveHelpers) {
+            const { cuboid, data } = this.drawnObjects[this.activatedElementID!];
+            const { selectedShapeOpacity } = this.model.data.configuration;
+            cuboid.setOpacity(selectedShapeOpacity);
+            for (const view of BOTTOM_VIEWS) {
+                cuboid[view].visible = true;
+            }
+            if (!data.lock) {
+                this.updateResizeHelperPos();
+                this.updateRotationHelperPos();
+            }
+            this.rotatePlane(null, null);
+            this.detachCamera();
+            this.updateCameraFrustumPlane();
+            this.updateOrthoPointCloudROI(true);
+        } else {
+            this.activateObject();
+        }
+
+        if (this.isGroundStripped) {
+            this.refreshGroundClippingPlane();
+        }
+        if (this.isGroundStripped || this.isObjectIsolated) {
+            this.updateClippingPlanes();
+        }
+
         this.updateSideViewsZoom();
     }
 
@@ -2734,17 +2836,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     } else {
                         this.mainSceneWorker.clear();
                         this.previousCuboids.clear();
-                        if (this.isObjectIsolated) {
-                            this.isObjectIsolated = false;
-                            this.isolatedClientID = null;
-                            this.hiddenByIsolation.forEach((id: number) => {
-                                const obj = this.drawnObjects[id];
-                                if (obj?.cuboid?.perspective && !obj.data.outside && !obj.data.hidden) {
-                                    obj.cuboid.perspective.visible = true;
-                                }
-                            });
-                            this.hiddenByIsolation.clear();
-                        }
 
                         const frameNumber = model.data.imageID;
                         if (frameNumber !== null && this.geometryCache.has(frameNumber)) {
@@ -2788,7 +2879,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                                         this.cachedGlobalGroundPlane = result.globalGroundPlane;
 
                                         if (frameNumber !== null) {
-                                            if (this.geometryCache.size >= 16) {
+                                            if (this.geometryCache.size >= 64) {
                                                 const oldestKey = this.geometryCache.keys().next().value;
                                                 if (oldestKey !== undefined) {
                                                     const evicted = this.geometryCache.get(oldestKey);
@@ -3220,6 +3311,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 if (this.pointCloudPoints?.geometry !== expectedGeo) return;
                 this.groundGrid = GroundElevationGrid.fromPrecomputed(res.groundGrid);
                 this.cachedGlobalGroundPlane = res.globalGroundPlane;
+                if (this.isGroundStripped) {
+                    this.refreshGroundClippingPlane();
+                    this.updateClippingPlanes();
+                    this.requestRender();
+                }
             });
         }
         const getCameraSettingsToFitScene = (
@@ -3435,27 +3531,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         }
 
         if (this.isGroundStripped) {
-            const planeEq = this.getGroundPlane();
-            let [A, B, C, D] = planeEq;
-            const len = Math.sqrt(A * A + B * B + C * C);
-            if (len > 1e-6) {
-                A /= len;
-                B /= len;
-                C /= len;
-                D /= len;
-            } else {
-                A = 0;
-                B = 0;
-                C = 1;
-                D = 1.65;
-            }
-            if (C < 0) {
-                A = -A;
-                B = -B;
-                C = -C;
-                D = -D;
-            }
-            this.groundClippingPlane = new THREE.Plane(new THREE.Vector3(A, B, C), D - this.groundStrippingOffset);
+            this.refreshGroundClippingPlane();
         }
         if (this.getActiveElement() === null) {
             this.resetBottomViewsCamera();

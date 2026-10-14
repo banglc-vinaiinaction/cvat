@@ -794,10 +794,9 @@ function getSharedMainWorker(): Worker | null {
     return sharedMainWorker;
 }
 
-export function areSceneWorkersActive(): { mainWorkerActive: boolean; orthoWorkerActive: boolean } {
+export function areSceneWorkersActive(): { mainWorkerActive: boolean } {
     return {
         mainWorkerActive: sharedMainWorker !== null,
-        orthoWorkerActive: false,
     };
 }
 

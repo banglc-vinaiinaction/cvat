@@ -5,7 +5,7 @@
 export type GpuTier = 'dgpu' | 'igpu' | 'software';
 
 export type RenderingMethod =
-    | 'dgpu-hardware-offscreen'
+    | 'dgpu-4view-webgl2'
     | 'igpu-balanced'
     | 'software-low-overhead';
 
@@ -16,12 +16,10 @@ export interface GpuCapabilities {
     renderer: string;
     isWebGL2: boolean;
     maxTextureSize: number;
-    supportsOffscreenCanvas: boolean;
     renderingMethod: RenderingMethod;
     antialias: boolean;
     pixelRatio: number;
     orthoRoiRadiusPadding: number;
-    orthoMaxPoints: number;
 }
 
 const SOFTWARE_GPU_PATTERNS = [
@@ -80,7 +78,6 @@ export function detectGpuCapabilities(): GpuCapabilities {
     let renderer = 'Unknown';
     let isWebGL2 = false;
     let maxTextureSize = 4096;
-    const supportsOffscreenCanvas = typeof OffscreenCanvas !== 'undefined';
 
     if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         try {
@@ -146,12 +143,10 @@ export function detectGpuCapabilities(): GpuCapabilities {
             renderer,
             isWebGL2,
             maxTextureSize,
-            supportsOffscreenCanvas,
-            renderingMethod: 'dgpu-hardware-offscreen',
+            renderingMethod: 'dgpu-4view-webgl2',
             antialias: true,
             pixelRatio: Math.min(dpr, 2),
             orthoRoiRadiusPadding: 12.0,
-            orthoMaxPoints: 25000,
         };
     } else if (tier === 'software') {
         cachedCapabilities = {
@@ -161,12 +156,10 @@ export function detectGpuCapabilities(): GpuCapabilities {
             renderer,
             isWebGL2,
             maxTextureSize,
-            supportsOffscreenCanvas,
             renderingMethod: 'software-low-overhead',
             antialias: false,
             pixelRatio: 1,
             orthoRoiRadiusPadding: 3.5,
-            orthoMaxPoints: 2500,
         };
     } else {
         cachedCapabilities = {
@@ -176,12 +169,10 @@ export function detectGpuCapabilities(): GpuCapabilities {
             renderer,
             isWebGL2,
             maxTextureSize,
-            supportsOffscreenCanvas,
             renderingMethod: 'igpu-balanced',
             antialias: false,
             pixelRatio: 1,
             orthoRoiRadiusPadding: 4.5,
-            orthoMaxPoints: 4000,
         };
     }
 
