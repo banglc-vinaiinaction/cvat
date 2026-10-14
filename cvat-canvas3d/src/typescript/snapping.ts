@@ -1078,6 +1078,17 @@ export function solveClusterYaw(
     };
 }
 
+export interface PrecomputedGroundGridData {
+    cellSize: number;
+    minX: number;
+    minY: number;
+    maxX: number;
+    maxY: number;
+    cols: number;
+    rows: number;
+    grid: Float32Array;
+}
+
 /**
  * Coarse 2D ground elevation spatial grid / heightmap cache.
  * Populated once when a point cloud frame loads, enabling O(1) road elevation
@@ -1093,6 +1104,19 @@ export class GroundElevationGrid {
     public readonly cols: number;
     public readonly rows: number;
     private readonly grid: Float32Array;
+
+    public static fromPrecomputed(data: PrecomputedGroundGridData): GroundElevationGrid {
+        const instance = Object.create(GroundElevationGrid.prototype) as GroundElevationGrid;
+        (instance as any).cellSize = data.cellSize;
+        (instance as any).minX = data.minX;
+        (instance as any).minY = data.minY;
+        (instance as any).maxX = data.maxX;
+        (instance as any).maxY = data.maxY;
+        (instance as any).cols = data.cols;
+        (instance as any).rows = data.rows;
+        (instance as any).grid = data.grid;
+        return instance;
+    }
 
     constructor(positions: ArrayLike<number>, cellSize: number = 0.5) {
         this.cellSize = cellSize > 0 ? cellSize : 0.5;
@@ -1256,6 +1280,70 @@ export class GroundElevationGrid {
 
         const d = -(normX * x + normY * y + normZ * z0);
         return [normX, normY, normZ, d];
+    }
+
+    /**
+     * Intersects a 3D camera ray with the ground elevation heightmap / road plane in O(1) time,
+     * eliminating O(N) brute-force raycasting against 150,000 point cloud vertices during Mode.DRAW.
+     */
+    public intersectRay(
+        ray: THREE.Ray,
+        fallbackPlane: [number, number, number, number] = [0, 0, 1, 1.65],
+        maxDistance: number = 150,
+    ): THREE.Vector3 | null {
+        let [A, B, C, D] = fallbackPlane;
+        const len = Math.sqrt(A * A + B * B + C * C);
+        if (len > 1e-6) {
+            A /= len;
+            B /= len;
+            C /= len;
+            D /= len;
+        } else {
+            A = 0;
+            B = 0;
+            C = 1;
+            D = 1.65;
+        }
+
+        const plane = new THREE.Plane(new THREE.Vector3(A, B, C), D);
+        const hit = ray.intersectPlane(plane, new THREE.Vector3());
+
+        if (hit && ray.origin.distanceTo(hit) <= maxDistance) {
+            for (let iter = 0; iter < 2; iter++) {
+                const roadZ = this.getElevation(hit.x, hit.y, 2);
+                if (roadZ === null || Math.abs(roadZ - hit.z) > 5.0) break;
+                if (Math.abs(ray.direction.z) > 0.03) {
+                    const t = (roadZ - ray.origin.z) / ray.direction.z;
+                    if (t >= 0.5 && t <= maxDistance) {
+                        hit.set(
+                            ray.origin.x + ray.direction.x * t,
+                            ray.origin.y + ray.direction.y * t,
+                            roadZ,
+                        );
+                    } else {
+                        hit.z = roadZ;
+                    }
+                } else {
+                    hit.z = roadZ;
+                }
+            }
+            return hit;
+        }
+
+        // Spatial heightmap ray-march fallback when ray is aimed near/above the horizon
+        if (this.cols > 0 && this.rows > 0) {
+            for (let t = 2.0; t <= 80.0; t += 1.0) {
+                const rx = ray.origin.x + ray.direction.x * t;
+                const ry = ray.origin.y + ray.direction.y * t;
+                const rz = ray.origin.z + ray.direction.z * t;
+                const elev = this.getElevation(rx, ry, 1);
+                if (elev !== null && rz <= elev + 0.5) {
+                    return new THREE.Vector3(rx, ry, elev);
+                }
+            }
+        }
+
+        return null;
     }
 }
 
