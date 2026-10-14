@@ -5,31 +5,50 @@ import { snapAndOrientCuboid } from '../utils/snappingAndOrientation';
 import { Tooltip, Button, Tag } from 'antd';
 import { 
   AimOutlined, 
-  EyeOutlined, 
   CompressOutlined, 
-  ThunderboltOutlined,
-  CheckCircleOutlined,
+  ThunderboltOutlined, 
+  CheckCircleOutlined, 
   UndoOutlined,
+  SwapOutlined,
+  FilterOutlined,
+  ScissorOutlined,
 } from '@ant-design/icons';
+
+export type CameraViewMode = 'perspective' | 'top' | 'side' | 'front';
 
 interface PointCloudCanvasProps {
   cuboid: CuboidParams;
   onCuboidChange: (newCuboid: CuboidParams) => void;
   activeColor: string;
+  isGroundStripped?: boolean;
+  isObjectIsolated?: boolean;
+  onToggleGroundStripping?: () => void;
+  onToggleObjectIsolation?: () => void;
+  onInvertHeading?: () => void;
   onSnapNotification?: (metrics: SnapMetrics) => void;
+  currentViewMode?: CameraViewMode;
+  onViewModeChange?: (mode: CameraViewMode) => void;
 }
 
 export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
   cuboid,
   onCuboidChange,
   activeColor,
+  isGroundStripped = false,
+  isObjectIsolated = false,
+  onToggleGroundStripping,
+  onToggleObjectIsolation,
+  onInvertHeading,
   onSnapNotification,
+  currentViewMode,
+  onViewModeChange,
 }) => {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const pointCloudDataRef = useRef<Float32Array | null>(null);
+  const originalColorsRef = useRef<Float32Array | null>(null);
   const pointsMeshRef = useRef<THREE.Points | null>(null);
   const boxMeshRef = useRef<THREE.Mesh | null>(null);
   const boxEdgesRef = useRef<THREE.LineSegments | null>(null);
@@ -39,7 +58,9 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
   const [lastSnap, setLastSnap] = useState<SnapMetrics | null>(null);
   const [previousCuboid, setPreviousCuboid] = useState<CuboidParams | null>(null);
   const [previousCuboidArray, setPreviousCuboidArray] = useState<number[] | null>(null);
-  const [viewMode, setViewMode] = useState<'perspective' | 'bev'>('perspective');
+  const [internalViewMode, setInternalViewMode] = useState<CameraViewMode>('perspective');
+  const viewMode = currentViewMode ?? internalViewMode;
+  const hasActiveFilterRef = useRef<boolean>(false);
 
   // Camera Orbit State
   const isDraggingRef = useRef(false);
@@ -166,6 +187,7 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
     // LiDAR Point Cloud
     const lidarData = generateLiDARScene();
     pointCloudDataRef.current = lidarData.positions;
+    originalColorsRef.current = new Float32Array(lidarData.colors);
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(lidarData.positions, 3));
@@ -358,12 +380,124 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
     }
   }, [previousCuboid, previousCuboidArray, onCuboidChange]);
 
-  // Keyboard shortcut listener: 'F' for snap, 'Shift+F' for revert
+  // Dynamic point cloud filtering (Ground Stripping & Object Isolation)
+  useEffect(() => {
+    if (!pointsMeshRef.current || !pointCloudDataRef.current || !originalColorsRef.current) return;
+
+    // Fast-path: If neither filter is active and previous state had no filter, skip 90k point iteration
+    if (!isGroundStripped && !isObjectIsolated) {
+      if (!hasActiveFilterRef.current) return;
+      hasActiveFilterRef.current = false;
+    } else {
+      hasActiveFilterRef.current = true;
+    }
+
+    const geometry = pointsMeshRef.current.geometry;
+    const colorAttr = geometry.getAttribute('color') as THREE.BufferAttribute;
+    const positions = pointCloudDataRef.current;
+    const orig = originalColorsRef.current;
+    const count = positions.length / 3;
+
+    const cx = cuboid.x;
+    const cy = cuboid.y;
+    const halfL = cuboid.l / 2 + 0.35;
+    const halfW = cuboid.w / 2 + 0.35;
+    const cosY = Math.cos(cuboid.yaw);
+    const sinY = Math.sin(cuboid.yaw);
+
+    for (let i = 0; i < count; i++) {
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
+
+      let r = orig[i * 3];
+      let g = orig[i * 3 + 1];
+      let b = orig[i * 3 + 2];
+
+      if (isGroundStripped && pz <= -1.55) {
+        r = 0.03;
+        g = 0.04;
+        b = 0.06;
+      }
+
+      if (isObjectIsolated) {
+        const dx = px - cx;
+        const dy = py - cy;
+        const u = dx * cosY + dy * sinY;
+        const v = -dx * sinY + dy * cosY;
+        const inside = Math.abs(u) <= halfL && Math.abs(v) <= halfW && pz >= cuboid.z - cuboid.h / 2 - 0.1 && pz <= cuboid.z + cuboid.h / 2 + 0.2;
+
+        if (inside) {
+          r = 0.2;
+          g = 0.95;
+          b = 1.0;
+        } else {
+          r *= 0.15;
+          g *= 0.15;
+          b *= 0.15;
+        }
+      }
+
+      colorAttr.setXYZ(i, r, g, b);
+    }
+    colorAttr.needsUpdate = true;
+  }, [isGroundStripped, isObjectIsolated, cuboid]);
+
+  // Keyboard shortcut listener: micro-nudges, snap, revert, heading inversion, modes
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Avoid triggering when focused on input fields
       if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) return;
-      if ((e.key === 'f' || e.key === 'F') && e.shiftKey) {
+
+      const stepDist = e.shiftKey ? 0.20 : 0.04;
+      const stepAngle = (e.shiftKey ? 5 : 1) * (Math.PI / 180);
+
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, x: parseFloat((cuboid.x + stepDist).toFixed(3)) });
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, x: parseFloat((cuboid.x - stepDist).toFixed(3)) });
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, y: parseFloat((cuboid.y + stepDist).toFixed(3)) });
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, y: parseFloat((cuboid.y - stepDist).toFixed(3)) });
+      } else if (e.key === 'PageUp') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, z: parseFloat((cuboid.z + 0.02).toFixed(3)) });
+      } else if (e.key === 'PageDown') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, z: parseFloat((cuboid.z - 0.02).toFixed(3)) });
+      } else if (e.key === '[' || e.key === '{') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, yaw: parseFloat((cuboid.yaw - stepAngle).toFixed(4)) });
+      } else if (e.key === ']' || e.key === '}') {
+        e.preventDefault();
+        onCuboidChange({ ...cuboid, yaw: parseFloat((cuboid.yaw + stepAngle).toFixed(4)) });
+      } else if (e.key === 'h' || e.key === 'H') {
+        e.preventDefault();
+        onInvertHeading?.();
+      } else if (e.key === 'g' || e.key === 'G') {
+        e.preventDefault();
+        onToggleGroundStripping?.();
+      } else if ((e.key === 'i' || e.key === 'I') && e.shiftKey) {
+        e.preventDefault();
+        onToggleObjectIsolation?.();
+      } else if (e.key === '1') {
+        e.preventDefault();
+        setPresetView('perspective');
+      } else if (e.key === '2') {
+        e.preventDefault();
+        setPresetView('top');
+      } else if (e.key === '3') {
+        e.preventDefault();
+        setPresetView('side');
+      } else if (e.key === '4') {
+        e.preventDefault();
+        setPresetView('front');
+      } else if ((e.key === 'f' || e.key === 'F') && e.shiftKey) {
         e.preventDefault();
         revertSnap();
       } else if (e.key === 'f' || e.key === 'F') {
@@ -373,21 +507,59 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [executeSnapToRoadAndOrient, revertSnap]);
+  }, [
+    executeSnapToRoadAndOrient, 
+    revertSnap, 
+    cuboid, 
+    onCuboidChange, 
+    onInvertHeading, 
+    onToggleGroundStripping, 
+    onToggleObjectIsolation
+  ]);
 
-  // View Presets
-  const setPresetView = (mode: 'perspective' | 'bev') => {
-    setViewMode(mode);
-    if (mode === 'bev') {
-      orbitRef.current.phi = 0.05; // Almost directly top-down
-      orbitRef.current.theta = 0;
-      orbitRef.current.target.set(cuboid.x, cuboid.y, -1.0);
+  // View Presets: Top, Side, Front, and Perspective
+  const setPresetView = useCallback((mode: CameraViewMode) => {
+    if (onViewModeChange) {
+      onViewModeChange(mode);
     } else {
+      setInternalViewMode(mode);
+    }
+
+    const { x, y, z, yaw, l, w, h } = cuboid;
+    const targetZ = z || -0.9;
+
+    if (mode === 'top') {
+      // Orthographic top-down BEV: phi near 0, yaw aligned
+      orbitRef.current.phi = 0.04;
+      orbitRef.current.theta = yaw - Math.PI / 2;
+      orbitRef.current.radius = Math.max(l, w) * 2.8 + 6;
+      orbitRef.current.target.set(x, y, targetZ);
+    } else if (mode === 'side') {
+      // Side camera view: lateral profile (doors / wheels)
+      orbitRef.current.phi = Math.PI / 2 - 0.05;
+      orbitRef.current.theta = yaw;
+      orbitRef.current.radius = Math.max(l, h) * 2.2 + 4;
+      orbitRef.current.target.set(x, y, targetZ);
+    } else if (mode === 'front') {
+      // Front camera view: front bumper & windshield
+      orbitRef.current.phi = Math.PI / 2 - 0.05;
+      orbitRef.current.theta = yaw + Math.PI / 2;
+      orbitRef.current.radius = Math.max(w, h) * 2.5 + 4;
+      orbitRef.current.target.set(x, y, targetZ);
+    } else {
+      // 3D Perspective orbit
       orbitRef.current.phi = Math.PI / 3.5;
       orbitRef.current.theta = Math.PI / 4;
-      orbitRef.current.target.set(cuboid.x, cuboid.y, -1.0);
+      orbitRef.current.radius = 28;
+      orbitRef.current.target.set(x, y, targetZ);
     }
-  };
+  }, [cuboid, onViewModeChange]);
+
+  useEffect(() => {
+    if (currentViewMode) {
+      setPresetView(currentViewMode);
+    }
+  }, [currentViewMode, setPresetView]);
 
   return (
     <div
@@ -467,15 +639,73 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
           </Tooltip>
         )}
 
+        <Tooltip title="Invert Vehicle Heading (180°) (Shortcut: H)">
+          <Button
+            icon={<SwapOutlined />}
+            onClick={onInvertHeading}
+          >
+            Invert (180°)
+          </Button>
+        </Tooltip>
+
+        <Tooltip title="Toggle Ground Stripping: Filter Road Surface (Shortcut: G)">
+          <Button
+            type={isGroundStripped ? 'primary' : 'default'}
+            icon={<FilterOutlined />}
+            onClick={onToggleGroundStripping}
+            style={isGroundStripped ? { background: '#8b5cf6', borderColor: '#8b5cf6' } : undefined}
+          >
+            Strip Road (G)
+          </Button>
+        </Tooltip>
+
+        <Tooltip title="Toggle Object Isolation: Dim Scene Clutter (Shortcut: Shift+I)">
+          <Button
+            type={isObjectIsolated ? 'primary' : 'default'}
+            icon={<ScissorOutlined />}
+            onClick={onToggleObjectIsolation}
+            style={isObjectIsolated ? { background: '#06b6d4', borderColor: '#06b6d4' } : undefined}
+          >
+            Isolate (Shift+I)
+          </Button>
+        </Tooltip>
+
         <div style={{ width: 1, height: 20, background: 'rgba(255,255,255,0.15)', margin: '0 4px' }} />
 
-        <Button
-          type={viewMode === 'bev' ? 'primary' : 'default'}
-          icon={<EyeOutlined />}
-          onClick={() => setPresetView(viewMode === 'bev' ? 'perspective' : 'bev')}
-        >
-          {viewMode === 'bev' ? '3D View' : 'BEV Top'}
-        </Button>
+        <div style={{ display: 'flex', background: 'rgba(255,255,255,0.06)', borderRadius: 6, padding: 2, gap: 2 }}>
+          <Button
+            size="small"
+            type={viewMode === 'perspective' ? 'primary' : 'text'}
+            onClick={() => setPresetView('perspective')}
+            style={{ fontSize: 11 }}
+          >
+            3D (1)
+          </Button>
+          <Button
+            size="small"
+            type={viewMode === 'top' ? 'primary' : 'text'}
+            onClick={() => setPresetView('top')}
+            style={{ fontSize: 11 }}
+          >
+            Top BEV (2)
+          </Button>
+          <Button
+            size="small"
+            type={viewMode === 'side' ? 'primary' : 'text'}
+            onClick={() => setPresetView('side')}
+            style={{ fontSize: 11 }}
+          >
+            Side (3)
+          </Button>
+          <Button
+            size="small"
+            type={viewMode === 'front' ? 'primary' : 'text'}
+            onClick={() => setPresetView('front')}
+            style={{ fontSize: 11 }}
+          >
+            Front (4)
+          </Button>
+        </div>
       </div>
 
       {/* Snap Feedback Badge */}
@@ -536,7 +766,16 @@ export const PointCloudCanvas: React.FC<PointCloudCanvasProps> = ({
           pointerEvents: 'none',
         }}
       >
-        Left Click: Rotate | Right Click: Pan | Scroll: Zoom | <Tag color="blue">F: Snap</Tag>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span>Navigate: LMB/RMB/Scroll</span>
+          <Tag color="cyan">1-4: Views (Top/Side/Front/3D)</Tag>
+          <Tag color="green">F: Snap</Tag>
+          <Tag color="purple">G: Strip Road</Tag>
+          <Tag color="orange">H: Invert 180°</Tag>
+          <Tag color="blue">Arrows: Micro-Nudge</Tag>
+          <Tag color="geekblue">PgUp/Dn: Z</Tag>
+          <Tag color="gold">[/]: Yaw</Tag>
+        </div>
       </div>
     </div>
   );

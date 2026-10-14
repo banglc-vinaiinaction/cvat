@@ -171,6 +171,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     private cachedGlobalGroundPlane: [number, number, number, number] | null = null;
     private pointCloudMeshes: THREE.Points[] = [];
     private hiddenByIsolation: Set<number> = new Set();
+    private orthoPointsGeometry: THREE.BufferGeometry | null = null;
+    private lastRoiCenter: THREE.Vector3 | null = null;
+    private scenePlanes: Record<string, THREE.Mesh | null> = {
+        [ViewType.TOP]: null,
+        [ViewType.SIDE]: null,
+        [ViewType.FRONT]: null,
+    };
 
     public requestRender(frameCount: number = 2): void {
         this.needsRenderCount = Math.max(this.needsRenderCount, frameCount);
@@ -1242,12 +1249,33 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     const h = canvas.height || 150;
                     if (w <= 0 || h <= 0) return;
 
-                    if (this.masterRenderer.domElement.width !== w || this.masterRenderer.domElement.height !== h) {
-                        this.masterRenderer.setSize(w, h, false);
+                    const curW = this.masterRenderer.domElement.width;
+                    const curH = this.masterRenderer.domElement.height;
+                    const targetW = Math.max(curW, w);
+                    const targetH = Math.max(curH, h);
+
+                    if (curW < targetW || curH < targetH) {
+                        this.masterRenderer.setSize(targetW, targetH, false);
                     }
+
+                    this.masterRenderer.setViewport(0, 0, w, h);
+                    this.masterRenderer.setScissor(0, 0, w, h);
+                    this.masterRenderer.setScissorTest(true);
+
                     this.masterRenderer.render(scene, camera);
+
                     ctx.clearRect(0, 0, w, h);
-                    ctx.drawImage(this.masterRenderer.domElement, 0, 0);
+                    ctx.drawImage(
+                        this.masterRenderer.domElement,
+                        0,
+                        this.masterRenderer.domElement.height - h,
+                        w,
+                        h,
+                        0,
+                        0,
+                        w,
+                        h,
+                    );
                 },
                 dispose: () => {
                     if (ctx) {
@@ -1837,6 +1865,11 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                     const objectOffset = Math.min(1, 1 - ((height / 2) / distanceUpToCamera));
                     camera.near = Math.max(0.01, distanceUpToCamera * objectOffset - 0.5);
                     camera.far = camera.near + height + 1.0;
+                } else if (this.selectedCuboid) {
+                    const height = dimensions.z;
+                    const objectOffset = Math.min(1, 1 - ((height / 2) / distanceUpToCamera));
+                    camera.near = Math.max(0.01, distanceUpToCamera * objectOffset - 1.5);
+                    camera.far = camera.near + height + 3.0;
                 } else {
                     camera.near = 0;
                     camera.far = 1000;
@@ -2032,6 +2065,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         if (!data.lock) {
             this.action.scan = view;
             this.model.mode = Mode.EDIT;
+            this.requestRender();
         }
     }
 
@@ -2047,26 +2081,30 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const { mouseVector } = this.views[view as keyof Views].rayCaster as { mouseVector: THREE.Vector2 };
         const diffX = event.clientX - rect.left;
         const diffY = event.clientY - rect.top;
-        mouseVector.x = (diffX / canvas.clientWidth) * 2 - 1;
-        mouseVector.y = -(diffY / canvas.clientHeight) * 2 + 1;
+        const clientW = canvas.clientWidth || 1;
+        const clientH = canvas.clientHeight || 1;
+        mouseVector.x = (diffX / clientW) * 2 - 1;
+        mouseVector.y = -(diffY / clientH) * 2 + 1;
         this.action.rotation.screenMove = { x: diffX, y: diffY };
-        this.requestRender();
+        if (this.action.scan !== null) {
+            this.requestRender();
+        }
     }
 
     private translateReferencePlane(coordinates: any): void {
-        const topPlane = this.views.top.scene.getObjectByName(Planes.TOP);
+        const topPlane = this.scenePlanes[ViewType.TOP] || this.views.top.scene.getObjectByName(Planes.TOP);
         if (topPlane) {
             topPlane.position.x = coordinates.x;
             topPlane.position.y = coordinates.y;
             topPlane.position.z = coordinates.z;
         }
-        const sidePlane = this.views.side.scene.getObjectByName(Planes.SIDE);
+        const sidePlane = this.scenePlanes[ViewType.SIDE] || this.views.side.scene.getObjectByName(Planes.SIDE);
         if (sidePlane) {
             sidePlane.position.x = coordinates.x;
             sidePlane.position.y = coordinates.y;
             sidePlane.position.z = coordinates.z;
         }
-        const frontPlane = this.views.front.scene.getObjectByName(Planes.FRONT);
+        const frontPlane = this.scenePlanes[ViewType.FRONT] || this.views.front.scene.getObjectByName(Planes.FRONT);
         if (frontPlane) {
             frontPlane.position.x = coordinates.x;
             frontPlane.position.y = coordinates.y;
@@ -2309,6 +2347,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 removeRotationHelper(cuboid[view]);
             }
             this.activatedElementID = null;
+            this.updateOrthoPointCloudROI(true);
         }
     }
 
@@ -2350,6 +2389,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.rotatePlane(null, null);
             this.detachCamera();
             this.updateCameraFrustumPlane();
+            this.updateOrthoPointCloudROI(true);
         }
     }
 
@@ -2822,6 +2862,13 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.isolatedClientID = null;
         this.hiddenByIsolation.clear();
         this.pointCloudMeshes = [];
+        this.orthoPointsGeometry = null;
+        this.lastRoiCenter = null;
+        this.scenePlanes = {
+            [ViewType.TOP]: null,
+            [ViewType.SIDE]: null,
+            [ViewType.FRONT]: null,
+        };
         Object.entries(this.drawnObjects).forEach(([clientID, { cuboid }]) => {
             this.removeSceneChildren(cuboid, +clientID);
         });
@@ -3034,10 +3081,22 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         topScenePlane.name = Planes.TOP;
         (topScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
         (topScenePlane as any).verticesNeedUpdate = true;
+        this.scenePlanes[ViewType.TOP] = topScenePlane;
+
+        // Dedicated geometry for orthographic views sharing the vertex buffer attributes
+        const orthoGeo = new THREE.BufferGeometry();
+        orthoGeo.setAttribute('position', points.geometry.getAttribute('position'));
+        if (points.geometry.getAttribute('color')) {
+            orthoGeo.setAttribute('color', points.geometry.getAttribute('color'));
+        }
+        this.orthoPointsGeometry = orthoGeo;
+        this.lastRoiCenter = null;
+
         material.size = 0.5;
-        const topCloud = new THREE.Points(points.geometry, material);
+        const topCloud = new THREE.Points(orthoGeo, material);
         this.views.top.scene.add(topCloud);
         this.views.top.scene.add(topScenePlane);
+
         // Setup Side View
         const canvasSideView = this.views.side.renderer.domElement;
         const sideScenePlane = new THREE.Mesh(
@@ -3058,9 +3117,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         sideScenePlane.name = Planes.SIDE;
         (sideScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
         (sideScenePlane as any).verticesNeedUpdate = true;
-        const sideCloud = new THREE.Points(points.geometry, material);
+        this.scenePlanes[ViewType.SIDE] = sideScenePlane;
+
+        const sideCloud = new THREE.Points(orthoGeo, material);
         this.views.side.scene.add(sideCloud);
         this.views.side.scene.add(sideScenePlane);
+
         // Setup front View
         const canvasFrontView = this.views.front.renderer.domElement;
         const frontScenePlane = new THREE.Mesh(
@@ -3080,7 +3142,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         frontScenePlane.name = Planes.FRONT;
         (frontScenePlane.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
         (frontScenePlane as any).verticesNeedUpdate = true;
-        const frontCloud = new THREE.Points(points.geometry, material);
+        this.scenePlanes[ViewType.FRONT] = frontScenePlane;
+
+        const frontCloud = new THREE.Points(orthoGeo, material);
         this.views.front.scene.add(frontCloud);
         this.views.front.scene.add(frontScenePlane);
 
@@ -3287,8 +3351,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             let controlsUpdated = false;
             if (viewType.controls.enabled) {
                 controlsUpdated = viewType.controls.update(delta);
-            } else {
-                viewType.camera.updateProjectionMatrix();
             }
 
             const isPerspective = view === ViewType.PERSPECTIVE;
@@ -3312,25 +3374,23 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 }
             }
 
-            if (clientID !== null && !isPerspective) {
+            if (clientID !== null && !isPerspective && isScanningView) {
                 viewType.rayCaster.renderer.setFromCamera(viewType.rayCaster.mouseVector, viewType.camera);
                 // First Scan
-                if (this.action.scan === view) {
-                    if (!(this.action.translation.status || this.action.resize.status || this.action.rotation.status)) {
-                        this.initiateAction(view as ViewType, viewType);
-                    }
-                    // Action Operations
-                    if (this.action.detected) {
-                        if (this.action.translation.status) {
-                            this.renderTranslateAction(view as ViewType, viewType);
-                        } else if (this.action.resize.status) {
-                            this.renderResizeAction(view as ViewType, viewType);
-                        } else {
-                            this.renderRotateAction(view as ViewType, viewType);
-                        }
+                if (!(this.action.translation.status || this.action.resize.status || this.action.rotation.status)) {
+                    this.initiateAction(view as ViewType, viewType);
+                }
+                // Action Operations
+                if (this.action.detected) {
+                    if (this.action.translation.status) {
+                        this.renderTranslateAction(view as ViewType, viewType);
+                    } else if (this.action.resize.status) {
+                        this.renderResizeAction(view as ViewType, viewType);
                     } else {
-                        this.resetActions();
+                        this.renderRotateAction(view as ViewType, viewType);
                     }
+                } else {
+                    this.resetActions();
                 }
             }
         });
@@ -3368,8 +3428,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         ) {
             return;
         }
+        const plane = this.scenePlanes[view] || viewType.scene.getObjectByName(`${view}Plane`);
         const intersects = viewType.rayCaster.renderer.intersectObjects(
-            [viewType.scene.getObjectByName(`${view}Plane`)],
+            plane ? [plane] : [],
             true,
         );
 
@@ -3379,6 +3440,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.moveObject(coordinates);
             this.detachCamera(view);
             this.updateCameraFrustumPlane(view);
+            this.updateOrthoPointCloudROI();
         }
     }
 
@@ -3404,8 +3466,9 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
     private renderResizeAction(view: ViewType, viewType: any): void {
         const cuboid = this.selectedCuboid;
+        const plane = this.scenePlanes[view] || viewType.scene.getObjectByName(`${view}Plane`);
         const intersects = viewType.rayCaster.renderer
-            .intersectObjects([viewType.scene.getObjectByName(`${view}Plane`)], true);
+            .intersectObjects(plane ? [plane] : [], true);
 
         if (
             cuboid === null || intersects.length === 0) {
@@ -3629,9 +3692,10 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     private rotatePlane(direction: number, view: ViewType): void {
-        const sceneTopPlane = this.views.top.scene.getObjectByName(Planes.TOP);
-        const sceneSidePlane = this.views.side.scene.getObjectByName(Planes.SIDE);
-        const sceneFrontPlane = this.views.front.scene.getObjectByName(Planes.FRONT);
+        const sceneTopPlane = this.scenePlanes[ViewType.TOP] || this.views.top.scene.getObjectByName(Planes.TOP);
+        const sceneSidePlane = this.scenePlanes[ViewType.SIDE] || this.views.side.scene.getObjectByName(Planes.SIDE);
+        const sceneFrontPlane = this.scenePlanes[ViewType.FRONT] || this.views.front.scene.getObjectByName(Planes.FRONT);
+        if (!sceneTopPlane || !sceneSidePlane || !sceneFrontPlane) return;
         switch (view) {
             case ViewType.TOP:
                 sceneTopPlane.rotateZ(direction);
@@ -3741,6 +3805,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const { cuboid, data } = this.drawnObjects[+clientID] || {};
         if (!data || !cuboid || data.lock) return;
 
+        const plane = this.scenePlanes[view] || viewType.scene.getObjectByName(`${view}Plane`);
+
         const intersectsHelperResize = viewType.rayCaster.renderer.intersectObjects(
             cuboid[view].parent.children
                 .filter((child: THREE.Object3D) => child.name.startsWith(consts.RESIZE_HELPER_NAME)),
@@ -3748,7 +3814,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         );
 
         const intersectsPlane = viewType.rayCaster.renderer.intersectObjects(
-            [viewType.scene.getObjectByName(`${view}Plane`)],
+            plane ? [plane] : [],
             false,
         );
 
@@ -3780,7 +3846,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
 
         const intersectsBox = viewType.rayCaster.renderer.intersectObjects([cuboid[view]], false);
         const intersectsPointCloud = viewType.rayCaster.renderer.intersectObjects(
-            [viewType.scene.getObjectByName(`${view}Plane`)],
+            plane ? [plane] : [],
             true,
         );
         if (intersectsBox.length !== 0 && !data.pinned) {
@@ -3795,6 +3861,55 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             this.views.side.controls.enabled = false;
             this.views.front.controls.enabled = false;
         }
+    }
+
+    private updateOrthoPointCloudROI(force: boolean = false): void {
+        if (!this.orthoPointsGeometry || !this.pointCloudPoints) return;
+        const activeClientID = this.getActiveElement();
+        if (activeClientID === null || !(activeClientID in this.drawnObjects)) {
+            if (this.orthoPointsGeometry.index !== null) {
+                this.orthoPointsGeometry.setIndex(null);
+                this.lastRoiCenter = null;
+            }
+            return;
+        }
+
+        const { cuboid } = this.drawnObjects[activeClientID];
+        if (!cuboid) return;
+
+        const pos = cuboid.perspective.position;
+        const scale = cuboid.perspective.scale;
+
+        if (!force && this.lastRoiCenter) {
+            const distSq = pos.distanceToSquared(this.lastRoiCenter);
+            if (distSq < 0.64) return;
+        }
+
+        const positions = this.pointCloudPoints.geometry?.attributes?.position?.array;
+        if (!positions || positions.length === 0) return;
+
+        const cx = pos.x;
+        const cy = pos.y;
+        const cz = pos.z;
+        const maxDim = Math.max(scale.x, scale.y, scale.z);
+        const radius = maxDim / 2 + 5.0;
+        const radiusSq = radius * radius;
+        const count = positions.length / 3;
+
+        const indices: number[] = [];
+        for (let i = 0; i < count; i++) {
+            const idx = i * 3;
+            const dx = positions[idx] - cx;
+            const dy = positions[idx + 1] - cy;
+            const dz = positions[idx + 2] - cz;
+            if (dx * dx + dy * dy + dz * dz <= radiusSq) {
+                indices.push(i);
+            }
+        }
+
+        const indexArray = count > 65535 ? new Uint32Array(indices) : new Uint16Array(indices);
+        this.orthoPointsGeometry.setIndex(new THREE.BufferAttribute(indexArray, 1));
+        this.lastRoiCenter = pos.clone();
     }
 
     public keyControls(key: any): void {

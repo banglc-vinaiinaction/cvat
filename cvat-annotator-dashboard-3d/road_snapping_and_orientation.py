@@ -266,7 +266,7 @@ class RoadPointCloudSnapper:
                 else:
                     # Refine with consensus ground inliers
                     norm_v = road_plane[:3]
-                    dist_to_plane = np.abs(ground_candidates @ norm_v + road_plane[3])
+                    dist_to_plane = np.abs(ground_candidates[:, :3] @ norm_v + road_plane[3])
                     inliers = ground_candidates[(dist_to_plane <= 0.06) & (ground_candidates[:, 2] <= lpr_z + 0.30)]
                     if len(inliers) >= 10:
                         ref_plane, _ = self.plane_fitter.fit_plane(inliers)

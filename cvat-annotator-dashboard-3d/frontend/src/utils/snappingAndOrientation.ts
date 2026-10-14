@@ -381,8 +381,8 @@ export function fitBoundingBox2D(
 export function alignYawWithPoints(
   pts2D: [number, number][],
   currentYaw: number,
-  l: number,
-  w: number
+  _l?: number,
+  _w?: number
 ): number {
   const normalizeAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
 
