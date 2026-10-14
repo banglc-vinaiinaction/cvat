@@ -210,7 +210,7 @@ export class Canvas3dModelImpl extends MasterImpl implements Canvas3dModel {
                     y: false,
                     z: false,
                 },
-                autoRoadSnap: true,
+                autoRoadSnap: false,
                 snapMode: 'ground',
             },
             isFrameUpdating: false,

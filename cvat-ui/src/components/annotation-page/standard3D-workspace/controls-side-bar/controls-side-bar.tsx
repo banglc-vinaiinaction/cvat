@@ -34,7 +34,6 @@ import { filterApplicableForType } from 'utils/filter-applicable-labels';
 import { subKeyMap } from 'utils/component-subkeymap';
 import { ShortcutScope } from 'utils/enums';
 import { registerComponentShortcuts } from 'actions/shortcuts-actions';
-import SnapToRoadControl from './snap-to-road-control';
 
 interface Props {
     keyMap: KeyMap;
@@ -48,7 +47,6 @@ interface Props {
     pasteShape(): void;
     resetGroup(): void;
     updateActiveControl(activeControl: ActiveControl): void;
-    onOpenStandardizeModal?(): void;
 }
 
 const componentShortcuts: Record<string, KeyMapItem> = {
@@ -95,18 +93,6 @@ const componentShortcuts: Record<string, KeyMapItem> = {
         sequences: ['alt+m'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
-    SNAP_TO_ROAD_3D_CONTROLS: {
-        name: 'Snap to Road & Orient',
-        description: 'Snap selected 3D cuboid flush to the road plane and align its yaw with vehicle points',
-        sequences: ['alt+s'],
-        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
-    },
-    REVERT_SNAP_3D_CONTROLS: {
-        name: 'Revert Snap to Road',
-        description: 'Revert previously snapped 3D cuboid to its original position and orientation',
-        sequences: ['alt+shift+s'],
-        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
-    },
     INVERT_HEADING_3D_CONTROLS: {
         name: 'Invert Heading (180°)',
         description: 'Invert selected 3D cuboid heading by 180 degrees',
@@ -117,12 +103,6 @@ const componentShortcuts: Record<string, KeyMapItem> = {
         name: 'Toggle Object Isolation',
         description: 'Clip point cloud to local volume around active cuboid and dim scene clutter',
         sequences: ['shift+i'],
-        scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
-    },
-    SNAP_TRACK_TO_ROAD_3D_CONTROLS: {
-        name: 'Snap Track to Road',
-        description: 'Snap selected track across all frames to the road surface with smoothed trajectory',
-        sequences: ['alt+t'],
         scope: ShortcutScope['3D_ANNOTATION_WORKSPACE_CONTROLS'],
     },
 };
@@ -264,20 +244,6 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             if (event) event.preventDefault();
             dynamicTrackIconProps.onClick();
         },
-        SNAP_TO_ROAD_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
-            if (event) event.preventDefault();
-            const targetID = activeTargetID;
-            if (event && event.shiftKey) {
-                canvasInstance.revertSnap(targetID);
-            } else {
-                canvasInstance.snapToRoad(targetID);
-            }
-        },
-        REVERT_SNAP_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
-            if (event) event.preventDefault();
-            const targetID = activeTargetID;
-            canvasInstance.revertSnap(targetID);
-        },
         INVERT_HEADING_3D_CONTROLS: (event: KeyboardEvent | undefined) => {
             if (event) event.preventDefault();
             const targetID = activeTargetID;
@@ -296,49 +262,6 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
             }
             if (canvasInstance?.toggleObjectIsolation) {
                 canvasInstance.toggleObjectIsolation(targetID);
-            }
-        },
-        SNAP_TRACK_TO_ROAD_3D_CONTROLS: async (event: KeyboardEvent | undefined) => {
-            if (event) event.preventDefault();
-            const targetID = activeTargetID;
-            if (targetID === null) {
-                notification.warning({ message: 'No 3D object selected', duration: 2 });
-                return;
-            }
-            try {
-                notification.open({
-                    key: 'track_snap_progress',
-                    message: `Snapping Track #${targetID}`,
-                    description: 'Starting track road snapping...',
-                    duration: 0,
-                });
-                const res = await canvasInstance.snapTrackToRoad(
-                    props.jobInstance,
-                    targetID,
-                    (msg: string, pct: number) => {
-                        notification.open({
-                            key: 'track_snap_progress',
-                            message: `Snapping Track #${targetID} (${pct}%)`,
-                            description: msg,
-                            duration: 0,
-                        });
-                    },
-                );
-                notification.destroy('track_snap_progress');
-                notification.success({
-                    key: `track_snap_success_${Date.now()}`,
-                    message: `Track #${targetID} Snapped`,
-                    description: `Successfully aligned and smoothed ${res.processedFrames} frames along the road.`,
-                    duration: 3,
-                });
-            } catch (err: any) {
-                notification.destroy('track_snap_progress');
-                notification.error({
-                    key: `track_snap_error_${Date.now()}`,
-                    message: 'Track Snap Failed',
-                    description: err?.message || 'Error occurred during track snapping',
-                    duration: 3,
-                });
             }
         },
     };
@@ -375,12 +298,6 @@ export default function ControlsSideBarComponent(props: Props): JSX.Element {
                 canvasInstance={canvasInstance}
                 isDrawing={activeControl === ActiveControl.DRAW_CUBOID}
                 disabled={controlsDisabled}
-            />
-            <SnapToRoadControl
-                canvasInstance={canvasInstance}
-                disabled={controlsDisabled}
-                jobInstance={props.jobInstance}
-                onOpenStandardizeModal={props.onOpenStandardizeModal}
             />
 
             <hr />

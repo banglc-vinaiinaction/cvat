@@ -1,0 +1,99 @@
+metadata:
+  name: pth-microsoft-florence-2-base-ft
+  namespace: cvat
+  annotations:
+    name: Florence-2 Base FT (Microsoft GPU)
+    type: detector
+    spec: |
+      [
+        { "id": 0, "name": "person", "type": "rectangle" },
+        { "id": 1, "name": "pedestrian", "type": "rectangle" },
+        { "id": 2, "name": "rider", "type": "rectangle" },
+        { "id": 3, "name": "car", "type": "rectangle" },
+        { "id": 4, "name": "truck", "type": "rectangle" },
+        { "id": 5, "name": "bus", "type": "rectangle" },
+        { "id": 6, "name": "motorcycle", "type": "rectangle" },
+        { "id": 7, "name": "bicycle", "type": "rectangle" },
+        { "id": 8, "name": "train", "type": "rectangle" },
+        { "id": 9, "name": "traffic light", "type": "rectangle" },
+        { "id": 10, "name": "traffic sign", "type": "rectangle" },
+        { "id": 11, "name": "stop sign", "type": "rectangle" },
+        { "id": 12, "name": "fire hydrant", "type": "rectangle" },
+        { "id": 13, "name": "vehicle", "type": "rectangle" },
+        { "id": 14, "name": "bench", "type": "rectangle" },
+        { "id": 15, "name": "dog", "type": "rectangle" },
+        { "id": 16, "name": "cat", "type": "rectangle" },
+        { "id": 17, "name": "backpack", "type": "rectangle" },
+        { "id": 18, "name": "handbag", "type": "rectangle" },
+        { "id": 19, "name": "umbrella", "type": "rectangle" },
+        { "id": 20, "name": "bottle", "type": "rectangle" },
+        { "id": 21, "name": "chair", "type": "rectangle" },
+        { "id": 22, "name": "couch", "type": "rectangle" },
+        { "id": 23, "name": "table", "type": "rectangle" },
+        { "id": 24, "name": "cell phone", "type": "rectangle" },
+        { "id": 25, "name": "laptop", "type": "rectangle" }
+      ]
+
+spec:
+  description: Microsoft Florence-2 Base Fine-Tuned Vision-Language Foundation Model for CVAT (GPU)
+  runtime: 'python:3.10'
+  handler: main:handler
+  eventTimeout: 60s
+  env:
+    - name: PYTHONPATH
+      value: /opt/nuclio
+    - name: MODEL_ID
+      value: microsoft/Florence-2-base-ft
+    - name: TORCH_DEVICE
+      value: cuda
+
+  build:
+    image: cvat.pth.microsoft.florence-2-base-ft:latest-gpu
+    baseImage: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+
+    directives:
+      preCopy:
+        - kind: ENV
+          value: DEBIAN_FRONTEND=noninteractive
+        - kind: WORKDIR
+          value: /opt/nuclio
+        - kind: RUN
+          value: |-
+            apt-get update && apt-get install -y --no-install-recommends \
+              curl \
+              git \
+              ffmpeg \
+              libsm6 \
+              libxext6 \
+              ca-certificates \
+            && rm -rf /var/lib/apt/lists/*
+        - kind: RUN
+          value: pip install transformers==4.44.2 timm einops pillow pyyaml requests accelerate --no-cache-dir
+
+      postCopy:
+        # Pre-cache weights into container image
+        - kind: RUN
+          value: |-
+            python -c "from transformers import AutoProcessor, AutoModelForCausalLM; \
+              m_id = 'microsoft/Florence-2-base-ft'; \
+              AutoProcessor.from_pretrained(m_id, trust_remote_code=True); \
+              AutoModelForCausalLM.from_pretrained(m_id, trust_remote_code=True)"
+
+  triggers:
+    myHttpTrigger:
+      numWorkers: 2
+      kind: 'http'
+      workerAvailabilityTimeoutMilliseconds: 20000
+      attributes:
+        maxRequestBodySize: 33554432 # 32MB
+
+  resources:
+    limits:
+      nvidia.com/gpu: 1
+
+  platform:
+    attributes:
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3
+      mountMode: volume

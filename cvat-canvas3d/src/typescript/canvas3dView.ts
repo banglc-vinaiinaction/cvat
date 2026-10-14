@@ -8,7 +8,7 @@ import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader';
 import CameraControls from 'camera-controls';
 import { Canvas3dController } from './canvas3dController';
 import { Listener, Master } from './master';
-import consts, { getClassDimensionPrior, isPedestrianClass } from './consts';
+import consts, { getClassDimensionPrior } from './consts';
 import {
     Canvas3dModel, DrawData, Mode, Planes, UpdateReasons, ViewType,
 } from './canvas3dModel';
@@ -20,8 +20,7 @@ import {
 import { ObjectState, ObjectType } from '.';
 import { disposeScene } from './utils';
 import {
-    snapCuboidToRoadAndOrient, fitClusterAtPoint,
-    alignEulerToRoadPlane, GroundElevationGrid,
+    GroundElevationGrid,
     computeSceneGroundPlane, estimateLocalRoadPlane,
 } from './snapping';
 import { MainSceneWorker, areSceneWorkersActive } from './sceneWorkers';
@@ -344,213 +343,16 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         return (geo?.attributes?.position?.array as Float32Array) || null;
     }
 
-    public snapToRoad(clientID?: number | null, options?: { snapGround?: boolean; autoOrient?: boolean; snapGeometry?: boolean; }): void {
-        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
-        if (targetClientID === null) {
-            targetClientID = this.getActiveElement();
-        }
-
-        if (targetClientID === null || !(targetClientID in this.drawnObjects)) {
-            return;
-        }
-
-        this.model.data.activeElement.clientID = `${targetClientID}`;
-        this.activatedElementID = targetClientID;
-
-        const positions = this.getBasePointCloudPositions();
-        if (!positions) {
-            return;
-        }
-        const { cuboid, data } = this.drawnObjects[targetClientID];
-        if (data.lock) return;
-
-        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
-        if (!state) return;
-
-        const currentPoints = [
-            cuboid.perspective.position.x,
-            cuboid.perspective.position.y,
-            cuboid.perspective.position.z,
-            cuboid.perspective.rotation.x,
-            cuboid.perspective.rotation.y,
-            cuboid.perspective.rotation.z,
-            cuboid.perspective.scale.x,
-            cuboid.perspective.scale.y,
-            cuboid.perspective.scale.z,
-            0, 0, 0, 0, 0, 0, 0,
-        ];
-
-        const previousPoints = [...currentPoints];
-        if (!this.previousCuboids.has(targetClientID)) {
-            this.previousCuboids.set(targetClientID, []);
-        }
-        this.previousCuboids.get(targetClientID)!.push(previousPoints);
-
-        const snapMode = this.model.data.configuration.snapMode ?? 'ground';
-        const defaultFlags = snapMode === 'ground' ?
-            { snapGround: true, autoOrient: false, snapGeometry: false } :
-            { snapGround: true, autoOrient: true, snapGeometry: true };
-
-        const snapResult = snapCuboidToRoadAndOrient(currentPoints, positions, {
-            labelName: state.label?.name,
-            ...defaultFlags,
-            ...(options || {}),
-        });
-        const [x, y, z, rx, ry, rz, dx, dy, dz] = snapResult.points;
-
-        cuboid.setPosition(x, y, z);
-        cuboid.setRotation(rx, ry, rz);
-        cuboid.setScale(dx, dy, dz);
-        data.points = [...snapResult.points];
-
-        this.translateReferencePlane(new THREE.Vector3(x, y, z));
-        try {
-            this.rotatePlane(null as any, null as any);
-        } catch (_) {
-            // ignore if not all views are initialized
-        }
-
-        this.updateResizeHelperPos();
-        this.updateRotationHelperPos();
-        this.detachCamera();
-        BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
-        this.updateCameraFrustumPlane();
-
-        this.dispatchEvent(
-            new CustomEvent('canvas.edited', {
-                bubbles: false,
-                cancelable: true,
-                detail: {
-                    state,
-                    points: [...snapResult.points],
-                    previousPoints: [...previousPoints],
-                },
-            }),
-        );
-
-        this.dispatchEvent(
-            new CustomEvent('canvas.snapped', {
-                bubbles: false,
-                cancelable: true,
-                detail: {
-                    state,
-                    points: [...snapResult.points],
-                    previousPoints: [...previousPoints],
-                    metrics: snapResult.metrics,
-                },
-            }),
-        );
-
-        this.requestRender();
-        this.render();
+    public snapToRoad(_clientID?: number | null, _options?: { snapGround?: boolean; autoOrient?: boolean; snapGeometry?: boolean; }): void {
+        // Snap tools disabled
     }
 
-    public revertSnap(clientID?: number | null): boolean {
-        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
-        if (targetClientID === null) {
-            targetClientID = this.getActiveElement();
-        }
-
-        if (targetClientID === null || !this.previousCuboids.has(targetClientID)) {
-            return false;
-        }
-
-        this.model.data.activeElement.clientID = `${targetClientID}`;
-        this.activatedElementID = targetClientID;
-
-        const stack = this.previousCuboids.get(targetClientID)!;
-        if (stack.length === 0) {
-            this.previousCuboids.delete(targetClientID);
-            return false;
-        }
-
-        const prevPoints = stack.pop()!;
-        if (stack.length === 0) {
-            this.previousCuboids.delete(targetClientID);
-        }
-
-        const { cuboid, data } = this.drawnObjects[targetClientID] || {};
-        if (!cuboid || data?.lock) return false;
-
-        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
-        if (!state) return false;
-
-        const snappedPoints = [
-            cuboid.perspective.position.x,
-            cuboid.perspective.position.y,
-            cuboid.perspective.position.z,
-            cuboid.perspective.rotation.x,
-            cuboid.perspective.rotation.y,
-            cuboid.perspective.rotation.z,
-            cuboid.perspective.scale.x,
-            cuboid.perspective.scale.y,
-            cuboid.perspective.scale.z,
-            0, 0, 0, 0, 0, 0, 0,
-        ];
-
-        cuboid.setPosition(prevPoints[0], prevPoints[1], prevPoints[2]);
-        cuboid.setRotation(prevPoints[3], prevPoints[4], prevPoints[5]);
-        cuboid.setScale(prevPoints[6], prevPoints[7], prevPoints[8]);
-        data.points = [...prevPoints];
-
-        this.translateReferencePlane(new THREE.Vector3(prevPoints[0], prevPoints[1], prevPoints[2]));
-        try {
-            this.rotatePlane(null as any, null as any);
-        } catch (_) {
-            // ignore if not all views initialized
-        }
-
-        this.updateResizeHelperPos();
-        this.updateRotationHelperPos();
-        this.detachCamera();
-        BOTTOM_VIEWS.forEach((view) => this.updateHelperPointsSize(view));
-        this.updateCameraFrustumPlane();
-
-        this.dispatchEvent(
-            new CustomEvent('canvas.edited', {
-                bubbles: false,
-                cancelable: true,
-                detail: {
-                    state,
-                    points: [...prevPoints],
-                    previousPoints: [...snappedPoints],
-                },
-            }),
-        );
-
-        this.dispatchEvent(
-            new CustomEvent('canvas.reverted', {
-                bubbles: false,
-                cancelable: true,
-                detail: {
-                    state,
-                    points: [...prevPoints],
-                    previousPoints: [...snappedPoints],
-                },
-            }),
-        );
-
-        this.requestRender();
-        this.render();
-        return true;
+    public revertSnap(_clientID?: number | null): boolean {
+        // Snap tools disabled
+        return false;
     }
 
-    public getPreviousCuboid(clientID?: number | null): number[] | null {
-        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
-        if (targetClientID === null) {
-            if (this.activatedElementID !== null) {
-                targetClientID = this.activatedElementID;
-            } else if (this.model.data.activeElement.clientID !== null) {
-                targetClientID = +this.model.data.activeElement.clientID;
-            }
-        }
-
-        if (targetClientID !== null && this.previousCuboids.has(targetClientID)) {
-            const stack = this.previousCuboids.get(targetClientID)!;
-            if (stack.length > 0) {
-                return [...stack[stack.length - 1]];
-            }
-        }
+    public getPreviousCuboid(_clientID?: number | null): number[] | null {
         return null;
     }
 
@@ -1533,189 +1335,12 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
     }
 
     public async snapTrackToRoad(
-        jobInstance: any,
-        clientID?: number | null,
-        onProgress?: (message: string, percent: number) => void,
+        _jobInstance: any,
+        _clientID?: number | null,
+        _onProgress?: (message: string, percent: number) => void,
     ): Promise<{ processedFrames: number }> {
-        let targetClientID: number | null = typeof clientID === 'number' ? clientID : null;
-        if (targetClientID === null) {
-            if (this.activatedElementID !== null) {
-                targetClientID = this.activatedElementID;
-            } else if (this.model.data.activeElement.clientID !== null) {
-                targetClientID = +this.model.data.activeElement.clientID;
-            }
-        }
-
-        if (targetClientID === null) {
-            throw new Error('No 3D object selected.');
-        }
-
-        const state = this.model.objects.find((obj: ObjectState) => obj.clientID === targetClientID);
-        if (!state) {
-            throw new Error(`Object #${targetClientID} not found.`);
-        }
-
-        if (state.objectType !== ObjectType.TRACK) {
-            this.snapToRoad(targetClientID);
-            return { processedFrames: 1 };
-        }
-
-        const { first, last } = state.keyframes || {};
-        if (first === null || last === null || first === undefined || last === undefined) {
-            this.snapToRoad(targetClientID);
-            return { processedFrames: 1 };
-        }
-
-        const loader = new PCDLoader();
-        const snappedFrames: { frame: number; state: ObjectState; points: number[] }[] = [];
-
-        onProgress?.(`Starting track snap across frames ${first} to ${last}...`, 5);
-
-        // Pre-fetch track states to determine motion vectors
-        const trackStatesByFrame = new Map<number, ObjectState>();
-        for (let f = first; f <= last; f++) {
-            try {
-                const frameStates = await jobInstance.annotations.get(f, true);
-                const trackState = frameStates.find((obj: ObjectState) => obj.clientID === targetClientID);
-                if (trackState && !trackState.outside && trackState.points) {
-                    trackStatesByFrame.set(f, trackState);
-                }
-            } catch (err) {
-                console.warn(`Could not get annotations for frame ${f}:`, err);
-            }
-        }
-
-        const sortedFrames = Array.from(trackStatesByFrame.keys()).sort((a, b) => a - b);
-        if (sortedFrames.length === 0) {
-            throw new Error('No valid track frames found to snap.');
-        }
-
-        if (this.drawnObjects[targetClientID]) {
-            const { cuboid } = this.drawnObjects[targetClientID];
-            const currentPoints = [
-                cuboid.perspective.position.x,
-                cuboid.perspective.position.y,
-                cuboid.perspective.position.z,
-                cuboid.perspective.rotation.x,
-                cuboid.perspective.rotation.y,
-                cuboid.perspective.rotation.z,
-                cuboid.perspective.scale.x,
-                cuboid.perspective.scale.y,
-                cuboid.perspective.scale.z,
-                0, 0, 0, 0, 0, 0, 0,
-            ];
-            if (!this.previousCuboids.has(targetClientID)) {
-                this.previousCuboids.set(targetClientID, []);
-            }
-            this.previousCuboids.get(targetClientID)!.push(currentPoints);
-        }
-
-        for (let idx = 0; idx < sortedFrames.length; idx++) {
-            const f = sortedFrames[idx];
-            const trackState = trackStatesByFrame.get(f)!;
-            const currentPct = 10 + Math.round(((idx + 1) / sortedFrames.length) * 75);
-            onProgress?.(`Processing frame ${f} of ${last}...`, currentPct);
-
-            let positions: ArrayLike<number> | null = null;
-            if (f === this.model.data.imageID && this.pointCloudPoints?.geometry?.attributes?.position?.array) {
-                positions = this.pointCloudPoints.geometry.attributes.position.array;
-            } else if (this.geometryCache.has(f)) {
-                positions = this.geometryCache.get(f)!.geometry.attributes.position?.array ?? null;
-            } else {
-                try {
-                    const frameData = await jobInstance.frames.get(f);
-                    if (frameData.deleted) continue;
-                    const frameImage = await frameData.data();
-                    const arrayBuffer = await frameImage.imageData.arrayBuffer();
-                    const pcd = loader.parse(arrayBuffer) as THREE.Points;
-                    if (pcd?.geometry?.attributes?.position?.array) {
-                        positions = pcd.geometry.attributes.position.array;
-                    }
-                } catch (err) {
-                    console.warn(`Could not load PCD for frame ${f}:`, err);
-                    continue;
-                }
-            }
-
-            if (!positions) continue;
-
-            // Strictly preserve the annotator's existing heading (yaw) on each track frame.
-            // In datasets where ego-vehicle is moving, sensor-frame displacement does not match
-            // vehicle heading and causes 180-degree heading flips.
-            const existingYaw = trackState.points[5];
-
-            try {
-                const snapResult = snapCuboidToRoadAndOrient(trackState.points, positions, {
-                    autoOrient: false,
-                    labelName: trackState.label?.name,
-                });
-                const snappedPoints = [...snapResult.points];
-                snappedPoints[5] = existingYaw;
-
-                snappedFrames.push({
-                    frame: f,
-                    state: trackState,
-                    points: snappedPoints,
-                });
-            } catch (err) {
-                console.warn(`Could not snap frame ${f}:`, err);
-            }
-        }
-
-        if (snappedFrames.length === 0) {
-            throw new Error('No valid track frames found to snap.');
-        }
-
-        // Apply 1D Temporal Smoothing to prevent elevation & tilt jitter
-        if (snappedFrames.length >= 3) {
-            onProgress?.('Smoothing road trajectory across track frames...', 88);
-            const zSmoothed = snappedFrames.map((s) => s.points[2]);
-            const rxSmoothed = snappedFrames.map((s) => s.points[3]);
-            const rySmoothed = snappedFrames.map((s) => s.points[4]);
-
-            for (let i = 1; i < snappedFrames.length - 1; i++) {
-                zSmoothed[i] = 0.25 * snappedFrames[i - 1].points[2] +
-                    0.5 * snappedFrames[i].points[2] +
-                    0.25 * snappedFrames[i + 1].points[2];
-                rxSmoothed[i] = 0.25 * snappedFrames[i - 1].points[3] +
-                    0.5 * snappedFrames[i].points[3] +
-                    0.25 * snappedFrames[i + 1].points[3];
-                rySmoothed[i] = 0.25 * snappedFrames[i - 1].points[4] +
-                    0.5 * snappedFrames[i].points[4] +
-                    0.25 * snappedFrames[i + 1].points[4];
-            }
-
-            for (let i = 1; i < snappedFrames.length - 1; i++) {
-                snappedFrames[i].points[2] = parseFloat(zSmoothed[i].toFixed(3));
-                snappedFrames[i].points[3] = parseFloat(rxSmoothed[i].toFixed(4));
-                snappedFrames[i].points[4] = parseFloat(rySmoothed[i].toFixed(4));
-            }
-        }
-
-        onProgress?.('Saving track updates...', 95);
-        for (const item of snappedFrames) {
-            item.state.points = item.points;
-            item.state.keyframe = true;
-        }
-
-        await jobInstance.annotations.saveStates(snappedFrames.map((s) => s.state));
-
-        // If the current active frame was part of the track, update canvas visual
-        if (this.drawnObjects[targetClientID]) {
-            const currentItem = snappedFrames.find((s) => s.frame === this.model.data.imageID);
-            if (currentItem) {
-                const { cuboid, data } = this.drawnObjects[targetClientID];
-                const [x, y, z, rx, ry, rz, dx, dy, dz] = currentItem.points;
-                cuboid.setPosition(x, y, z);
-                cuboid.setRotation(rx, ry, rz);
-                cuboid.setScale(dx, dy, dz);
-                data.points = [...currentItem.points];
-                this.requestRender();
-            }
-        }
-
-        onProgress?.('Track snapping completed.', 100);
-        return { processedFrames: snappedFrames.length };
+        // Snap tools disabled
+        return { processedFrames: 0 };
     }
 
     private action: {
@@ -1989,24 +1614,8 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 const { x, y, z } = this.cube.perspective.position;
                 const { x: width, y: height, z: depth } = this.cube.perspective.scale;
                 const { x: rotationX, y: rotationY, z: rotationZ } = this.cube.perspective.rotation;
-                let points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
+                const points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
                 const initState = this.model.data.drawData.initialState;
-                if (this.pointCloudPoints?.geometry?.attributes?.position?.array) {
-                    const label = initState?.label;
-                    const labelName = label?.name;
-                    points = fitClusterAtPoint(
-                        [x, y, z],
-                        this.pointCloudPoints.geometry.attributes.position.array,
-                        {
-                            labelName,
-                            label,
-                            attributes: initState?.attributes,
-                            defaultDims: this.controller.drawData.initialDimensions,
-                            snapGround: this.controller.drawData.snapGround ?? true,
-                            autoOrient: this.controller.drawData.autoOrient ?? true,
-                        },
-                    ).points;
-                }
                 this.dispatchEvent(
                     new CustomEvent('canvas.drawn', {
                         bubbles: false,
@@ -2291,7 +1900,7 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         const { x, y, z } = this.cube.perspective.position;
         const { x: width, y: height, z: depth } = this.cube.perspective.scale;
         const { x: rotationX, y: rotationY, z: rotationZ } = this.cube.perspective.rotation;
-        let points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
+        const points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
         const initState = this.model.data.drawData.initialState;
         const { redraw } = this.model.data.drawData;
         if (typeof redraw === 'number') {
@@ -2311,24 +1920,6 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
                 }),
             );
         } else {
-            if (this.pointCloudPoints?.geometry?.attributes?.position?.array) {
-                const label = initState?.label;
-                const labelName = label?.name;
-                const fitted = fitClusterAtPoint(
-                    [x, y, z],
-                    this.pointCloudPoints.geometry.attributes.position.array,
-                    {
-                        labelName,
-                        label,
-                        attributes: initState?.attributes,
-                        defaultDims: this.controller.drawData.initialDimensions,
-                        snapGround: this.controller.drawData.snapGround ?? true,
-                        autoOrient: this.controller.drawData.autoOrient ?? true,
-                    },
-                );
-                points = fitted.points;
-            }
-
             this.dispatchEvent(
                 new CustomEvent('canvas.drawn', {
                     bubbles: false,
@@ -2748,41 +2339,15 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
             return;
         }
 
-        const isTranslation = Boolean(this.action.translation.status);
         const targetClientID = Number(this.selectedCuboid[scan].name);
-        const autoRoadSnap = this.model.data.configuration.autoRoadSnap ?? true;
 
-        let { x, y, z } = this.selectedCuboid[scan].position;
+        const { x, y, z } = this.selectedCuboid[scan].position;
         const { x: width, y: height, z: depth } = this.selectedCuboid[scan].scale;
         const { x: rotationX, y: rotationY, z: rotationZ } = this.selectedCuboid[scan].rotation;
-        let points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
+        const points = [x, y, z, rotationX, rotationY, rotationZ, width, height, depth, 0, 0, 0, 0, 0, 0, 0];
         const [state] = this.model.objects.filter(
             (_state: any): boolean => _state.clientID === targetClientID,
         );
-
-        if (isTranslation && autoRoadSnap && this.pointCloudPoints?.geometry?.attributes?.position?.array) {
-            const positions = this.pointCloudPoints.geometry.attributes.position.array;
-            try {
-                const snapResult = snapCuboidToRoadAndOrient(points, positions, {
-                    labelName: state?.label?.name,
-                    autoOrient: false,
-                    snapGround: true,
-                });
-                points = [...snapResult.points];
-                const [sx, sy, sz, srx, sry, srz, sdx, sdy, sdz] = points;
-                this.selectedCuboid.setPosition(sx, sy, sz);
-                this.selectedCuboid.setRotation(srx, sry, srz);
-                this.selectedCuboid.setScale(sdx, sdy, sdz);
-                if (targetClientID in this.drawnObjects) {
-                    this.drawnObjects[targetClientID].data.points = [...points];
-                }
-                x = sx;
-                y = sy;
-                z = sz;
-            } catch (err) {
-                console.warn('Auto road snap on translation failed:', err);
-            }
-        }
 
         this.dispatchEvent(
             new CustomEvent('canvas.edited', {
@@ -4064,56 +3629,14 @@ export class Canvas3dViewImpl implements Canvas3dView, Listener {
         this.hoverNeedsUpdate = false;
         viewType.rayCaster.renderer.setFromCamera(viewType.rayCaster.mouseVector, viewType.camera);
         if (this.mode === Mode.DRAW) {
-            const object = this.views.perspective.scene.getObjectByName('drawTemplate');
-            if (!object) return;
-
-            const groundGrid = this.getGroundGrid();
-            const globalPlane = this.cachedGlobalGroundPlane || this.getGroundPlane();
-            const ray = viewType.rayCaster.renderer.ray;
-
-            let hitPoint: THREE.Vector3 | null = null;
-            if (groundGrid) {
-                hitPoint = groundGrid.intersectRay(ray, globalPlane, 150);
-            }
-            if (!hitPoint) {
-                let [A, B, C, D] = globalPlane;
-                const len = Math.sqrt(A * A + B * B + C * C);
-                if (len > 1e-6) {
-                    A /= len; B /= len; C /= len; D /= len;
-                } else {
-                    A = 0; B = 0; C = 1; D = 1.65;
+            const [intersection] = viewType.rayCaster.renderer
+                .intersectObjects(this.views.perspective.scene.children, false);
+            if (intersection) {
+                const object = this.views.perspective.scene.getObjectByName('drawTemplate');
+                if (object) {
+                    const { x, y, z } = intersection.point;
+                    object.position.set(x, y, z);
                 }
-                const fallbackPlane = new THREE.Plane(new THREE.Vector3(A, B, C), D);
-                hitPoint = ray.intersectPlane(fallbackPlane, new THREE.Vector3());
-            }
-
-            if (hitPoint) {
-                const { x, y, z } = hitPoint;
-                const h = this.cube.perspective.scale.z;
-                let zGround = z;
-                let rx = 0;
-                let ry = 0;
-                const rz = object.rotation.z;
-
-                if (groundGrid) {
-                    const roadZ = groundGrid.getElevation(x, y);
-                    if (roadZ !== null && Math.abs(roadZ - z) <= 2.5) {
-                        zGround = roadZ;
-                    }
-                    const label = this.controller.drawData.initialState?.label;
-                    const isPedestrian = isPedestrianClass(label || label?.name);
-                    if (!isPedestrian) {
-                        const plane = groundGrid.getRoadPlane(x, y);
-                        if (plane) {
-                            const aligned = alignEulerToRoadPlane(rz, plane);
-                            rx = aligned.rx;
-                            ry = aligned.ry;
-                        }
-                    }
-                }
-
-                object.position.set(x, y, zGround + h / 2);
-                object.rotation.set(rx, ry, rz);
             }
         } else {
             const { renderer } = this.views.perspective.rayCaster;
