@@ -86,6 +86,21 @@
                 fill: $info-icon-color;
             }
         }
+
+        &.cvat-annotation-header-qc-button {
+            width: auto;
+            min-width: $grid-unit-size * 6;
+            padding: 0 4px;
+
+            > span:not([role='img']) {
+                font-size: inherit;
+            }
+
+            > span[role='img'],
+            .anticon {
+                font-size: 20px;
+            }
+        }
     }
 
     .cvat-annotation-header-left-group {

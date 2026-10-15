@@ -27,11 +27,20 @@
 .cvat-logo-icon {
     width: max-content;
     height: $grid-unit-size * 4;
-    max-width: $grid-unit-size * 16;
+    max-width: max-content;
     overflow: hidden;
     display: flex;
     justify-content: center;
     align-items: center;
+
+    .cvat-logo-text {
+        font-size: 18px;
+        font-weight: 800;
+        color: #000000;
+        white-space: nowrap;
+        user-select: none;
+        letter-spacing: 0.5px;
+    }
 
     img {
         object-fit: contain;

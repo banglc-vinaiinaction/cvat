@@ -34,6 +34,7 @@ import SelectCSUpdatingSchemeModal from 'components/update-linked-cs-modal/selec
 
 import JobsPageComponent from 'components/jobs-page/jobs-page';
 import ModelsPageComponent from 'components/models-page/models-page';
+import QAQCDashboard from 'components/qaqc-dashboard/qaqc-dashboard';
 
 import TasksPageContainer from 'containers/tasks-page/tasks-page';
 import CreateTaskPageContainer from 'containers/create-task-page/create-task-page';
@@ -597,6 +598,7 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
                                         <Route exact path='/organization' component={OrganizationPage} />
                                         <Route exact path='/requests' component={RequestsPage} />
                                         <Route exact path='/profile' component={ProfilePageComponent} />
+                                        <Route exact path='/qaqc-dashboard' component={QAQCDashboard} />
                                         { routesToRender }
                                         <Route
                                             path='/models'

@@ -10,7 +10,8 @@ import {
     ActiveControl, NavigationType, ToolsBlockerState, Workspace,
 } from 'reducers';
 import { Job } from 'cvat-core-wrapper';
-import { RectDrawingMethod } from 'cvat-canvas-wrapper';
+import { Canvas, RectDrawingMethod } from 'cvat-canvas-wrapper';
+import { Canvas3d } from 'cvat-canvas3d-wrapper';
 import { KeyMap } from 'utils/mousetrap-react';
 import { Chapter } from 'cvat-core/src/frames';
 import LeftGroup from './left-group';
@@ -53,6 +54,7 @@ interface Props {
     showSearchFrameByName: boolean;
     keyMap: KeyMap;
     jobInstance: Job;
+    canvasInstance: Canvas | Canvas3d;
     ranges: string;
     changeWorkspace(workspace: Workspace): void;
     showStatistics(): void;
@@ -118,6 +120,7 @@ export default function AnnotationTopBarComponent(props: Props): JSX.Element {
         initialOpenGuide,
         navigationType,
         jobInstance,
+        canvasInstance,
         keyMap,
         showStatistics,
         showFilters,
@@ -237,8 +240,14 @@ export default function AnnotationTopBarComponent(props: Props): JSX.Element {
             <RightGroup
                 workspace={workspace}
                 jobInstance={jobInstance}
+                currentFrame={frameNumber}
+                saving={saving}
+                canvasInstance={canvasInstance}
+                onSelectFrame={onInputChange}
                 annotationFilters={annotationFilters}
                 initialOpenGuide={initialOpenGuide}
+                currentFrame={frameNumber}
+                onSelectQCFrame={onInputChange}
                 changeWorkspace={changeWorkspace}
                 showStatistics={showStatistics}
                 showFilters={showFilters}

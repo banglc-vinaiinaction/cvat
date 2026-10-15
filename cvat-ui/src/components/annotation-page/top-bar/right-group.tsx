@@ -17,9 +17,12 @@ import {
     DimensionType, Job, JobStage, JobState,
 } from 'cvat-core-wrapper';
 import { Workspace } from 'reducers';
+import { Canvas } from 'cvat-canvas-wrapper';
+import { Canvas3d } from 'cvat-canvas3d-wrapper';
 
 import MDEditor from '@uiw/react-md-editor';
 import rehypeSanitize from 'rehype-sanitize';
+import ModelQCAssistant from './model-qc-assistant';
 
 interface Props {
     showStatistics(): void;
@@ -29,6 +32,10 @@ interface Props {
     workspace: Workspace;
     annotationFilters: object[];
     initialOpenGuide: boolean;
+    currentFrame: number;
+    saving: boolean;
+    canvasInstance: Canvas | Canvas3d;
+    onSelectFrame(frame: number): void;
 }
 
 function RightGroup(props: Props): JSX.Element {
@@ -40,6 +47,10 @@ function RightGroup(props: Props): JSX.Element {
         jobInstance,
         annotationFilters,
         initialOpenGuide,
+        currentFrame,
+        saving,
+        canvasInstance,
+        onSelectFrame,
     } = props;
 
     const filters = annotationFilters.length;
@@ -107,6 +118,13 @@ function RightGroup(props: Props): JSX.Element {
 
     return (
         <Col className='cvat-annotation-header-right-group'>
+            <ModelQCAssistant
+                jobInstance={jobInstance}
+                currentFrame={currentFrame}
+                saving={saving}
+                canvasInstance={canvasInstance}
+                onSelectFrame={onSelectFrame}
+            />
             <Button
                 type='link'
                 className='cvat-annotation-header-fullscreen-button cvat-annotation-header-button'

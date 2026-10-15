@@ -832,6 +832,7 @@ class AnnotationTopBarContainer extends React.PureComponent<Props> {
                 onSwitchToolsBlockerState={this.onSwitchToolsBlockerState}
                 toolsBlockerState={toolsBlockerState}
                 jobInstance={jobInstance}
+                canvasInstance={this.props.canvasInstance}
                 activeControl={activeControl}
                 rectDrawingMethod={rectDrawingMethod}
             />

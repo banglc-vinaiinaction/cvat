@@ -1,0 +1,63 @@
+metadata:
+  name: pth-qwen-qwen3-5-2b-referee
+  namespace: cvat
+  annotations:
+    name: Qwen3.5-2B VLM Referee (BDD100K Discrepancy Oracle - GPU)
+    type: detector
+    spec: |
+      [
+        { "id": 0, "name": "pedestrian", "type": "rectangle" },
+        { "id": 1, "name": "rider", "type": "rectangle" },
+        { "id": 2, "name": "car", "type": "rectangle" },
+        { "id": 3, "name": "truck", "type": "rectangle" },
+        { "id": 4, "name": "bus", "type": "rectangle" },
+        { "id": 5, "name": "train", "type": "rectangle" },
+        { "id": 6, "name": "motorcycle", "type": "rectangle" },
+        { "id": 7, "name": "bicycle", "type": "rectangle" },
+        { "id": 8, "name": "traffic light", "type": "rectangle" },
+        { "id": 9, "name": "traffic sign", "type": "rectangle" }
+      ]
+
+spec:
+  description: Qwen3.5-2B VLM Semantic Referee & Discrepancy Oracle for BDD100K (via Ollama GPU Backend)
+  runtime: 'python:3.12'
+  handler: main:handler
+  eventTimeout: 60s
+  env:
+    - name: PYTHONPATH
+      value: /opt/nuclio
+    - name: OLLAMA_MODEL
+      value: qwen3.5:2b
+    - name: OLLAMA_URL
+      value: http://host.docker.internal:11435
+
+  build:
+    image: cvat.pth.qwen.qwen3-5-2b-referee:latest-gpu
+    baseImage: nhattruong19052005/cvat-yolo-server:latest
+
+    directives:
+      preCopy:
+        - kind: USER
+          value: root
+        - kind: ENTRYPOINT
+          value: '[]'
+        - kind: WORKDIR
+          value: /opt/nuclio
+
+  triggers:
+    myHttpTrigger:
+      numWorkers: 1
+      kind: 'http'
+      workerAvailabilityTimeoutMilliseconds: 20000
+      attributes:
+        maxRequestBodySize: 33554432
+
+  platform:
+    attributes:
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3
+      mountMode: volume
+      network: cvat_cvat
+      extraHosts:
+        - host.docker.internal:host-gateway

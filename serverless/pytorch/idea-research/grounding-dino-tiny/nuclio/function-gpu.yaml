@@ -1,0 +1,95 @@
+metadata:
+  name: pth-idea-research-grounding-dino-tiny
+  namespace: cvat
+  annotations:
+    name: Grounding DINO Tiny (BDD100K Referee - GPU)
+    type: detector
+    spec: |
+      [
+        { "id": 0, "name": "pedestrian", "type": "rectangle" },
+        { "id": 1, "name": "rider", "type": "rectangle" },
+        { "id": 2, "name": "car", "type": "rectangle" },
+        { "id": 3, "name": "truck", "type": "rectangle" },
+        { "id": 4, "name": "bus", "type": "rectangle" },
+        { "id": 5, "name": "train", "type": "rectangle" },
+        { "id": 6, "name": "motorcycle", "type": "rectangle" },
+        { "id": 7, "name": "bicycle", "type": "rectangle" },
+        { "id": 8, "name": "traffic light", "type": "rectangle" },
+        { "id": 9, "name": "traffic sign", "type": "rectangle" }
+      ]
+
+spec:
+  description: IDEA-Research Grounding DINO Tiny Open-Set Detector for BDD100K Referee & CVAT Automatic Annotation (GPU, 6GB VRAM Parity)
+  runtime: 'python:3.10'
+  handler: main:handler
+  eventTimeout: 60s
+  env:
+    - name: PYTHONPATH
+      value: /opt/nuclio:/sp1:/sp2:/sp3:/sp4
+    - name: MODEL_ID
+      value: IDEA-Research/grounding-dino-tiny
+    - name: HF_HOME
+      value: /hf_cache
+    - name: TORCH_DEVICE
+      value: cuda
+
+  volumes:
+    - volume:
+        name: sp1
+        hostPath:
+          path: /media/bang/Work/projects/P-004/.venv/lib/python3.10/site-packages
+      volumeMount:
+        name: sp1
+        mountPath: /sp1
+    - volume:
+        name: sp2
+        hostPath:
+          path: /home/bang/.local/lib/python3.10/site-packages
+      volumeMount:
+        name: sp2
+        mountPath: /sp2
+    - volume:
+        name: sp3
+        hostPath:
+          path: /usr/local/lib/python3.10/dist-packages
+      volumeMount:
+        name: sp3
+        mountPath: /sp3
+    - volume:
+        name: sp4
+        hostPath:
+          path: /usr/lib/python3/dist-packages
+      volumeMount:
+        name: sp4
+        mountPath: /sp4
+    - volume:
+        name: hf-cache
+        hostPath:
+          path: /home/bang/.cache/huggingface
+      volumeMount:
+        name: hf-cache
+        mountPath: /hf_cache
+
+  build:
+    image: cvat.pth.idea-research.grounding-dino-tiny:latest-gpu
+    baseImage: python:3.10-slim
+
+    directives:
+      preCopy:
+        - kind: WORKDIR
+          value: /opt/nuclio
+
+  triggers:
+    myHttpTrigger:
+      numWorkers: 1
+      kind: 'http'
+      workerAvailabilityTimeoutMilliseconds: 20000
+      attributes:
+        maxRequestBodySize: 33554432
+
+  platform:
+    attributes:
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3
+      mountMode: bind
